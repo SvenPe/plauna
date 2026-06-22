@@ -28,6 +28,12 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Read emails directly from IMAP folders.
 
+- Password-protected web UI (password can be set via an environment variable, changed in the UI, or auto-generated on first launch).
+
+- Per-category destination folders: choose exactly which IMAP folder each category's mail is moved to.
+
+- Responsive web UI that also works on mobile, so you can recategorize e-mails on the go.
+
 
 * What Plauna is NOT
 
@@ -52,9 +58,11 @@ This will produce a Plauna uberjar in the ./target directory which you can run u
 
 * Security
 
-Plauna comes without security features like different users. It is made to be used by self-hosters who own and use the service themselves in an internal network that is isolated.
+The web UI is protected by a single password (see "Web UI Password Protection" below). There are no separate user accounts - Plauna is made to be used by self-hosters who own and use the service themselves.
 
-*Please do not use Plauna in an open network or open ports to outside!*
+The password protects the UI, but Plauna still has no transport encryption of its own and is meant to run inside a trusted, isolated network.
+
+*Please do not expose Plauna directly to the internet. If you must reach it from outside, put it behind a reverse proxy with HTTPS.*
 
 * How to use
 
@@ -69,7 +77,9 @@ Note: If you run Plauna as a Docker container, the directory /var/lib/plauna is 
 
 *** Environment Variables
 
-You can use the environment variables $DATA_FOLDER and $SERVER_PORT
+You can use the environment variables $DATA_FOLDER and $SERVER_PORT.
+
+You can also set the web UI password with $PLAUNA_PASSWORD (see "Web UI Password Protection" below).
 
 *** CLI Parameters
 
@@ -86,7 +96,49 @@ In case multiple values are provided, plauna decides on which value to use accor
 3. Default configuration
 
 
+** Web UI Password Protection
+
+The whole web UI is protected by a single password. When you open Plauna you are redirected to a login page; after logging in, a session cookie keeps you signed in until you log out (via the "Logout" link in the navigation bar) or restart Plauna.
+
+*** How the password is determined
+
+On startup Plauna decides which password is active using this order of priority:
+
+1. The =PLAUNA_PASSWORD= environment variable, if set. This is authoritative on every start - if it is set, it overrides any password you changed in the UI the next time Plauna restarts.
+2. A password you previously set in the UI (stored, hashed, in the database).
+3. Otherwise, on first launch, Plauna generates a strong random password and prints it to the log. Look for a block like this in your logs:
+
+#+begin_src
+No web UI password configured. A temporary password was generated:
+
+    Xk7p... (a long random string)
+
+Log in with it and change it under Administration > Change Password,
+or set the PLAUNA_PASSWORD environment variable.
+#+end_src
+
+The password is never stored in plain text; only a salted PBKDF2 hash is kept in the database.
+
+*** Changing the password
+
+Go to "Admin" -> "Change Password", enter your current password and the new one (at least 8 characters) twice. If =PLAUNA_PASSWORD= is set, the page warns you that your change will be reset to the environment variable's value on the next restart.
+
+*** Docker example
+
+To set the password explicitly and persist the database, run, for example:
+
+#+begin_src
+docker run -d --name plauna -p 8080:8080 \
+  -e PLAUNA_PASSWORD=your-strong-password \
+  -v plauna-data:/var/lib/plauna \
+  <image>
+#+end_src
+
+If you do not set =PLAUNA_PASSWORD=, check the container logs (=docker logs plauna=) after the first start to find the generated password.
+
 ** Authentication
+
+This section is about connecting Plauna to your *e-mail accounts* (not about logging in to Plauna itself - see "Web UI Password Protection" above).
 
 Plauna supports basic (username - password) and oauth2 (XOAUTH2) authentication methods.
 
@@ -125,11 +177,23 @@ Plauna automatically detects the language of an e-mail upon parsing it. Here, yo
 
 *** Create Categories
 
-Go to "Admin" -> "Manage Categories" in order to create and delete categories. If you set up connections to your IMAP servers in your settings file, anytime you create a category Plauna will try to create a folder on the servers. If you however delete a category, Plauna will not delete it on the server. As a general rule, Plauna reads and moves e-mails as well as it creates folders but it never deletes anything.
+Go to "Admin" -> "Categories" in order to create and delete categories. If you set up connections to your IMAP servers in your settings file, anytime you create a category Plauna will try to create a folder on the servers. If you however delete a category, Plauna will not delete it on the server. As a general rule, Plauna reads and moves e-mails as well as it creates folders but it never deletes anything.
+
+*** Destination Folders
+
+By default, e-mails of a category are moved to a sub-folder of "Categories" named after the category (e.g. =Categories/Work=). You can override this per category: in "Admin" -> "Categories" each category has a "Destination Folder" field, and the "New Category" form lets you set one when creating a category.
+
+- Enter a full IMAP folder path using your mail server's hierarchy separator (e.g. =Archive/Newsletters= or =Archive.Newsletters=).
+- Leave it blank to keep the default =Categories/<Name>= behaviour.
+- Set it to the folder the mail is already in (e.g. =INBOX=) to *leave that category's mail in place* instead of moving it. More generally, whenever the source and destination folder are the same, Plauna performs no move.
+
+Changing a destination folder does not move e-mails that were already filed; it only affects future moves.
 
 *** Categorize E-mails
 
 Under the tab "E-mails" you can edit the language and category of every e-mail; either as a batch operation or by clicking on an e-mail and changing it at the details page.
+
+The UI is responsive and works on phones, so you can recategorize e-mails on the go: the e-mail list keeps the category dropdown visible on small screens for quick batch updates.
 
 #+CAPTION: List emails and edit metadata
 [[./docs/resources/plauna-new-1.png]]
