@@ -13,4 +13,6 @@ COPY --from=build /usr/src/app/target/plauna-standalone.jar /app/
 EXPOSE 8080
 WORKDIR /app
 RUN mkdir /var/lib/plauna # Default location for data files
-CMD ["sh", "-c", "java -jar plauna-standalone.jar $PLAUNA_ARGS"]
+# 'exec' so the JVM replaces the shell and runs as PID 1: this gives it proper signal handling
+# (clean shutdown, and SIGQUIT/kill -3 thread dumps go straight to the JVM).
+CMD ["sh", "-c", "exec java -jar plauna-standalone.jar $PLAUNA_ARGS"]

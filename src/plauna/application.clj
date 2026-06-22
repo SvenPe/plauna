@@ -17,6 +17,26 @@
     (= search-field "subject") {:where [:like :headers.subject (str "%" search-text "%")] :order-by [[:date :desc]]}
     :else {:order-by [[:date :desc]]}))
 
+(defn- date-string->epoch-seconds
+  "Convert a 'YYYY-MM-DD' string to a UTC unix timestamp (seconds) at the start of that day,
+   or the start of the following day when next-day? is true (used for an inclusive upper bound)."
+  [date-str next-day?]
+  (let [^java.time.LocalDate base (java.time.LocalDate/parse date-str)
+        ^java.time.LocalDate day (if next-day? (.plusDays base 1) base)]
+    (.toEpochSecond (.atStartOfDay day java.time.ZoneOffset/UTC))))
+
+(defn- date->sql-clause
+  "Build a where-clause filtering headers.date (stored as unix seconds) between the given dates.
+   Either bound may be blank/nil. The upper bound is inclusive of the whole 'to' day."
+  [date-from date-to]
+  (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false))
+        to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true))]
+    (cond
+      (and from to) {:where [:and [:>= :date from] [:< :date to]] :order-by [[:date :desc]]}
+      from {:where [:>= :date from] :order-by [[:date :desc]]}
+      to {:where [:< :date to] :order-by [[:date :desc]]}
+      :else {:order-by [[:date :desc]]})))
+
 (defn- combine-maps-with [map1 map2 key combination-key]
   (let [val1 (get map1 key)
         val2 (get map2 key)]
@@ -57,7 +77,11 @@
   [context parameters]
   (let [db (:db context)
         cat-list (categories db)
-        customization-clause (combine-maps-with (filter->sql-clause (:filter parameters)) (search->sql-clause (:search-field parameters) (:search-text parameters)) :where :and)
+        customization-clause (-> (combine-maps-with (filter->sql-clause (:filter parameters))
+                                                    (search->sql-clause (:search-field parameters) (:search-text parameters))
+                                                    :where :and)
+                                 (combine-maps-with (date->sql-clause (:date-from parameters) (:date-to parameters))
+                                                    :where :and))
         result (int/fetch-emails db {:entity :enriched-email :strict false :page (page/page-request (:page parameters) (:size parameters))} customization-clause)]
     {:data (:data result)
      :parameters {:filter (:filter parameters)
@@ -65,7 +89,9 @@
                   :size (:size parameters)
                   :page (:page result)
                   :total (:total result)
-                  :search-text (:search-text parameters)}
+                  :search-text (:search-text parameters)
+                  :date-from (:date-from parameters)
+                  :date-to (:date-to parameters)}
      :optional {:categories cat-list}}))
 
 (defn create-new-category! [context category destination-folder]

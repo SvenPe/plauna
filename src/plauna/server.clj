@@ -12,6 +12,7 @@
             [plauna.auth :as auth]
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
+            [plauna.diagnostics :as diagnostics]
             [plauna.core.email :as core-email]
             [plauna.database :as db]
             [plauna.files :as files]
@@ -175,7 +176,9 @@
                       :page {:default 1 :type-fn Integer/parseInt}
                       :filter {:default "all" :type-fn identity}
                       :search-field {:default "subject" :type-fn identity}
-                      :search-text {:default nil :type-fn identity}})
+                      :search-text {:default nil :type-fn identity}
+                      :date-from {:default nil :type-fn identity}
+                      :date-to {:default nil :type-fn identity}})
 
 (defn template->request-parameters [template]
   (fn [rp] (reduce (fn [acc [k v]] (if (contains? rp k)
@@ -223,6 +226,15 @@
 
    (comp/GET "/logout" {}
      (-> (redirect "/login") (assoc :session nil)))
+
+   (comp/GET "/admin/threads" {}
+     ;; A full thread dump for diagnosing freezes. Also written to the log. Returned as plain text so
+     ;; it can be copied directly from the browser.
+     (let [dump (diagnostics/thread-dump-string)]
+       (diagnostics/log-thread-dump! "requested via /admin/threads")
+       {:status  200
+        :headers {"Content-Type" "text/plain; charset=UTF-8"}
+        :body    dump}))
 
    (comp/GET "/admin/password" {}
      (success-html-with-body (markup/password-page {:env-managed (auth/password-from-env-var?)})))

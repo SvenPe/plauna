@@ -243,3 +243,26 @@
     ;; numbers of messages not yet processed. Message 2 throws on read and is skipped; 3 and 1 succeed.
     (is (= [3 2 1] @read-attempts))
     (is (= ["email-3" "email-1"] @saved-subjects))))
+
+(deftest fetch-emails-applies-date-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil
+                                :page 1 :size 20 :date-from "2026-06-01" :date-to "2026-06-30"})
+    (let [where-flat (flatten (:where @captured))]
+      (is (some #{:>=} where-flat) "Lower date bound is present")
+      (is (some #{:<} where-flat) "Upper date bound is present")
+      (is (some #{:date} where-flat) "Filters on the date column")))
+  "Date-from/date-to are translated into a date-range filter on the email date")
+
+(deftest fetch-emails-no-date-filter-when-blank
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil
+                                :page 1 :size 20 :date-from "" :date-to ""})
+    (is (not (some #{:>=} (flatten (:where @captured)))) "No date bound is added when both dates are blank"))
+  "Blank date inputs add no date filter")

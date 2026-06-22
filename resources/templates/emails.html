@@ -31,6 +31,14 @@
           <p class="label">Currently you can only search in email subjects.</p>
         </fieldset>
         <fieldset class="fieldset">
+          <legend class="fieldset-legend">Date From</legend>
+          <input type="date" name="date-from" class="input" value="{{page.date-from}}" />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Date To</legend>
+          <input type="date" name="date-to" class="input" value="{{page.date-to}}" />
+        </fieldset>
+        <fieldset class="fieldset">
           <legend class="fieldset-legend">Page Size</legend>
           <select class="select" name="size">
             <div tabindex="0" role="button" class="btn">Page Size: {{page.size}}</div>
@@ -51,39 +59,7 @@
   </div>
 </div>
 
-<div class="grid grid-cols-1 lg:grid-cols-3 lg:justify-items-stretch">
-  <div class="hidden lg:block"></div>
-  <div class="lg:justify-self-center-safe my-2">
-    <div class="pagination flex flex-nowrap text-xs lg:text-md items-center">
-    {% if page.page > 1 %}
-    <form action="/emails" method="get">
-      <input type="hidden" name="size" value="{{page.size}}" />
-      <input type="hidden" name="search-field" value="subject" />
-      <input type="hidden" name="search-text" value="{{page.search-text}}" />
-      <input type="hidden" name="page" value="{{page.page|add:-1}}" />
-      <input type="hidden" name="filter" value="{{page.filter}}" />
-      <button class="btn join-item text-xs lg:text-md text-nowrap">Back</button>
-    </form>
-    {% else %}
-    <button disabled class="btn join-item text-xs lg:text-md text-nowrap">< Back</button>
-    {% endif %}
-    <p class="text-sm lg:text-md text-nowrap mx-2">{{page.page}} of {{page.total-pages}}</p>
-    {% if page.page <= page.last-page %}
-                       
-    <form action="/emails" method="get">
-      <input type="hidden" name="size" value="{{page.size}}" />
-      <input type="hidden" name="search-field" value="subject" />
-      <input type="hidden" name="search-text" value="{{page.search-text}}" />
-      <input type="hidden" name="page" value="{{page.page|add:1}}" />
-      <input type="hidden" name="filter" value="{{page.filter}}" />
-      <button class="btn join-item text-xs lg:text-md text-nowrap">Next</button>
-    </form>
-    {% else %}
-    <button disabled class="btn join-item text-xs lg:text-md text-nowrap">Next ></button>
-    {% endif %}
-    </div>
-  </div>
-</div>
+{% include "emails-pagination.html" %}
 
 <form action="/metadata" id="emails" method="post"></form>
 <input type="hidden" name="size" value="{{page.size}}" />
@@ -133,6 +109,8 @@
     </table>
   <button class="btn btn-primary my-4" form="emails">Batch Update</button>
   </div>
+
+{% include "emails-pagination.html" %}
 
 {% endif %}
 

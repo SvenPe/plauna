@@ -7,6 +7,7 @@
    [plauna.core.email :as core.email]
    [plauna.core.events :as events]
    [plauna.database :as db]
+   [plauna.diagnostics :as diagnostics]
    [plauna.files :as files]
    [plauna.messaging :as messaging]
    [plauna.parser :as parser]
@@ -21,7 +22,8 @@
 (defn setup-logging []
   (t/set-min-level! :info)
   ;; jetty is very noisy. Disable all jetty logs.
-  (t/set-ns-filter! {:disallow "org.eclipse.jetty.*"}))
+  (t/set-ns-filter! {:disallow "org.eclipse.jetty.*"})
+  (diagnostics/install-uncaught-exception-handler!))
 
 (set! *warn-on-reflection* true)
 
@@ -61,6 +63,7 @@
     (t/log! :info "Setting log level according to preferences.")
     (t/set-min-level! (preferences/log-level))
     (auth/initialize!)
+    (diagnostics/start-watchdog! 60)
     (start-imap-client context)
     (events/start-event-loops event-register)
     (server/start-server context)))
