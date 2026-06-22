@@ -17,3 +17,5 @@ pom.xml.asc
 .clerk/
 .clj-kondo/
 .cpcache/
+/node_modules
+/resources/public/css/tailwind.css

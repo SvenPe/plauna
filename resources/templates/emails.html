@@ -4,7 +4,7 @@
 
 {% if emails|not-empty %}
 
-<div class="flex">
+<div class="flex flex-col lg:flex-row gap-4">
   <div class="card grow place-items-center">
     <h3>Filter</h3>
     <form action="/emails" method="get" id="page-form">
@@ -107,7 +107,7 @@
         <th class="hidden lg:table-cell text-left"><strong>To</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
-        <th class="hidden lg:table-cell text-left"><strong>Category</strong></th>
+        <th class="text-left"><strong>Category</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
       </tr>
     </thead>
@@ -120,8 +120,8 @@
         <td class="hidden lg:table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.participants|concat-receivers}}</a></td>
         <td class="hidden lg:table-cell"><input class="input" form="emails" name="language" type="text" value="{{email.metadata.language}}"></td>
         <td class="hidden lg:table-cell">{{email.metadata.language-confidence|double-format-nillable:10}}</td>
-        <td class="hidden lg:table-cell">
-          <select class="select w-32" form="emails" name="category">
+        <td>
+          <select class="select w-28 sm:w-32" form="emails" name="category">
             {% for category in categories %}
             <option value="{{category.id}}" {% if email.metadata.category-id = category.id %} selected {% endif %}>{{category.name}}</option>
             {% endfor %}
