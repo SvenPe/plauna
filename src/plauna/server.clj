@@ -9,6 +9,7 @@
             [nrepl.server :as nrepl]
             [plauna.analysis :as analysis]
             [plauna.application :as app]
+            [plauna.auth :as auth]
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
             [plauna.core.email :as core-email]
@@ -211,6 +212,36 @@
   (comp/routes
 
    (route/resources "/")
+
+   (comp/GET "/login" {} (success-html-with-body (markup/login-page)))
+
+   (comp/POST "/login" request
+     (if (auth/verify-web-password? (-> request :params :password))
+       (-> (redirect "/")
+           (assoc :session (assoc (:session request) :authenticated true)))
+       (success-html-with-body (markup/login-page {:error "Invalid password."}))))
+
+   (comp/GET "/logout" {}
+     (-> (redirect "/login") (assoc :session nil)))
+
+   (comp/GET "/admin/password" {}
+     (success-html-with-body (markup/password-page {:env-managed (auth/password-from-env-var?)})))
+
+   (comp/POST "/admin/password" request
+     (let [{:keys [current-password new-password confirm-password]} (:params request)]
+       (cond
+         (not (auth/verify-web-password? current-password))
+         (redirect-request request {:type :alert :content "Current password is incorrect."})
+
+         (not= new-password confirm-password)
+         (redirect-request request {:type :alert :content "New password and confirmation do not match."})
+
+         (< (count (or new-password "")) 8)
+         (redirect-request request {:type :alert :content "New password must be at least 8 characters long."})
+
+         :else
+         (do (auth/set-password! new-password)
+             (redirect-request request {:type :success :content "Password changed successfully."})))))
 
    (comp/GET "/" {} (let [data (db/yearly-email-stats)]
                       (if (> (count data) 0)
@@ -452,7 +483,28 @@
            :let [read-percent  (* 100 (float (/ bytes-read content-length)))]}
           ["Writing" item-count "files. Read" read-percent "% until now. Total length: " content-length]))
 
+(defn- public-path?
+  "Paths reachable without authentication: the login endpoint and the static assets the login page needs."
+  [^String uri]
+  (or (= uri "/login")
+      (.startsWith uri "/css/")
+      (.startsWith uri "/favicon")
+      (.startsWith uri "/android-chrome")
+      (= uri "/plauna-banner.png")
+      (= uri "/site.webmanifest")))
+
+(defn wrap-authentication
+  "Require a logged-in session for every request except public paths. Unauthenticated requests are
+   redirected to the login page."
+  [handler]
+  (fn [request]
+    (if (or (public-path? (:uri request))
+            (get-in request [:session :authenticated]))
+      (handler request)
+      (redirect "/login"))))
+
 (defn app [context] (-> (fn [req] ((make-routes context) req))
+                        wrap-authentication
                         wrap-keyword-params
                         (wrap-multipart-params {:progress-fn upload-progress})
                         wrap-params

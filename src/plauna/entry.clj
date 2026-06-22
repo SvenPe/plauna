@@ -2,6 +2,7 @@
   (:require
    [plauna.analysis :as analysis]
    [plauna.application :as app]
+   [plauna.auth :as auth]
    [plauna.client :as client]
    [plauna.core.email :as core.email]
    [plauna.core.events :as events]
@@ -59,6 +60,7 @@
     (db/create-db)
     (t/log! :info "Setting log level according to preferences.")
     (t/set-min-level! (preferences/log-level))
+    (auth/initialize!)
     (start-imap-client context)
     (events/start-event-loops event-register)
     (server/start-server context)))

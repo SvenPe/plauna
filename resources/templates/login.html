@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <link rel="stylesheet" href="/css/tailwind.css" type="text/css"/>
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png"/>
+    <meta charset="UTF-8">
+    <meta content="width=device-width, initial-scale=1" name="viewport">
+    <title>Plauna — Login</title>
+  </head>
+  <body class="min-h-screen flex items-center justify-center mx-2">
+    <div class="card card-border w-full max-w-sm">
+      <div class="card-body items-center gap-4">
+        <a href="/"><img src="/plauna-banner.png" style="height: 36px"/></a>
+        <h2 class="card-title">Sign in</h2>
+        {% if error %}
+        <div role="alert" class="alert alert-error alert-outline w-full">
+          <span>{{error}}</span>
+        </div>
+        {% endif %}
+        <form action="/login" method="POST" class="flex flex-col gap-4 w-full">
+          <input class="input w-full" name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus required>
+          <button class="btn btn-primary w-full" type="submit">Sign in</button>
+        </form>
+      </div>
+    </div>
+  </body>
+</html>
