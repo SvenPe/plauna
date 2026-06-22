@@ -175,9 +175,18 @@
     (if (> (:message-count messages-result) 0)
       (do
         (t/log! :info ["There are" (:message-count messages-result) "emails in" folder-name "The messages will get processed asynchronously"])
-        (async/go
-          ;; reading email is index 1
-          (doseq [n (range 1 (inc (:message-count messages-result)))]
-            (process-nth-email-from-folder client n folder-name folder options context messages-result))))
+        ;; Use async/thread (a real thread), not async/go: each email does blocking JDBC and IMAP work,
+        ;; and a long blocking loop inside a go block would tie up a shared core.async dispatch thread.
+        (async/thread
+          ;; If we're bulk-reading the folder that is being IDLE-monitored, pause monitoring first.
+          ;; Otherwise the periodic health check re-arms IDLE on the same folder and collides with the
+          ;; bulk read, hanging the processing thread. Always resume afterwards.
+          (let [paused? (int/pause-monitoring-for-folder client connection-data folder-name)]
+            (try
+              ;; reading email is index 1
+              (doseq [n (range 1 (inc (:message-count messages-result)))]
+                (process-nth-email-from-folder client n folder-name folder options context messages-result))
+              (finally
+                (when paused? (int/resume-monitoring client connection-data context)))))))
       (t/log! :info ["There are no emails in the folder. Doing nothing."]))
     (:message-count messages-result)))

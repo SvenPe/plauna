@@ -22,7 +22,9 @@
   (move-email-to-category [this connection-id original-message original-folder category])
   (number-of-messages-in-folder [this connection-data folder-name])
   (nth-email-from-folder [this n folder])
-  (current-folder-name [this folder] "Return the full IMAP name of a folder object."))
+  (current-folder-name [this folder] "Return the full IMAP name of a folder object.")
+  (pause-monitoring-for-folder [this connection-data folder-name] "If folder-name is the connection's monitored folder, stop IDLE monitoring (and its health-check re-arming) and return true; otherwise return false.")
+  (resume-monitoring [this connection-data context] "Restart IDLE monitoring and health checks for the connection."))
 
 (defprotocol Analyzer
   "Language detection and categorization"

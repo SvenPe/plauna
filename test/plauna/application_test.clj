@@ -220,6 +220,7 @@
         client (reify int/EmailClient
                  (number-of-messages-in-folder [_ _ _]
                    {:message-count 3 :connection-id "test-connection" :folder :test-folder})
+                 (pause-monitoring-for-folder [_ _ _] false)
                  (current-folder-name [_ folder] (str folder))
                  (nth-email-from-folder [_ n _]
                    (swap! read-attempts conj n)

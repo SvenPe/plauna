@@ -521,6 +521,15 @@
        :connection-id (id-from-connection connection-data)
        :folder folder}))
   (current-folder-name [_ folder] (.getFullName ^Folder folder))
+  (pause-monitoring-for-folder [_ connection-data folder-name]
+    (if (= (monitor-folder-name folder-name) (monitor-folder-name (-> connection-data :config :folder)))
+      (do (t/log! :info ["Pausing IDLE monitoring to bulk-read the monitored folder:" folder-name])
+          (stop-monitoring connection-data)
+          true)
+      false))
+  (resume-monitoring [_ connection-data context]
+    (t/log! :info ["Resuming IDLE monitoring for" (-> connection-data :config :folder)])
+    (-> connection-data (start-monitoring context) schedule-health-checks))
   (nth-email-from-folder [_ n folder]
     (let [message (.getMessage ^IMAPFolder folder n)]
       (set-message-as-peek message)

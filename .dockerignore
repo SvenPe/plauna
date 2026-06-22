@@ -1,0 +1,6 @@
+.git
+node_modules
+target
+tmp
+.cpcache
+resources/public/css/tailwind.css

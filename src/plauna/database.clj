@@ -19,8 +19,13 @@
 (set! *warn-on-reflection* true)
 
 (defn db []
-  {:dbtype "sqlite"
-   :dbname (files/path-to-db-file)})
+  ;; Pragmas are applied to every connection via the URL:
+  ;; - busy_timeout: wait (ms) for a lock instead of failing/stalling immediately, so reads (e.g. the
+  ;;   Emails page) and writes (e.g. bulk categorization) cooperate under concurrency.
+  ;; - journal_mode=WAL: readers don't block the single writer and vice versa.
+  ;; - synchronous=NORMAL: standard, safe-with-WAL setting that shortens write/lock windows.
+  {:jdbcUrl (str "jdbc:sqlite:" (files/path-to-db-file)
+                 "?busy_timeout=30000&journal_mode=WAL&synchronous=NORMAL")})
 
 (defn ds [] (jdbc/get-datasource (db)))
 
@@ -51,7 +56,7 @@
     (conj (rest insert-query) (string/replace insert-part #"INSERT" "INSERT OR REPLACE"))))
 
 (defn save-headers [headers]
-  (jdbc/execute! (jdbc/get-connection (db))
+  (jdbc/execute! (ds)
                  (->>
                   (builder/for-insert-multi
                    :headers
@@ -61,7 +66,7 @@
                  {:batch true}))
 
 (defn save-bodies [bodies]
-  (jdbc/execute! (jdbc/get-connection (db))
+  (jdbc/execute! (ds)
                  (->>
                   (builder/for-insert-multi
                    :bodies
@@ -71,7 +76,7 @@
                  {:batch true}))
 
 (defn save-contacts [contacts]
-  (jdbc/execute! (jdbc/get-connection (db))
+  (jdbc/execute! (ds)
                  (->>
                   (builder/for-insert-multi
                    :contacts
@@ -81,7 +86,7 @@
                  {:batch true}))
 
 (defn save-communications [contacts]
-  (jdbc/execute! (jdbc/get-connection (db))
+  (jdbc/execute! (ds)
                  (->> (builder/for-insert-multi
                        :communications
                        [:message_id :contact_key :type]
@@ -91,7 +96,7 @@
 
 (defn update-metadata-batch [metadata]
   (when (seq metadata)
-    (jdbc/execute! (jdbc/get-connection (db))
+    (jdbc/execute! (ds)
                    (->> (builder/for-insert-multi
                          :metadata
                          [:message_id :language :language_confidence :category :category_confidence]
@@ -205,7 +210,7 @@
                                      :where  [:= :id id]})))
 
 (defn delete-email-by-message-id [message-id]
-  (let [conn (jdbc/get-connection (ds))]
+  (with-open [conn (jdbc/get-connection (ds))]
     (jdbc/execute! conn ["PRAGMA foreign_keys = ON"])
     (jdbc/execute! conn ["DELETE FROM headers WHERE message_id = ?" message-id])))
 
