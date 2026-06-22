@@ -116,12 +116,27 @@
 
       (catch Exception e (t/log! :error e) (error-result e "Moving email failed. Please check the logs.")))))
 
-(defn- move-message [move? folder connection-id email-message category context]
-  (if (and (true? move?) (some? category))
-    (do (int/move-email-to-category (:client context) connection-id (:message email-message) folder category)
-        (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully moved to the corresponding folder"]))
-    (do (t/log! :debug ["move option:" move? "category:" category "the email" (-> email-message :email :header :subject) "will not move moved"])
-        :na)))
+(defn- move-message [move? folder connection-id email-message category {:keys [db client]}]
+  (let [message-id (-> email-message :email :header :message-id)
+        ;; The email stays in the folder it arrived in. Record that folder so a later recategorization
+        ;; can find it even after the category's destination is changed.
+        record-current-folder! (fn []
+                                 (when (some? folder)
+                                   (let [current-folder (int/current-folder-name client folder)]
+                                     (when-not (str/blank? current-folder)
+                                       (int/update-email-folder db message-id current-folder)))))]
+    (if (and (true? move?) (some? category))
+      (let [moved-to-folder (int/move-email-to-category client connection-id (:message email-message) folder category)]
+        (if (string? moved-to-folder)
+          (do (int/update-email-folder db message-id moved-to-folder)
+              (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully moved to the corresponding folder"]))
+          ;; The move did not complete (e.g. the copy+delete fallback failed). The email is still in
+          ;; its source folder, so record that rather than leaving the location unknown.
+          (do (t/log! :warn ["Email with subject:" (-> email-message :email :header :subject) "could not be moved; recording its current folder so it stays findable."])
+              (record-current-folder!))))
+      (do (t/log! :debug ["move option:" move? "category:" category "the email" (-> email-message :email :header :subject) "will not move moved"])
+          (record-current-folder!)
+          :na))))
 
 (defn- incoming-email-workflow [email-message connection-id folder {:keys [move? assigned-category assigned-category-id]} {:keys [analyzer db] :as context}]
   (if (some? assigned-category)

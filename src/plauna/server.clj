@@ -409,9 +409,9 @@
              (= "parse" operation) (let [params (:params request)
                                          folder (:folder params)
                                          move (some? (:move params))
-                                         assigned-category-pair (st/split (:assigned-category params) #"-")
+                                         assigned-category (when-not (st/blank? (:assigned-category params)) (db/category-by-id (:assigned-category params)))
                                          conn-data (client/connection-data-from-id id)
-                                         message-count (app/read-emails-from-folder conn-data folder {:move? move :assigned-category (second assigned-category-pair) :assigned-category-id (first assigned-category-pair)} context)]
+                                         message-count (app/read-emails-from-folder conn-data folder {:move? move :assigned-category (:name assigned-category) :assigned-category-id (:id assigned-category)} context)]
                                      (swap! global-messages (fn [mess] (conj mess {:type :success :content (str "Started parsing " folder " asynchronously. There are " message-count " emails in the folder. Move folders after parsing: " move)})))
                                      (redirect-request request)))))
 

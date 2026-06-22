@@ -1,6 +1,7 @@
 (ns plauna.client-test
   (:require [clojure.test :refer :all]
             [plauna.client :as client :refer [->ConnectionData]]
+            [plauna.database :as db]
             [plauna.core.email :as core-email :refer [->Email ->Participant]]
             [taoensso.telemere :as t])
   (:import (java.util Properties)
@@ -158,4 +159,53 @@
                 client/connection-data-from-id (fn [_] {})]
     (is (false? (client/move-messages-by-id-between-category-folders "fake" "does-no-exist" "test" "test2" {}))))
   "If the store is not connected, return false immediately.")
+
+(deftest move-emails-same-folder-leaves-in-place
+  (let [recorded (atom nil)]
+    (with-redefs [client/connected? (fn [_] true)
+                  client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
+                  db/email-folder (fn [_] nil)
+                  db/update-email-folder (fn [message-id folder] (reset! recorded [message-id folder]))
+                  client/inbox-or-default-category-folder-name (fn [_ _ _] "INBOX")
+                  client/inbox-or-category-folder-name (fn [_ _ _] "INBOX")]
+      (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "n/a" "keep" {})))
+      ;; Even though nothing moved, the resolved folder is recorded so a legacy email stops being nil.
+      (is (= ["msg-id" "INBOX"] @recorded))))
+  "When the resolved source and target folders are identical, the message is left in place, the move reports success without touching IMAP, and the resolved folder is still recorded.")
+
+(deftest move-emails-same-custom-folder-leaves-in-place
+  (with-redefs [client/connected? (fn [_] true)
+                client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
+                db/email-folder (fn [_] nil)
+                db/update-email-folder (fn [_ _] nil)
+                client/inbox-or-default-category-folder-name (fn [_ _ _] "Archive/Projects")
+                client/inbox-or-category-folder-name (fn [_ _ _] "Archive/Projects")]
+    (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
+  "The same-folder guard is generic: it applies to any folder, not just the inbox. When source and target both resolve to the same custom folder the message is left in place.")
+
+(deftest copy-message-returns-false-on-failure
+  (is (false? (client/copy-message nil nil nil)))
+  "copy-message returns false when the IMAP operations throw, so a failed copy+delete is never recorded as a successful move.")
+
+(deftest move-emails-unrecorded-uses-default-category-folder-as-source
+  (with-redefs [client/connected? (fn [_] true)
+                client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
+                db/email-folder (fn [_] nil)
+                db/update-email-folder (fn [_ _] nil)
+                ;; default resolver (correct for legacy emails) and the custom-destination resolver
+                ;; return DIFFERENT values; the target resolves to the same value as the default resolver.
+                client/inbox-or-default-category-folder-name (fn [_ _ _] "Categories/Work")
+                client/inbox-or-category-folder-name (fn [_ folder-name _] (if (= folder-name "projects") "Categories/Work" "Custom/WrongSource"))]
+    (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
+  "For an email with no recorded folder, the source resolves through the DEFAULT category folder, not the (mutable) custom destination. Here that makes source == target so the move is a safe no-op; had the custom-destination resolver been used for the source it would differ and the code would hit the nil store.")
+
+(deftest move-emails-uses-recorded-folder-as-source
+  (with-redefs [client/connected? (fn [_] true)
+                client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
+                db/email-folder (fn [_] "Recorded/Folder")
+                db/update-email-folder (fn [_ _] nil)
+                ;; category-derived resolution would give a *different* source ("Derived/Work").
+                client/inbox-or-category-folder-name (fn [_ folder-name _] (if (= folder-name "projects") "Recorded/Folder" "Derived/Work"))]
+    (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
+  "The recorded folder drives source resolution: the recorded source equals the resolved target so the move is a no-op (true). If the category-derived folder were used instead, source would be 'Derived/Work' != target and the code would try to open a (nil) store and fail.")
 

@@ -174,6 +174,20 @@
                                       (do-update-set :category :category_modified :category_confidence)))
                           (honey/format))))
 
+(defn update-email-folder
+  "Record the IMAP folder a message currently lives in, so later moves can find it regardless of category-to-folder mapping changes."
+  [message-id folder]
+  (jdbc/execute! (ds) (honey/format {:update :metadata
+                                     :set    {:folder folder}
+                                     :where  [:= :message-id message-id]})))
+
+(defn email-folder
+  "Return the recorded IMAP folder for a message, or nil if none was recorded."
+  [message-id]
+  (:folder (jdbc/execute-one! (ds) (honey/format {:select [:folder]
+                                                  :from   :metadata
+                                                  :where  [:= :message-id message-id]}) builder-function)))
+
 (defn get-categories []
   (jdbc/execute! (ds) (honey/format {:select [:*] :from :categories}) builder-function))
 
@@ -197,6 +211,9 @@
 
 (defn category-by-name [category-name]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from :categories :where [:= :name category-name]}) builder-function))
+
+(defn category-by-id [id]
+  (jdbc/execute-one! (ds) (honey/format {:select [:*] :from :categories :where [:= :id id]}) builder-function))
 
 (defn get-languages []
   (jdbc/execute! (ds) ["select language from metadata group by language"] builder-function))
@@ -420,6 +437,7 @@
   (fetch-emails [_ entity customization] (fetch-data entity customization))
   (save-category [_ category-name destination-folder] (create-category category-name destination-folder))
   (update-category-destination-folder [_ id destination-folder] (update-category-destination-folder id destination-folder))
+  (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (save-email [_ email]
     (save-headers [(:header email)])
     (save-bodies (:body email))

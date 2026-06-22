@@ -122,10 +122,17 @@
           (conj result-map {folder-name :created}))
       (conj result-map {folder-name :already-exists}))))
 
-(defn structured-folder-name [store lower-case-folder-name]
+(defn default-category-folder-name
+  "The default folder for a category, ignoring any custom destination: 'Categories/<Name>'."
+  [store lower-case-folder-name]
+  (str parent-folder-name (folder-separator store) (s/capitalize lower-case-folder-name)))
+
+(defn structured-folder-name
+  "The folder a category's mail should be moved to: the custom destination if configured, otherwise the default 'Categories/<Name>'."
+  [store lower-case-folder-name]
   (let [destination-folder (:destination_folder (db/category-by-name lower-case-folder-name))]
     (if (s/blank? destination-folder)
-      (str parent-folder-name (folder-separator store) (s/capitalize lower-case-folder-name))
+      (default-category-folder-name store lower-case-folder-name)
       destination-folder)))
 
 (defn create-folders
@@ -262,7 +269,9 @@
       (.open folder Folder/READ_WRITE))
     folder))
 
-(defn copy-message [^Message message ^Folder source-folder ^Folder target-folder]
+(defn copy-message
+  "Copy a message to the target folder and delete it from the source. Returns true on confirmed success, false if any step failed."
+  [^Message message ^Folder source-folder ^Folder target-folder]
   (try
     (.setPeek ^IMAPMessage message true)
     (.copyMessages source-folder (into-array Message [message]) target-folder)
@@ -271,11 +280,20 @@
     (t/log! :debug ["Set DELETED flag for" message])
     (.expunge source-folder)
     (t/log! :debug ["Expunged source folder"])
-    (catch Exception e (t/log! {:level :error :error e} ["There was an error copying and deleting the message" message]))))
+    true
+    (catch Exception e (t/log! {:level :error :error e} ["There was an error copying and deleting the message" message])
+           false)))
 
 (defn inbox-or-category-folder-name [^Store store ^String folder-name default]
   (let [real-default (if (s/blank? default) "INBOX" default)]
     (if (nil? folder-name) real-default (structured-folder-name store folder-name))))
+
+(defn inbox-or-default-category-folder-name
+  "Like inbox-or-category-folder-name but resolves a category to its DEFAULT folder, ignoring any custom destination.
+   Used to locate emails that were filed before per-email folder tracking existed: they always live under the default scheme."
+  [^Store store ^String folder-name default]
+  (let [real-default (if (s/blank? default) "INBOX" default)]
+    (if (nil? folder-name) real-default (default-category-folder-name store folder-name))))
 
 (defn move-message
   "Find the proper location for the email and move it there. Returns the name of the folder to which the email was moved."
@@ -285,14 +303,23 @@
         capabilities ^PersistentVector (:capabilities connection-data)
         structured-folder (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))
         target-folder ^IMAPFolder (.getFolder ^Store store ^String structured-folder)]
-    (if (.contains capabilities :move)
+    (cond
+      (= (.getFullName source-folder) structured-folder)
+      (do (t/log! :debug ["Target folder" structured-folder "is the same as the source folder. Leaving the message in place."])
+          structured-folder)
+
+      (.contains capabilities :move)
       (do (t/log! :debug ["Moving message from" source-folder "to" target-folder])
           (.setPeek ^IMAPMessage message true)
           (.moveMessages ^IMAPFolder source-folder (into-array Message [message]) target-folder)
           structured-folder)
+
+      :else
       (do (t/log! :debug "Server does not support the IMAP MOVE command. Using copy and delete as fallback.")
-          (copy-message message source-folder target-folder)
-          structured-folder))))
+          ;; Only report the new folder if the copy+delete actually succeeded, so a failed
+          ;; fallback is never recorded as a completed move.
+          (when (copy-message message source-folder target-folder)
+            structured-folder)))))
 
 (defn monitor->map [monitor]
   (if (nil? monitor)
@@ -317,9 +344,20 @@
   (let [^ConnectionData connection-data (connection-data-from-id id)]
     (if (connected? connection-data)
       (let [^Store store (:store connection-data)
-            ^String source-folder-name (inbox-or-category-folder-name store source-name (-> connection-data :config :folder))
+            ^String source-folder-name (let [recorded-folder (db/email-folder message-id)]
+                                         (if (s/blank? recorded-folder)
+                                           ;; No recorded folder: the email predates folder tracking, so it lives under
+                                           ;; the DEFAULT category folder, never a (newer, possibly-changed) custom destination.
+                                           (inbox-or-default-category-folder-name store source-name (-> connection-data :config :folder))
+                                           recorded-folder))
             ^String target-folder-name (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))]
-        (with-open [^IMAPFolder target-folder (open-folder-in-store store target-folder-name)
+        (if (= source-folder-name target-folder-name)
+          (do (t/log! :info ["Source and target folder are both" target-folder-name "- leaving the message in place."])
+              ;; Even though nothing moves, record the resolved folder so a previously-unrecorded
+              ;; (legacy) email gets a concrete location and stays findable for future moves.
+              (db/update-email-folder message-id target-folder-name)
+              true)
+          (with-open [^IMAPFolder target-folder (open-folder-in-store store target-folder-name)
                     ^IMAPFolder source-folder (open-folder-in-store store source-folder-name)]
           (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
             (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
@@ -330,15 +368,17 @@
                   (set-messages-as-peek found-messages)
                   (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
                   (.moveMessages source-folder (into-array Message found-messages) target-folder)
+                  (db/update-email-folder message-id target-folder-name)
                   (start-monitoring connection-data context)
                   true)
                 (do
                   (set-messages-as-peek found-messages)
                   (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
                   (.moveMessages source-folder (into-array Message found-messages) target-folder)
+                  (db/update-email-folder message-id target-folder-name)
                   true))
               (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName store)])
-                  false)))))
+                  false))))))
       (do
         (t/log! :info ["IMAP store in connection" (:id (:config connection-data)) "is not connected. Cancelling the move attempt."])
         false))))
@@ -480,6 +520,7 @@
       {:message-count (.getMessageCount folder)
        :connection-id (id-from-connection connection-data)
        :folder folder}))
+  (current-folder-name [_ folder] (.getFullName ^Folder folder))
   (nth-email-from-folder [_ n folder]
     (let [message (.getMessage ^IMAPFolder folder n)]
       (set-message-as-peek message)

@@ -189,12 +189,30 @@
   "Client is not called if move=true but not category")
 
 (deftest handle-incoming-email-happy-path
-  (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
-        db (reify int/DB (save-email [_ _] true))
-        client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] true))
-        test-result (app/handle-incoming-imap-email {} {:move? true} {:analyzer analyzer :db db :client client})]
-    (is (= :ok (:result test-result))))
+  (let [recorded (atom nil)
+        analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
+        db (reify int/DB
+             (save-email [_ _] true)
+             (update-email-folder [_ message-id folder] (reset! recorded [message-id folder])))
+        client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] "Categories/Test"))
+        test-result (app/handle-incoming-imap-email {:header {:message-id "happy-1"}} {:move? true} {:analyzer analyzer :db db :client client})]
+    (is (= :ok (:result test-result)))
+    (is (= ["happy-1" "Categories/Test"] @recorded) "A successful move records the destination folder"))
   "Happy path. All underlying functions are called normally. Return an :ok result.")
+
+(deftest handle-incoming-email-failed-move-records-source-folder
+  (let [recorded (atom nil)
+        analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
+        db (reify int/DB
+             (save-email [_ _] true)
+             (update-email-folder [_ message-id folder] (reset! recorded [message-id folder])))
+        client (reify int/EmailClient
+                 (move-email-to-category [_ _ _ _ _] nil)         ; move did not complete (e.g. copy fallback failed)
+                 (current-folder-name [_ folder] (str folder)))
+        test-result (app/handle-incoming-imap-email {:header {:message-id "fail-1"}} {:move? true :origin-folder :inbox} {:analyzer analyzer :db db :client client})]
+    (is (= :ok (:result test-result)))
+    (is (= ["fail-1" ":inbox"] @recorded) "A failed move records the email's actual (source) folder, not the destination"))
+  "When a move does not complete, the email stays in its source folder and that folder is recorded so later recategorization can still find it.")
 
 (deftest read-emails-from-folder-continues-after-read-exception
   (let [read-attempts (atom [])
@@ -202,6 +220,7 @@
         client (reify int/EmailClient
                  (number-of-messages-in-folder [_ _ _]
                    {:message-count 3 :connection-id "test-connection" :folder :test-folder})
+                 (current-folder-name [_ folder] (str folder))
                  (nth-email-from-folder [_ n _]
                    (swap! read-attempts conj n)
                    (if (= n 2)
@@ -210,7 +229,8 @@
         analyzer (reify int/Analyzer
                    (enrich-email [_ email] (assoc email :metadata {:category nil})))
         db (reify int/DB
-             (save-email [_ email] (swap! saved-subjects conj (-> email :header :subject))))]
+             (save-email [_ email] (swap! saved-subjects conj (-> email :header :subject)))
+             (update-email-folder [_ _ _] nil))]
     (is (= 3 (app/read-emails-from-folder {} "Newsletter" {:move? false} {:client client :analyzer analyzer :db db})))
     (let [deadline (+ (System/currentTimeMillis) 1000)]
       (loop []

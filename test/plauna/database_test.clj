@@ -47,3 +47,10 @@
     (is (= "SELECT headers.message_id, in_reply_to, subject, mime_type, date FROM headers INNER JOIN metadata ON headers.message_id = metadata.message_id WHERE (headers.message_id = ?) AND (metadata.language IS NOT NULL) AND (metadata.category IS NOT NULL)"
            (first sql)))))
 
+(deftest email-folder-round-trip
+  (db/save-headers [{:mime-type "text/plain" :subject "f" :message-id "folder-rt" :date 0 :in-reply-to nil}])
+  (db/update-metadata-category "folder-rt" nil 1.0)
+  (db/update-email-folder "folder-rt" "Archive/Projects")
+  (is (= "Archive/Projects" (db/email-folder "folder-rt")) "Recorded folder is persisted and read back through metadata.folder")
+  (is (nil? (db/email-folder "no-such-message")) "Unknown message has no recorded folder"))
+

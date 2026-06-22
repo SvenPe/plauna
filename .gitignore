@@ -19,3 +19,4 @@ pom.xml.asc
 .cpcache/
 /node_modules
 /resources/public/css/tailwind.css
+/tmp
