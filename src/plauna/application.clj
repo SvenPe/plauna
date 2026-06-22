@@ -131,6 +131,14 @@
          (success-result :ok {:move process-result}))
        (catch Exception e (error-result e "Error encountered when processing incoming email"))))
 
+(defn- process-nth-email-from-folder [client n folder-name folder options context messages-result]
+  (try
+    (let [email-message (int/nth-email-from-folder client n folder)]
+      (incoming-email-workflow email-message (:connection-id messages-result) folder options context))
+    (catch Exception e
+      (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
+      (error-result e "Error encountered when reading email from folder"))))
+
 (defn read-emails-from-folder
   "Read all emails from a folder and process them. Returns the number of messages in the folder. Emails are processed on another thread."
   [connection-data folder-name options {:keys [client] :as context}]
@@ -141,8 +149,7 @@
         (t/log! :info ["There are" (:message-count messages-result) "emails in" folder-name "The messages will get processed asynchronously"])
         (async/go
           ;; reading email is index 1
-          (doseq [n (range 1 (inc (:message-count messages-result)))
-                  :let [email-message (int/nth-email-from-folder client n folder)]]
-            (incoming-email-workflow email-message (:connection-id messages-result) folder options context))))
+          (doseq [n (range 1 (inc (:message-count messages-result)))]
+            (process-nth-email-from-folder client n folder-name folder options context messages-result))))
       (t/log! :info ["There are no emails in the folder. Doing nothing."]))
     (:message-count messages-result)))

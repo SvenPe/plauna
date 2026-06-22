@@ -195,3 +195,28 @@
         test-result (app/handle-incoming-imap-email {} {:move? true} {:analyzer analyzer :db db :client client})]
     (is (= :ok (:result test-result))))
   "Happy path. All underlying functions are called normally. Return an :ok result.")
+
+(deftest read-emails-from-folder-continues-after-read-exception
+  (let [read-attempts (atom [])
+        saved-subjects (atom [])
+        client (reify int/EmailClient
+                 (number-of-messages-in-folder [_ _ _]
+                   {:message-count 3 :connection-id "test-connection" :folder :test-folder})
+                 (nth-email-from-folder [_ n _]
+                   (swap! read-attempts conj n)
+                   (if (= n 2)
+                     (throw (ex-info "failed to read message" {:n n}))
+                     {:email {:header {:subject (str "email-" n)}} :message n})))
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        db (reify int/DB
+             (save-email [_ email] (swap! saved-subjects conj (-> email :header :subject))))]
+    (is (= 3 (app/read-emails-from-folder {} "Newsletter" {:move? false} {:client client :analyzer analyzer :db db})))
+    (let [deadline (+ (System/currentTimeMillis) 1000)]
+      (loop []
+        (when (and (< (count @saved-subjects) 2)
+                   (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)
+          (recur))))
+    (is (= [1 2 3] @read-attempts))
+    (is (= ["email-1" "email-3"] @saved-subjects))))
