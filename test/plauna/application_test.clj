@@ -218,9 +218,9 @@
   (let [read-attempts (atom [])
         saved-subjects (atom [])
         client (reify int/EmailClient
-                 (number-of-messages-in-folder [_ _ _]
+                 (open-folder-for-bulk-read [_ _ _]
                    {:message-count 3 :connection-id "test-connection" :folder :test-folder})
-                 (pause-monitoring-for-folder [_ _ _] false)
+                 (close-folder-for-bulk-read [_ _] nil)
                  (current-folder-name [_ folder] (str folder))
                  (nth-email-from-folder [_ n _]
                    (swap! read-attempts conj n)
@@ -239,5 +239,7 @@
                    (< (System/currentTimeMillis) deadline))
           (Thread/sleep 10)
           (recur))))
-    (is (= [1 2 3] @read-attempts))
-    (is (= ["email-1" "email-3"] @saved-subjects))))
+    ;; Sequence numbers are processed high -> low so that moving/expunging a message never shifts the
+    ;; numbers of messages not yet processed. Message 2 throws on read and is skipped; 3 and 1 succeed.
+    (is (= [3 2 1] @read-attempts))
+    (is (= ["email-3" "email-1"] @saved-subjects))))

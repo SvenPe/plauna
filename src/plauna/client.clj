@@ -299,7 +299,10 @@
   "Find the proper location for the email and move it there. Returns the name of the folder to which the email was moved."
   [connection-id ^Message message ^Folder source-folder ^String target-name]
   (let [connection-data (connection-data-from-id connection-id)
-        store (:store connection-data)
+        ;; Resolve and open the target folder from the SAME Store as the source folder. moveMessages and
+        ;; the copy fallback cannot operate across two different Stores, and during a bulk parse the source
+        ;; lives in a dedicated bulk-read Store rather than the monitor's Store.
+        store ^Store (.getStore source-folder)
         capabilities ^PersistentVector (:capabilities connection-data)
         structured-folder (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))
         target-folder ^IMAPFolder (.getFolder ^Store store ^String structured-folder)]
@@ -480,6 +483,35 @@
 
 (defn id-from-connection [connection-data] (get-in connection-data [:config :id]))
 
+(defn open-folder-for-bulk-read
+  "Open folder-name on a DEDICATED Store connection, separate from the monitoring connection.
+   Bulk reading and the IDLE monitor therefore never share a connection or folder object, which
+   avoids deadlocking the monitored folder's IDLE. Returns a handle to close with close-folder-for-bulk-read."
+  [connection-data folder-name]
+  (let [connection-config (:config connection-data)]
+    (when (oauth2? connection-config) (refresh-access-token connection-config))
+    (let [^Store store (login connection-config)]
+      (try
+        (let [^IMAPFolder folder (open-folder-in-store store folder-name)]
+          {:store store
+           :folder folder
+           :message-count (.getMessageCount folder)
+           :connection-id (id-from-connection connection-data)})
+        (catch Exception e
+          ;; Opening/counting failed - don't leak the just-opened Store.
+          (try (.close store) (catch Exception _ nil))
+          (throw e))))))
+
+(defn close-folder-for-bulk-read [bulk-handle]
+  (let [^Folder folder (:folder bulk-handle)
+        ^Store store (:store bulk-handle)]
+    (when (some? folder)
+      (try (when (.isOpen folder) (.close folder false))
+           (catch Exception e (t/log! {:level :error :error e} "Error closing bulk-read folder"))))
+    (when (some? store)
+      (try (.close store)
+           (catch Exception e (t/log! {:level :error :error e} "Error closing bulk-read store"))))))
+
 (defmulti connect (fn [config _] (:auth-type config)))
 
 (defmethod connect "oauth2" [connection-config context]
@@ -515,21 +547,9 @@
   (connection-id-for-email [_ connections email] (connection-id-for-email connections email))
   (move-email-between-categories [_ connection-id message-id old-category new-category context] (move-messages-by-id-between-category-folders connection-id message-id old-category new-category context))
   (move-email-to-category [_ connection-id message original-folder category] (move-message connection-id message original-folder category))
-  (number-of-messages-in-folder [_ connection-data folder-name]
-    (let [folder ^Folder (folder-from-connection  connection-data folder-name)]
-      {:message-count (.getMessageCount folder)
-       :connection-id (id-from-connection connection-data)
-       :folder folder}))
   (current-folder-name [_ folder] (.getFullName ^Folder folder))
-  (pause-monitoring-for-folder [_ connection-data folder-name]
-    (if (= (monitor-folder-name folder-name) (monitor-folder-name (-> connection-data :config :folder)))
-      (do (t/log! :info ["Pausing IDLE monitoring to bulk-read the monitored folder:" folder-name])
-          (stop-monitoring connection-data)
-          true)
-      false))
-  (resume-monitoring [_ connection-data context]
-    (t/log! :info ["Resuming IDLE monitoring for" (-> connection-data :config :folder)])
-    (-> connection-data (start-monitoring context) schedule-health-checks))
+  (open-folder-for-bulk-read [_ connection-data folder-name] (open-folder-for-bulk-read connection-data folder-name))
+  (close-folder-for-bulk-read [_ bulk-handle] (close-folder-for-bulk-read bulk-handle))
   (nth-email-from-folder [_ n folder]
     (let [message (.getMessage ^IMAPFolder folder n)]
       (set-message-as-peek message)

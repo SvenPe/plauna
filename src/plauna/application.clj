@@ -168,25 +168,29 @@
       (error-result e "Error encountered when reading email from folder"))))
 
 (defn read-emails-from-folder
-  "Read all emails from a folder and process them. Returns the number of messages in the folder. Emails are processed on another thread."
+  "Read all emails from a folder and process them. Returns the number of messages in the folder.
+   Emails are read over a DEDICATED IMAP connection (separate from the IDLE monitor, so the two never
+   contend for the same folder/connection) and processed on another thread."
   [connection-data folder-name options {:keys [client] :as context}]
-  (let [messages-result (int/number-of-messages-in-folder client connection-data folder-name)
-        folder (:folder messages-result)]
-    (if (> (:message-count messages-result) 0)
+  (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
+        folder (:folder bulk)
+        message-count (:message-count bulk)]
+    (if (> message-count 0)
       (do
-        (t/log! :info ["There are" (:message-count messages-result) "emails in" folder-name "The messages will get processed asynchronously"])
+        (t/log! :info ["There are" message-count "emails in" folder-name "The messages will get processed asynchronously"])
         ;; Use async/thread (a real thread), not async/go: each email does blocking JDBC and IMAP work,
         ;; and a long blocking loop inside a go block would tie up a shared core.async dispatch thread.
         (async/thread
-          ;; If we're bulk-reading the folder that is being IDLE-monitored, pause monitoring first.
-          ;; Otherwise the periodic health check re-arms IDLE on the same folder and collides with the
-          ;; bulk read, hanging the processing thread. Always resume afterwards.
-          (let [paused? (int/pause-monitoring-for-folder client connection-data folder-name)]
-            (try
-              ;; reading email is index 1
-              (doseq [n (range 1 (inc (:message-count messages-result)))]
-                (process-nth-email-from-folder client n folder-name folder options context messages-result))
-              (finally
-                (when paused? (int/resume-monitoring client connection-data context)))))))
-      (t/log! :info ["There are no emails in the folder. Doing nothing."]))
-    (:message-count messages-result)))
+          (try
+            ;; Iterate sequence numbers high -> low. When move? is enabled a processed message is moved
+            ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
+            ;; Going downward means the numbers we have not processed yet are never affected, so no
+            ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
+            (doseq [n (range message-count 0 -1)]
+              (process-nth-email-from-folder client n folder-name folder options context bulk))
+            (finally
+              (int/close-folder-for-bulk-read client bulk)))))
+      (do
+        (int/close-folder-for-bulk-read client bulk)
+        (t/log! :info ["There are no emails in the folder. Doing nothing."])))
+    message-count))
