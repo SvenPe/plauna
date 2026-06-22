@@ -2,6 +2,7 @@
   (:require [plauna.interfaces :as int]
             [taoensso.telemere :as t]
             [clojure.core.async :as async]
+            [clojure.string :as str]
             [plauna.core.email :as core-email]
             [plauna.util.page :as page]))
 
@@ -67,12 +68,24 @@
                   :search-text (:search-text parameters)}
      :optional {:categories cat-list}}))
 
-(defn create-new-category! [context category]
+(defn create-new-category! [context category destination-folder]
   (let [db (:db context)
-        client (:client context)]
-    (int/save-category db category)
+        client (:client context)
+        cleaned (when-not (str/blank? destination-folder) (str/trim destination-folder))]
+    (int/save-category db category cleaned)
     (doseq [connection-data (vals (int/connections client))]
       (int/create-category-directories! client connection-data [category]))))
+
+(defn update-category-destination-folder!
+  "Persist the destination folder for a category and make sure the folder exists on every active connection.
+   A blank destination-folder restores the default 'Categories/<Name>' behaviour. Existing emails are not moved."
+  [context id category-name destination-folder]
+  (let [db (:db context)
+        client (:client context)
+        cleaned (when-not (str/blank? destination-folder) (str/trim destination-folder))]
+    (int/update-category-destination-folder db id cleaned)
+    (doseq [connection-data (vals (int/connections client))]
+      (int/create-category-directories! client connection-data [category-name]))))
 
 (defn move-email-to-category
   "Email address of the recipient is usually the 'username' in the connection data. It may be different, if the user is using some kind of email masking service. If the email and the username match, we know where to look for. If not, we have to loop over the connections and try to find the email by id before moving it to its new directory. This all pressupposes that the message-id is really unique."

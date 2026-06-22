@@ -123,7 +123,10 @@
       (conj result-map {folder-name :already-exists}))))
 
 (defn structured-folder-name [store lower-case-folder-name]
-  (str parent-folder-name (folder-separator store) (s/capitalize lower-case-folder-name)))
+  (let [destination-folder (:destination_folder (db/category-by-name lower-case-folder-name))]
+    (if (s/blank? destination-folder)
+      (str parent-folder-name (folder-separator store) (s/capitalize lower-case-folder-name))
+      destination-folder)))
 
 (defn create-folders
   ([store folder-names]

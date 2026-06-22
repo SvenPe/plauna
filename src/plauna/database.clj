@@ -177,11 +177,18 @@
 (defn get-categories []
   (jdbc/execute! (ds) (honey/format {:select [:*] :from :categories}) builder-function))
 
-(defn create-category [category]
-  (jdbc/execute! (ds) (honey/format {:insert-into :categories :columns [:name] :values [[category]]})))
+(defn create-category
+  ([category] (create-category category nil))
+  ([category destination-folder]
+   (jdbc/execute! (ds) (honey/format {:insert-into :categories :columns [:name :destination_folder] :values [[category destination-folder]]}))))
 
 (defn delete-category-by-id [id]
   (jdbc/execute! (ds) (honey/format {:delete-from :categories :where [:= :id id]})))
+
+(defn update-category-destination-folder [id destination-folder]
+  (jdbc/execute! (ds) (honey/format {:update :categories
+                                     :set    {:destination_folder destination-folder}
+                                     :where  [:= :id id]})))
 
 (defn delete-email-by-message-id [message-id]
   (let [conn (jdbc/get-connection (ds))]
@@ -411,7 +418,8 @@
   (fetch-auth-provider [_ id] (get-auth-provider id))
   (fetch-categories [_] (get-categories))
   (fetch-emails [_ entity customization] (fetch-data entity customization))
-  (save-category [_ category-name] (create-category category-name))
+  (save-category [_ category-name destination-folder] (create-category category-name destination-folder))
+  (update-category-destination-folder [_ id destination-folder] (update-category-destination-folder id destination-folder))
   (save-email [_ email]
     (save-headers [(:header email)])
     (save-bodies (:body email))

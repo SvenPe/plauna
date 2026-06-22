@@ -7,7 +7,8 @@
   (fetch-auth-provider [this id])
   (fetch-categories [this] "Get a list of all categories")
   (fetch-emails [this entity customization] "Get a list of emails")
-  (save-category [this category-name])
+  (save-category [this category-name destination-folder])
+  (update-category-destination-folder [this id destination-folder] "Set the IMAP folder that emails of this category should be moved to. A blank value restores the default 'Categories/<Name>' behaviour.")
   (save-email [this email]))
 
 (defprotocol EmailClient

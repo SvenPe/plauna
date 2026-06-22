@@ -98,11 +98,11 @@
 (deftest create-a-category
   (let [db-called (atom false)
         client-called (atom false)
-        database (reify int/DB (save-category [_ _] (swap! db-called (fn [_] true))))
+        database (reify int/DB (save-category [_ _ _] (swap! db-called (fn [_] true))))
         client (reify int/EmailClient
                  (connections [_] {"does not matter" "some-data"})
                  (create-category-directories! [_ _ _] (swap! client-called (fn [_] true))))]
-    (app/create-new-category! {:db database :client client} "test")
+    (app/create-new-category! {:db database :client client} "test" nil)
     (is (= true @db-called))
     (is (= true @client-called)))
   "Creating a new category makes correct database and client calls")

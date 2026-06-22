@@ -267,7 +267,13 @@
        (success-html-with-body (markup/languages-admin-page language-preferences))))
 
    (comp/POST "/admin/categories" {params :params}
-     (app/create-new-category! context (:name params))
+     (app/create-new-category! context (:name params) (:destination-folder params))
+     {:status  301
+      :headers {"Location" "/admin/categories"}
+      :body    (markup/administration {:repl (get-status-repl-server)})})
+
+   (comp/POST "/admin/categories/:id" {route-params :route-params params :params}
+     (app/update-category-destination-folder! context (:id route-params) (:name params) (:destination-folder params))
      {:status  301
       :headers {"Location" "/admin/categories"}
       :body    (markup/administration {:repl (get-status-repl-server)})})
