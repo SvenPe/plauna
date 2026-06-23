@@ -191,9 +191,16 @@ Changing a destination folder does not move e-mails that were already filed; it 
 
 *** Categorize E-mails
 
-Under the tab "E-mails" you can edit the language and category of every e-mail; either as a batch operation or by clicking on an e-mail and changing it at the details page.
+Under the tab "E-mails" you can edit the language and category of every e-mail directly in the list, or by clicking on an e-mail and changing it on the details page.
 
-The UI is responsive and works on phones, so you can recategorize e-mails on the go: the e-mail list keeps the category dropdown visible on small screens for quick batch updates.
+Changes in the list are saved *immediately* when you change a field - there is no "Batch Update" button to click:
+
+- Changing an e-mail's *category* moves the e-mail to that category's folder on the IMAP server and saves the new category. If the move fails (for example when there is no active IMAP connection), the category is *not* saved so the stored metadata always reflects the e-mail's real location. Choosing "n/a" clears the category without moving the e-mail.
+- Changing an e-mail's *language* saves it right away as well. Clearing the field removes the stored language.
+
+Each field briefly outlines itself to show the result: green when fully saved, amber when the category could not be moved (and was therefore not saved), and red on unexpected failure.
+
+The UI is responsive and works on phones, so you can recategorize e-mails on the go: the e-mail list keeps the category dropdown visible on small screens, and each change is saved instantly.
 
 *** Filtering and Navigating the E-mail List
 

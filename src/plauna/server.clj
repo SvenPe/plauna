@@ -337,6 +337,38 @@
    (comp/GET "/statistics" {}
      (success-html-with-body (markup/statistics-overall (db/yearly-email-stats) (mime-type-statistics :yearly) (language-statistics-by-period :yearly) (category-statistics-by-period {:interval :yearly}))))
 
+   (comp/POST "/metadata/category" request
+     ;; Recategorize a single email immediately (the e-mail list's category dropdown calls this on
+     ;; change, so no "Batch Update" click is needed). The category is only persisted when the IMAP move
+     ;; succeeds, so the stored category always reflects the real IMAP location. Clearing (n/a) always
+     ;; saves without a move. Returns 204 on full success, 200 (amber in the UI) when the move failed,
+     ;; and 500 on unexpected error.
+     (let [message-id (:message-id (:params request))
+           category (:category (:params request))
+           new-category-id (when (seq category) (Integer/parseInt category))]
+       (if (nil? new-category-id)
+         ;; Clearing the category — no move, just save.
+         (do (db/update-metadata-category message-id nil 1.0)
+             {:status 204})
+         (let [email-before (enriched-email-by-message-id message-id)
+               new-category-name (get (first (filter #(= (:id %) new-category-id) (db/get-categories))) :name "")
+               process (app/move-email-to-category email-before new-category-name context)
+               moved? (= :ok (:result process))]
+           (if moved?
+             (do (db/update-metadata-category message-id new-category-id 1.0)
+                 {:status 204})
+             ;; Move failed — do not update the category so metadata stays consistent with the real folder.
+             {:status 200 :headers {"Content-Type" "text/plain"} :body "saved-not-moved"})))))
+
+   (comp/POST "/metadata/language" request
+     ;; Update a single email's detected language immediately (the language field calls this on change).
+     ;; A blank value is treated as nil (clearing the language) to match the old batch-update behaviour
+     ;; and avoid leaving an empty string that confuses enriched-only filters.
+     (let [{:keys [message-id language]} (:params request)
+           lang (when (seq language) language)]
+       (db/update-metadata-language message-id lang 1.0)
+       {:status 204}))
+
    (comp/POST "/metadata" request
      (if (some? (:move (:params request)))
        (let [message-id (:message-id (:params request))
@@ -444,7 +476,8 @@
                (cond
                  (= :redirect (:result action))
                  (let [csrf (.toString (UUID/randomUUID))]
-                   (-> (redirect (oauth/authorize-uri (:provider action) csrf)) (assoc :session {:oauth-csrf csrf :connection-id id :provider (:provider action)})))
+                   (-> (redirect (oauth/authorize-uri (:provider action) csrf))
+                       (assoc :session (merge (:session request) {:oauth-csrf csrf :connection-id id :provider (:provider action)}))))
                  (= :ok (:result action))
                  (redirect-request request)
                  (= :error (:result action))
@@ -476,15 +509,18 @@
 
    (comp/GET "/oauth2/callback" request
      (let [params (:params request)
-           session (:session request)]
-       (if (= (:state params) (:oauth-csrf session))
+           session (:session request)
+           state (:state params)
+           expected-csrf (:oauth-csrf session)]
+       (if (and (seq state) (seq expected-csrf) (= state expected-csrf))
          (try
            (let [response (oauth/exchange-code-for-access-token (:provider session) (:code params))]
              (db/save-oauth-token (assoc response :connection-id (:connection-id session)))
              (app/connect-to-client context (:connection-id session)))
            (redirect "/admin/connections")
            (catch Exception e (t/log! :error e) (redirect "/admin/connections")))
-         "Bad response - csrf token mismach")))
+         (do (t/log! :warn "OAuth callback rejected: missing or mismatched CSRF token.")
+             (redirect "/admin/connections")))))
 
    (route/resources "/")))
 
@@ -496,9 +532,10 @@
           ["Writing" item-count "files. Read" read-percent "% until now. Total length: " content-length]))
 
 (defn- public-path?
-  "Paths reachable without authentication: the login endpoint and the static assets the login page needs."
+  "Paths reachable without authentication: the login endpoint, the OAuth callback, and the static assets the login page needs."
   [^String uri]
   (or (= uri "/login")
+      (= uri "/oauth2/callback")
       (.startsWith uri "/css/")
       (.startsWith uri "/favicon")
       (.startsWith uri "/android-chrome")

@@ -35,7 +35,7 @@
     <a class="disabled:text-indigo-100 rounded-lg px-4 py-2 disabled:bg-sky-500" href="#">Prev</a>
     {% endif %}
     <span class="mx-2">{{page.page}}</span>
-    {% if page.page <= page.last-page %}
+    {% if page.page < page.total-pages %}
     <a class="rounded-none px-4 py-2 ring-2 ring-purple-900 hover:bg-purple-900 hover:text-white" href="?page={{page.page|add:1}}&page-size={{page.size}}">Next</a>
     {% else %}
     <a class="disabled:text-indigo-100 rounded-lg px-4 py-2 disabled:bg-sky-500" href="#">Next</a>

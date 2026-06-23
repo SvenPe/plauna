@@ -28,7 +28,7 @@
       <button disabled class="btn join-item text-xs lg:text-md text-nowrap">&lsaquo; Back</button>
       {% endif %}
       <p class="text-sm lg:text-md text-nowrap mx-2">{{page.page}} of {{page.total-pages}}</p>
-      {% if page.page <= page.last-page %}
+      {% if page.page < page.total-pages %}
       <form action="/emails" method="get">
         <input type="hidden" name="size" value="{{page.size}}" />
         <input type="hidden" name="search-field" value="subject" />

@@ -179,6 +179,13 @@
                                       (do-update-set :category :category_modified :category_confidence)))
                           (honey/format))))
 
+(defn update-metadata-language [message_id language confidence]
+  (jdbc/execute! (ds) (-> (insert-into :metadata)
+                          (values [{:message_id message_id :language language :language_modified [:strftime "%s" "now"] :language_confidence confidence}])
+                          (upsert (-> (on-conflict :message_id)
+                                      (do-update-set :language :language_modified :language_confidence)))
+                          (honey/format))))
+
 (defn update-email-folder
   "Record the IMAP folder a message currently lives in, so later moves can find it regardless of category-to-folder mapping changes."
   [message-id folder]

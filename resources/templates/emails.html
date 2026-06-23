@@ -61,19 +61,7 @@
 
 {% include "emails-pagination.html" %}
 
-<form action="/metadata" id="emails" method="post"></form>
-<input type="hidden" name="size" value="{{page.size}}" />
-<input type="hidden" name="search-field" value="subject" />
-<input type="hidden" name="search-text" value="{{page.search-text}}" />
-<input type="hidden" name="page" value="{{page.page|add:1}}" />
-<input type="hidden" name="filter" value="{{page.filter}}" />
-<input form="emails" hidden="true" name="redirect-url" type="text" value="/emails">
 <div class="w-full">
-  {% for email in emails %}
-  <input form="emails" hidden="true" name="message-id" type="text" value="{{email.header.message-id}}">
-  <input form="emails" hidden="true" name="language-confidence" type="text" value="1">
-  <input form="emails" hidden="true" name="category-confidence" type="text" value="1">
-  {% endfor %}
   <table class="table table-zebra">
     <thead class="table-header-group">
       <tr class="table-row">
@@ -94,10 +82,11 @@
         <td class="table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.header.subject}}</a></td>
         <td class="hidden lg:table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.participants|concat-senders}}</a></td>
         <td class="hidden lg:table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.participants|concat-receivers}}</a></td>
-        <td class="hidden lg:table-cell"><input class="input" form="emails" name="language" type="text" value="{{email.metadata.language}}"></td>
+        <td class="hidden lg:table-cell"><input class="input" type="text" value="{{email.metadata.language}}" data-message-id="{{email.header.message-id}}" onchange="updateLanguage(this)"></td>
         <td class="hidden lg:table-cell">{{email.metadata.language-confidence|double-format-nillable:10}}</td>
         <td>
-          <select class="select w-28 sm:w-32" form="emails" name="category">
+          <select class="select w-28 sm:w-32"
+                  data-message-id="{{email.header.message-id}}" onchange="recategorizeEmail(this)">
             {% for category in categories %}
             <option value="{{category.id}}" {% if email.metadata.category-id = category.id %} selected {% endif %}>{{category.name}}</option>
             {% endfor %}
@@ -107,10 +96,43 @@
       {% endfor %}
     </tbody>
     </table>
-  <button class="btn btn-primary my-4" form="emails">Batch Update</button>
   </div>
 
 {% include "emails-pagination.html" %}
+
+<script>
+  // Briefly outline a field to show the outcome of an auto-save. color: green/amber/red.
+  function flash(el, color) {
+    el.style.outline = '2px solid ' + color;
+    setTimeout(function () { el.style.outline = ''; }, 1400);
+  }
+
+  function autosave(el, url, fields) {
+    el.disabled = true;
+    fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams(fields)
+    }).then(function (res) {
+      el.disabled = false;
+      // 204 = saved and moved; 200 = move failed (category not saved); otherwise an error.
+      flash(el, res.status === 204 ? '#16a34a' : (res.ok ? '#d97706' : '#dc2626'));
+    }).catch(function () {
+      el.disabled = false;
+      flash(el, '#dc2626');
+    });
+  }
+
+  // Recategorize (and move) an e-mail when its category dropdown changes - no "Batch Update" needed.
+  function recategorizeEmail(select) {
+    autosave(select, '/metadata/category', {'message-id': select.dataset.messageId, 'category': select.value});
+  }
+
+  // Save an e-mail's language when its language field changes.
+  function updateLanguage(input) {
+    autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
+  }
+</script>
 
 {% endif %}
 

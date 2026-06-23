@@ -60,9 +60,9 @@
         context {:config application-config :client (ImapClient.) :db (SqliteDB.) :analyzer (BasicAnalyzer.)}]
     (files/check-and-create-database-file)
     (db/create-db)
+    (auth/initialize!)
     (t/log! :info "Setting log level according to preferences.")
     (t/set-min-level! (preferences/log-level))
-    (auth/initialize!)
     (diagnostics/start-watchdog! 60)
     (start-imap-client context)
     (events/start-event-loops event-register)
