@@ -33,10 +33,13 @@
             [taoensso.telemere :as t])
   (:import [java.net ServerSocket]
            [java.util UUID]
-           [org.eclipse.jetty.server Server]))
+           [java.util.concurrent ExecutorService Executors]
+           [org.eclipse.jetty.server Server]
+           [org.eclipse.jetty.util.thread QueuedThreadPool]))
 
 (set! *warn-on-reflection* true)
 
+;; Holds {:jetty ^Server, :executor ^ExecutorService} when running, nil otherwise.
 (defonce server (atom nil))
 
 (defonce repl-server (atom nil))
@@ -646,20 +649,31 @@
 (defn start-server [context]
   (let [config (:config context)
         port (if (some? (-> (:server config) :port)) (-> (:server config) :port) (get-random-port))
-        new-app (app context)]
+        new-app (app context)
+        executor (Executors/newVirtualThreadPerTaskExecutor)]
     (t/log! :info [(str "Starting server: http://0.0.0.0:" port)])
-    (reset! server
-            (jetty/run-jetty (fn [req] (new-app req))
-                             {:port        port
-                              :join?       false
-                              :min-threads 2}))))
+    (try
+      (let [jetty (jetty/run-jetty (fn [req] (new-app req))
+                                   {:port        port
+                                    :join?       false
+                                    :configurator (fn [^Server s]
+                                                    (.setVirtualThreadsExecutor
+                                                     ^QueuedThreadPool (.getThreadPool s)
+                                                     executor))})]
+        (reset! server {:jetty jetty :executor executor}))
+      (catch Exception e
+        (.close ^ExecutorService executor)
+        (throw e)))))
 
 (defn stop-server []
-  (if-some [s ^Server @server]
+  (if-some [{^Server jetty :jetty ^ExecutorService executor :executor} @server]
     (do
-      (let [port (.getPort (.getURI s))]
+      (let [port (.getPort (.getURI jetty))]
         (t/log! {:level :info} ["Stopping server on port" port]))
-      (.stop s)
+      (try
+        (.stop jetty)
+        (finally
+          (.close executor)))
       (reset! server nil)
       nil)
     (do (t/log! :info "No server running.")

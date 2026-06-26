@@ -54,7 +54,7 @@ The second way to get Plauna is fetching it from the git repository and compilin
 clj -T:build uber
 #+end_src
 
-This will produce a Plauna uberjar in the ./target directory which you can run using a Java Runtime Environment.
+This will produce a Plauna uberjar in the ./target directory which you can run using Java 21 or later (required for virtual thread support).
 
 * Security
 
