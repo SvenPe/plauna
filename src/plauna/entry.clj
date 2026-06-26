@@ -7,6 +7,7 @@
    [plauna.core.email :as core.email]
    [plauna.core.events :as events]
    [plauna.database :as db]
+   [plauna.db-config :as db-cfg]
    [plauna.diagnostics :as diagnostics]
    [plauna.files :as files]
    [plauna.messaging :as messaging]
@@ -58,7 +59,10 @@
   (setup-logging)
   (let [application-config (files/parse-config-from-cli-arguments args)
         context {:config application-config :client (ImapClient.) :db (SqliteDB.) :analyzer (BasicAnalyzer.)}]
-    (files/check-and-create-database-file)
+    (let [db-config (db-cfg/load-config)]
+      (db/setup-db! db-config)
+      (when (= :sqlite (:type db-config))
+        (files/check-and-create-database-file)))
     (db/create-db)
     (auth/initialize!)
     (t/log! :info "Setting log level according to preferences.")

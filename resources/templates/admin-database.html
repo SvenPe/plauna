@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2 class="text-xl font-bold mb-4">Database</h2>
+
+{% if message %}
+<div role="alert" class="alert {% if message.type = "success" %}alert-success{% else %}alert-error{% endif %} mb-4">
+  <span>{{message.text}}</span>
+</div>
+{% endif %}
+
+<div class="flex flex-col gap-4">
+
+  <!-- Current status -->
+  <div class="card card-border">
+    <div class="card-body">
+      <h3 class="card-title">Current Status</h3>
+      <p>Active database: <strong>{{db-status.type}}</strong>
+        {% if db-status.type = "mariadb" %}
+          &mdash; {{db-status.host}}:{{db-status.port}}/{{db-status.name}} (user: {{db-status.user}})
+        {% endif %}
+      </p>
+      {% if db-status.type = "sqlite" %}
+      <p class="text-sm opacity-70">SQLite path: {{db-status.path}}</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Configure MariaDB -->
+  <div class="card card-border">
+    <div class="card-body">
+      <h3 class="card-title">Configure MariaDB</h3>
+      <p class="mb-3 text-sm opacity-80">
+        Changes are saved to <code>db-config.edn</code> in the data directory and take effect after
+        the next restart. Migrate your data first, then restart.
+        Environment variables (<code>PLAUNA_DB_TYPE</code>, <code>PLAUNA_DB_HOST</code>, etc.) always
+        override the saved file.
+      </p>
+      <form action="/admin/database/config" method="post" class="flex flex-col gap-3 max-w-md">
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Host</legend>
+          <input class="input" type="text" name="host" value="{{saved-config.host}}" placeholder="localhost" required />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Port</legend>
+          <input class="input" type="number" name="port" value="{{saved-config.port|default:3306}}" placeholder="3306" required />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Database name</legend>
+          <input class="input" type="text" name="name" value="{{saved-config.name}}" placeholder="plauna" required />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">User</legend>
+          <input class="input" type="text" name="user" value="{{saved-config.user}}" placeholder="plauna" required />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Password</legend>
+          <input class="input" type="password" name="password" placeholder="leave blank to keep current" />
+        </fieldset>
+        <div class="flex gap-2">
+          <button class="btn btn-primary" type="submit">Save Configuration</button>
+          <button class="btn btn-outline" type="submit" formaction="/admin/database/test">Test Connection</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Migration -->
+  <div class="card card-border">
+    <div class="card-body">
+      <h3 class="card-title">Migrate SQLite &rarr; MariaDB</h3>
+      <p class="mb-3 text-sm opacity-80">
+        Copies all data from the local SQLite file to the configured MariaDB database.
+        The SQLite file is not deleted. Migration is idempotent — running it again skips
+        duplicate rows. After a successful migration, save the config above and restart Plauna.
+      </p>
+      {% if sqlite-exists %}
+      <form action="/admin/database/migrate" method="post">
+        <button class="btn btn-warning" type="submit"
+                onclick="return confirm('This will copy all SQLite data to MariaDB. Continue?')">
+          Start Migration
+        </button>
+      </form>
+      {% else %}
+      <p class="text-sm opacity-60">SQLite database file not found — nothing to migrate.</p>
+      {% endif %}
+
+      {% if migration-counts %}
+      <div class="mt-4">
+        <p class="font-semibold">Row counts per table:</p>
+        <ul class="list-disc ml-5 text-sm">
+          {% for entry in migration-counts %}
+          <li>{{entry.table}}: {{entry.inserted}} inserted
+            {% if entry.skipped > 0 %}, <span class="text-error font-semibold">{{entry.skipped}} skipped</span>{% endif %}
+            ({{entry.total}} source rows)</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+{% endblock %}

@@ -15,6 +15,8 @@
             [plauna.diagnostics :as diagnostics]
             [plauna.core.email :as core-email]
             [plauna.database :as db]
+            [plauna.db-config :as db-cfg]
+            [plauna.db-migration :as db-mig]
             [plauna.files :as files]
             [plauna.markup :as markup]
             [plauna.messaging :as messaging]
@@ -27,6 +29,7 @@
             [ring.middleware.session.cookie :refer [cookie-store]]
             [ring.util.codec :refer [base64-decode]]
             [ring.util.response :refer [response redirect]]
+            [selmer.parser :as selmer]
             [taoensso.telemere :as t])
   (:import [java.net ServerSocket]
            [java.util UUID]
@@ -142,11 +145,13 @@
     (doseq [trained-email trained-emails] (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email)))))
 
 (defn mime-type-statistics [period]
-  (db/query-db {:select [[[:count :headers.message-id] :count] :bodies.mime-type [(db/interval-for-honey period) :interval]] :from [:bodies]
-                :join [:headers [:= :bodies.message-id :headers.message_id]]
-                :where [:<> :interval nil]
-                :group-by [:interval :bodies.mime-type]
-                :order-by [[:count :desc]]}))
+  ;; MariaDB does not allow SELECT aliases in WHERE; reference the source column directly.
+  (let [iv (db/interval-for-honey period)]
+    (db/query-db {:select [[[:count :headers.message-id] :count] :bodies.mime-type [iv :interval]] :from [:bodies]
+                  :join [:headers [:= :bodies.message-id :headers.message_id]]
+                  :where [:is-not :headers.date nil]
+                  :group-by [:interval :bodies.mime-type]
+                  :order-by [[:count :desc]]})))
 
 (defn language-statistics-by-period [period]
   (db/query-db {:select [[[:count :metadata.language] :count] :metadata.language [(db/interval-for-honey period) :interval]] :from [:metadata]
@@ -154,14 +159,16 @@
                 :group-by [:language :interval]}))
 
 (defn category-statistics-by-period [period]
-  (let [year (:year period)
+  ;; MariaDB does not allow SELECT aliases in WHERE; inline the interval expression there.
+  (let [year       (:year period)
+        iv         (db/interval-for-honey (:interval period))
         categories (reduce (fn [acc el] (merge acc {(:id el) (:name el)})) {} (db/get-categories))
         statistics (if (some? year)
-                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [(db/interval-for-honey (:interval period)) :interval]] :from [:metadata]
+                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [iv :interval]] :from [:metadata]
                                    :join [:headers [:= :metadata.message-id :headers.message_id]]
-                                   :where [:and [:<> :category nil] [:like :interval (str year "%")]]
+                                   :where [:and [:<> :category nil] [:like iv (str year "%")]]
                                    :group-by [:category :interval]})
-                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [(db/interval-for-honey (:interval period)) :interval]] :from [:metadata]
+                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [iv :interval]] :from [:metadata]
                                    :join [:headers [:= :metadata.message-id :headers.message_id]]
                                    :where [:<> :category nil]
                                    :group-by [:category :interval]}))]
@@ -235,6 +242,79 @@
        {:status  200
         :headers {"Content-Type" "text/plain; charset=UTF-8"}
         :body    dump}))
+
+   (comp/GET "/admin/database" {}
+     (let [cfg        (db-cfg/load-config)
+           saved      (when (= :mariadb (:type cfg)) (dissoc cfg :password))
+           db-status  (if (= :mariadb (db/db-type))
+                        {:type "mariadb" :host (:host cfg) :port (:port cfg)
+                         :name (:name cfg) :user (:user cfg)}
+                        {:type "sqlite" :path (files/path-to-db-file)})]
+       (success-html-with-body
+        (selmer/render-file "admin-database.html"
+                            {:db-status db-status
+                             :saved-config saved
+                             :sqlite-exists (.exists (clojure.java.io/file (files/path-to-db-file)))
+                             :header "Database"
+                             :active-nav :admin}))))
+
+   (comp/POST "/admin/database/config" request
+     (let [{:keys [host port name user password]} (:params request)
+           existing (db-cfg/load-config)
+           cfg {:type     :mariadb
+                :host     host
+                :port     (Integer/parseInt port)
+                :name     name
+                :user     user
+                :password (if (st/blank? password) (:password existing "") password)}]
+       (db-cfg/save-config! cfg)
+       (redirect "/admin/database?saved=1")))
+
+   (comp/POST "/admin/database/test" request
+     (let [{:keys [host port name user password]} (:params request)
+           existing (db-cfg/load-config)
+           cfg {:host     host
+                :port     (Integer/parseInt port)
+                :name     name
+                :user     user
+                :password (if (st/blank? password) (:password existing "") password)}
+           result (db-mig/test-connection! cfg)]
+       (success-html-with-body
+        (selmer/render-file "admin-database.html"
+                            {:db-status (if (= :mariadb (db/db-type))
+                                          {:type "mariadb" :host (:host existing) :port (:port existing)
+                                           :name (:name existing) :user (:user existing)}
+                                          {:type "sqlite" :path (files/path-to-db-file)})
+                             :saved-config (dissoc (db-cfg/load-config) :password)
+                             :sqlite-exists (.exists (clojure.java.io/file (files/path-to-db-file)))
+                             :message (if (:ok result)
+                                        {:type "success" :text "Connection successful!"}
+                                        {:type "error"   :text (str "Connection failed: " (:error result))})
+                             :header "Database"
+                             :active-nav :admin}))))
+
+   (comp/POST "/admin/database/migrate" {}
+     (let [result (db-mig/migrate!)]
+       (success-html-with-body
+        (selmer/render-file "admin-database.html"
+                            {:db-status (if (= :mariadb (db/db-type))
+                                          (let [cfg (db-cfg/load-config)]
+                                            {:type "mariadb" :host (:host cfg) :port (:port cfg)
+                                             :name (:name cfg) :user (:user cfg)})
+                                          {:type "sqlite" :path (files/path-to-db-file)})
+                             :saved-config (dissoc (db-cfg/load-config) :password)
+                             :sqlite-exists (.exists (clojure.java.io/file (files/path-to-db-file)))
+                             :message (cond
+                                        (not (:ok result))
+                                        {:type "error" :text (str "Migration failed: " (:error result))}
+                                        (pos? (:skipped-total result 0))
+                                        {:type "error" :text (str "Migration finished with " (:skipped-total result) " skipped row(s) — check the logs for details. Do not restart until the issue is resolved.")}
+                                        :else
+                                        {:type "success" :text "Migration complete with no losses. Save the configuration above and restart Plauna to switch to MariaDB."})
+                             :migration-counts (when (:ok result)
+                                                 (map (fn [[t v]] {:table t :inserted (:inserted v) :skipped (:skipped v) :total (:total v)}) (:counts result)))
+                             :header "Database"
+                             :active-nav :admin}))))
 
    (comp/GET "/admin/password" {}
      (success-html-with-body (markup/password-page {:env-managed (auth/password-from-env-var?)})))

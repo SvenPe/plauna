@@ -81,6 +81,8 @@ You can use the environment variables $DATA_FOLDER and $SERVER_PORT.
 
 You can also set the web UI password with $PLAUNA_PASSWORD (see "Web UI Password Protection" below).
 
+Database connection can be configured via environment variables (see "MariaDB" below).
+
 *** CLI Parameters
 
 You can also configure these values using the cli parameters --data-folder, and --server-port.
@@ -228,6 +230,75 @@ You must have selected at least one language in "Admin" -> "Manage Languages" in
 
 After training your models on the categories you created, Plauna will categorize each e-mail you receive and moved it automatically to its corresponding folder.
 
+
+* MariaDB
+
+By default Plauna stores everything in a local SQLite file. For installations that experience freezes during heavy concurrent use (bulk categorization + browsing at the same time), switching to MariaDB eliminates SQLite's single-writer bottleneck.
+
+** Setting up MariaDB
+
+Provide a MariaDB 10.6+ (or MySQL 8+) database and a user with full privileges on it, then tell Plauna how to reach it.
+
+*** Via environment variables (recommended for Docker)
+
+#+begin_src
+PLAUNA_DB_TYPE=mariadb
+PLAUNA_DB_HOST=db          # hostname or IP of the MariaDB server
+PLAUNA_DB_PORT=3306        # default 3306
+PLAUNA_DB_NAME=plauna
+PLAUNA_DB_USER=plauna
+PLAUNA_DB_PASSWORD=secret
+#+end_src
+
+Example docker-compose snippet:
+
+#+begin_src yaml
+services:
+  plauna:
+    image: svenpe/plauna:latest
+    ports: ["8080:8080"]
+    environment:
+      PLAUNA_PASSWORD: your-ui-password
+      PLAUNA_DB_TYPE: mariadb
+      PLAUNA_DB_HOST: db
+      PLAUNA_DB_NAME: plauna
+      PLAUNA_DB_USER: plauna
+      PLAUNA_DB_PASSWORD: secret
+    volumes:
+      - plauna-data:/var/lib/plauna
+    depends_on: [db]
+
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpw
+      MARIADB_DATABASE: plauna
+      MARIADB_USER: plauna
+      MARIADB_PASSWORD: secret
+    volumes:
+      - mariadb-data:/var/lib/mysql
+
+volumes:
+  plauna-data:
+  mariadb-data:
+#+end_src
+
+*** Via the web UI
+
+If you are already running Plauna on SQLite and want to switch:
+
+1. Go to "Admin" → "Database".
+2. Fill in the MariaDB connection details and click *Test Connection* to verify.
+3. Click *Save Configuration* — this writes =db-config.edn= to the data directory.
+4. Click *Start Migration* — Plauna will create the schema on MariaDB and copy all rows from SQLite. The SQLite file is not deleted.
+5. Restart Plauna. It will now use MariaDB.
+
+*** Notes
+
+- Environment variables always override the saved =db-config.edn= file.
+- If MariaDB is configured but unreachable at startup, Plauna logs an error and falls back to SQLite automatically.
+- Migrations are idempotent: running "Start Migration" again skips rows that are already present.
+- The SQLite file remains untouched after migration; you can keep it as a backup.
 
 * Debugging
 

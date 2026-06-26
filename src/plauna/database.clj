@@ -14,44 +14,97 @@
             [taoensso.telemere :as t]
             [plauna.interfaces :as int]
             [clojure.core.async :as async])
-  (:import (org.flywaydb.core Flyway)))
+  (:import (org.flywaydb.core Flyway)
+           (com.zaxxer.hikari HikariDataSource HikariConfig)))
 
 (set! *warn-on-reflection* true)
 
-(defn db []
-  ;; Pragmas are applied to every connection via the URL:
-  ;; - busy_timeout: wait (ms) for a lock instead of failing/stalling immediately, so reads (e.g. the
-  ;;   Emails page) and writes (e.g. bulk categorization) cooperate under concurrency.
-  ;; - journal_mode=WAL: readers don't block the single writer and vice versa.
-  ;; - synchronous=NORMAL: standard, safe-with-WAL setting that shortens write/lock windows.
-  {:jdbcUrl (str "jdbc:sqlite:" (files/path-to-db-file)
-                 "?busy_timeout=30000&journal_mode=WAL&synchronous=NORMAL")})
+;; ── Datasource management ──────────────────────────────────────────────────────
 
-(defn ds [] (jdbc/get-datasource (db)))
+(defonce ^:private active-db-type (atom :sqlite))
+
+(defonce ^:private ^:volatile-mutable mariadb-pool nil)
+
+(defn sqlite-url []
+  (str "jdbc:sqlite:" (files/path-to-db-file)
+       "?busy_timeout=30000&journal_mode=WAL&synchronous=NORMAL"))
+
+(defn setup-db!
+  "Initialise the datasource for the given db-config map.
+   Must be called once at startup before any other DB function.
+   Falls back to SQLite if MariaDB connection fails."
+  [{:keys [type host port name user password] :as cfg}]
+  (reset! active-db-type type)
+  (when (= :mariadb type)
+    (try
+      (let [hcfg (HikariConfig.)]
+        (.setJdbcUrl hcfg (str "jdbc:mariadb://" host ":" port "/" name))
+        (.setUsername hcfg user)
+        (.setPassword hcfg (or password ""))
+        (.setMaximumPoolSize hcfg 10)
+        (.setMinimumIdle hcfg 2)
+        (.setConnectionTimeout hcfg 30000)
+        (.setValidationTimeout hcfg 5000)
+        (set! mariadb-pool (HikariDataSource. hcfg))
+        (t/log! :info ["Connected to MariaDB at" (str host ":" port "/" name)]))
+      (catch Exception e
+        (t/log! :error ["Failed to initialise MariaDB connection pool, falling back to SQLite:" (.getMessage e)])
+        (reset! active-db-type :sqlite)
+        (set! mariadb-pool nil))))
+  cfg)
+
+(defn ds
+  "Return the active datasource (HikariCP pool for MariaDB, JDBC URL for SQLite)."
+  []
+  (or mariadb-pool
+      (jdbc/get-datasource {:jdbcUrl (sqlite-url)})))
+
+(defn db-type [] @active-db-type)
 
 (defn flyway []
-  (.load (doto (Flyway/configure)
-           (.dataSource (ds)))))
+  (let [location (if (= :mariadb @active-db-type)
+                   "classpath:db/migration/mariadb"
+                   "classpath:db/migration/sqlite")]
+    (.load (doto (Flyway/configure)
+             (.dataSource (ds))
+             (.locations ^"[Ljava.lang.String;" (into-array String [location]))))))
 
 (def my-addresses (atom #{}))
 
 (defn create-db []
   (.migrate ^Flyway (flyway))
-  (jdbc/execute! (ds) ["PRAGMA foreign_keys = ON;"])
-  (jdbc/execute! (ds) ["PRAGMA journal_mode = WAL;"])
-  (jdbc/execute! (ds) ["PRAGMA foreign_keys=on;"]))
+  (when (= :sqlite @active-db-type)
+    (jdbc/execute! (ds) ["PRAGMA foreign_keys = ON;"])
+    (jdbc/execute! (ds) ["PRAGMA journal_mode = WAL;"])
+    (jdbc/execute! (ds) ["PRAGMA foreign_keys=on;"])))
 
 (def builder-function {:builder-fn as-unqualified-lower-maps})
 
 (def builder-function-kebab {:builder-fn as-unqualified-kebab-maps})
 
+;; ── Dialect helpers ────────────────────────────────────────────────────────────
+
+(defn- mariadb? [] (= :mariadb @active-db-type))
+
+(defn- sql-now
+  "Current time as a Unix epoch integer, dialect-appropriate."
+  []
+  (if (mariadb?) [:unix_timestamp] [:strftime "%s" "now"]))
+
 ;; Insert Clauses
 
 (defn insert->insert-ignore [insert-query]
-  (let [insert-part (first insert-query)]
-    (conj (rest insert-query) (string/replace insert-part #"INSERT" "INSERT OR IGNORE"))))
+  (let [sql (first insert-query)]
+    (if (mariadb?)
+      ;; ON DUPLICATE KEY UPDATE col = col is a true no-op: row is unchanged, no other
+      ;; constraints are bypassed, and non-duplicate errors still propagate.
+      (let [first-col (second (re-find #"(?i)INSERT INTO \w+ \((\w+)" sql))]
+        (conj (rest insert-query)
+              (str sql " ON DUPLICATE KEY UPDATE " first-col " = " first-col)))
+      (conj (rest insert-query) (string/replace sql #"INSERT" "INSERT OR IGNORE")))))
 
 (defn insert->insert-update [insert-query]
+  ;; Only used for preferences on SQLite; MariaDB callers use ON DUPLICATE KEY UPDATE directly.
   (let [insert-part (first insert-query)]
     (conj (rest insert-query) (string/replace insert-part #"INSERT" "INSERT OR REPLACE"))))
 
@@ -96,13 +149,18 @@
 
 (defn update-metadata-batch [metadata]
   (when (seq metadata)
-    (jdbc/execute! (ds)
-                   (->> (builder/for-insert-multi
-                         :metadata
-                         [:message_id :language :language_confidence :category :category_confidence]
-                         (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
-                        (insert->insert-update))
-                   {:batch true})))
+    (if (mariadb?)
+      (doseq [m metadata]
+        (jdbc/execute! (ds)
+          ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence)"
+           (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m)]))
+      (jdbc/execute! (ds)
+                     (->> (builder/for-insert-multi
+                           :metadata
+                           [:message_id :language :language_confidence :category :category_confidence]
+                           (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
+                          (insert->insert-update))
+                     {:batch true}))))
 
 (def batch-size 500)
 
@@ -150,41 +208,56 @@
           :else
           (recur (async-utils/fetch-or-timeout! local-chan 1000) (add-to-buffer (:payload event) buffer)))))))
 
-(defonce honey-intervals
-  {:yearly [:strftime "%Y" [:datetime :date "unixepoch"]]
-   :monthly [:strftime "%Y-%m" [:datetime :date "unixepoch"]]})
+(defn honey-intervals []
+  (if (mariadb?)
+    {:yearly  [:year [:from_unixtime :date]]
+     :monthly [:date_format [:from_unixtime :date] "%Y-%m"]}
+    {:yearly  [:strftime "%Y" [:datetime :date "unixepoch"]]
+     :monthly [:strftime "%Y-%m" [:datetime :date "unixepoch"]]}))
 
 (defn update-metadata [message_id category cat-confidence language lang-confidence]
-  (jdbc/execute! (ds) (-> (insert-into :metadata)
-                          (values [{:message_id          message_id
-                                    :category            category
-                                    :category_modified   [:strftime "%s" "now"]
-                                    :category_confidence cat-confidence
-                                    :language            language
-                                    :language_modified   [:strftime "%s" "now"]
-                                    :language_confidence lang-confidence}])
-                          (upsert (-> (on-conflict :message_id)
-                                      (do-update-set :category
-                                                     :category_modified
-                                                     :category_confidence
-                                                     :language
-                                                     :language_modified
-                                                     :language_confidence)))
-                          (honey/format))))
+  (if (mariadb?)
+    (jdbc/execute! (ds)
+      ["INSERT INTO metadata (message_id, category, category_modified, category_confidence, language, language_modified, language_confidence) VALUES (?, ?, UNIX_TIMESTAMP(), ?, ?, UNIX_TIMESTAMP(), ?) ON DUPLICATE KEY UPDATE category = VALUES(category), category_modified = VALUES(category_modified), category_confidence = VALUES(category_confidence), language = VALUES(language), language_modified = VALUES(language_modified), language_confidence = VALUES(language_confidence)"
+       message_id category cat-confidence language lang-confidence])
+    (jdbc/execute! (ds) (-> (insert-into :metadata)
+                            (values [{:message_id          message_id
+                                      :category            category
+                                      :category_modified   (sql-now)
+                                      :category_confidence cat-confidence
+                                      :language            language
+                                      :language_modified   (sql-now)
+                                      :language_confidence lang-confidence}])
+                            (upsert (-> (on-conflict :message_id)
+                                        (do-update-set :category
+                                                       :category_modified
+                                                       :category_confidence
+                                                       :language
+                                                       :language_modified
+                                                       :language_confidence)))
+                            (honey/format)))))
 
 (defn update-metadata-category [message_id category confidence]
-  (jdbc/execute! (ds) (-> (insert-into :metadata)
-                          (values [{:message_id message_id :category category :category_modified [:strftime "%s" "now"] :category_confidence confidence}])
-                          (upsert (-> (on-conflict :message_id)
-                                      (do-update-set :category :category_modified :category_confidence)))
-                          (honey/format))))
+  (if (mariadb?)
+    (jdbc/execute! (ds)
+      ["INSERT INTO metadata (message_id, category, category_modified, category_confidence) VALUES (?, ?, UNIX_TIMESTAMP(), ?) ON DUPLICATE KEY UPDATE category = VALUES(category), category_modified = VALUES(category_modified), category_confidence = VALUES(category_confidence)"
+       message_id category confidence])
+    (jdbc/execute! (ds) (-> (insert-into :metadata)
+                            (values [{:message_id message_id :category category :category_modified (sql-now) :category_confidence confidence}])
+                            (upsert (-> (on-conflict :message_id)
+                                        (do-update-set :category :category_modified :category_confidence)))
+                            (honey/format)))))
 
 (defn update-metadata-language [message_id language confidence]
-  (jdbc/execute! (ds) (-> (insert-into :metadata)
-                          (values [{:message_id message_id :language language :language_modified [:strftime "%s" "now"] :language_confidence confidence}])
-                          (upsert (-> (on-conflict :message_id)
-                                      (do-update-set :language :language_modified :language_confidence)))
-                          (honey/format))))
+  (if (mariadb?)
+    (jdbc/execute! (ds)
+      ["INSERT INTO metadata (message_id, language, language_modified, language_confidence) VALUES (?, ?, UNIX_TIMESTAMP(), ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_modified = VALUES(language_modified), language_confidence = VALUES(language_confidence)"
+       message_id language confidence])
+    (jdbc/execute! (ds) (-> (insert-into :metadata)
+                            (values [{:message_id message_id :language language :language_modified (sql-now) :language_confidence confidence}])
+                            (upsert (-> (on-conflict :message_id)
+                                        (do-update-set :language :language_modified :language_confidence)))
+                            (honey/format)))))
 
 (defn update-email-folder
   "Record the IMAP folder a message currently lives in, so later moves can find it regardless of category-to-folder mapping changes."
@@ -217,9 +290,11 @@
                                      :where  [:= :id id]})))
 
 (defn delete-email-by-message-id [message-id]
-  (with-open [conn (jdbc/get-connection (ds))]
-    (jdbc/execute! conn ["PRAGMA foreign_keys = ON"])
-    (jdbc/execute! conn ["DELETE FROM headers WHERE message_id = ?" message-id])))
+  (if (mariadb?)
+    (jdbc/execute! (ds) ["DELETE FROM headers WHERE message_id = ?" message-id])
+    (with-open [conn (jdbc/get-connection (ds))]
+      (jdbc/execute! conn ["PRAGMA foreign_keys = ON"])
+      (jdbc/execute! conn ["DELETE FROM headers WHERE message_id = ?" message-id]))))
 
 (defn category-by-name [category-name]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from :categories :where [:= :name category-name]}) builder-function))
@@ -231,7 +306,7 @@
   (jdbc/execute! (ds) ["select language from metadata group by language"] builder-function))
 
 (defn get-language-preferences []
-  (jdbc/execute! (ds) ["select * from category_training_preferences where language is not 'n/a'"] builder-function))
+  (jdbc/execute! (ds) ["select * from category_training_preferences where language <> 'n/a'"] builder-function))
 
 (defn get-activated-language-preferences []
   (jdbc/execute! (ds) ["select * from category_training_preferences where use_in_training = 1"] builder-function))
@@ -251,7 +326,7 @@
 
 (defn body-parts-for-options [] "SELECT * FROM bodies INNER JOIN metadata ON metadata.message_id = bodies.message_id")
 
-(defn interval-for-honey [key] (get honey-intervals key :yearly))
+(defn interval-for-honey [key] (get (honey-intervals) key :yearly))
 
 (defn convert-to-count [sql-result entity]
   (let [sql (first sql-result)
@@ -350,12 +425,16 @@
            :order-by [[:count :desc]]}))
 
 (defn update-preference [preference value]
-  (jdbc/execute! (ds)
-                 (-> {:insert-into [:preferences]
-                      :columns     [:preference :value]
-                      :values      [[(name preference) value]]}
-                     (honey/format)
-                     (insert->insert-update)) builder-function-kebab))
+  (if (mariadb?)
+    (jdbc/execute! (ds)
+      ["INSERT INTO preferences (preference, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)"
+       (name preference) value])
+    (jdbc/execute! (ds)
+                   (-> {:insert-into [:preferences]
+                        :columns     [:preference :value]
+                        :values      [[(name preference) value]]}
+                       (honey/format)
+                       (insert->insert-update)) builder-function-kebab)))
 
 (defn fetch-preference [preference]
   (let [result (jdbc/execute-one! (ds)
@@ -364,10 +443,16 @@
                                                  :where [:= :preference (name preference)]}) builder-function-kebab)]
     (when (some? result) (:value result))))
 
+(defn- coerce-bool
+  "SQLite stores BOOLEANs as 1/0 integers; MariaDB JDBC can return Java true/false.
+   Normalise both representations to a Clojure boolean."
+  [v]
+  (or (= 1 v) (true? v)))
+
 (defn db-connection->model [db-conn]
   (apply (comp core.email/map->ImapConnection
-               (fn [conn] (update conn :check-ssl-certs #(= % 1)))
-               (fn [conn] (update conn :debug #(= % 1)))) [db-conn]))
+               (fn [conn] (update conn :check-ssl-certs coerce-bool))
+               (fn [conn] (update conn :debug coerce-bool))) [db-conn]))
 
 (defn get-connections [] (map
                           db-connection->model
@@ -439,6 +524,13 @@
                                   :set wo-id
                                   :where  [:= :id (:id provider)]})
                    builder-function)))
+
+(defn close-pool!
+  "Shut down the MariaDB connection pool gracefully (called on app stop)."
+  []
+  (when mariadb-pool
+    (.close ^HikariDataSource mariadb-pool)
+    (set! mariadb-pool nil)))
 
 (deftype SqliteDB []
   int/DB
