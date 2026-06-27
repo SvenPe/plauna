@@ -99,7 +99,7 @@
 
 (defn connection-config->store [connection-config]
   (let [session ^Session (config->session connection-config)]
-    (if (= security "ssl")
+    (if (= (security connection-config) "ssl")
       (.getStore session "imaps")
       (.getStore session "imap"))))
 
@@ -222,7 +222,7 @@
         sender-participant (create-participant sender :sender message-id)
         recipient-participants (mapv (fn [address] (create-participant address :receiver message-id)) (.getRecipients message Message$RecipientType/TO))
         cc-participants (mapv (fn [address] (create-participant address :cc message-id)) (.getRecipients message Message$RecipientType/CC))
-        bcc-participants (mapv (fn [address] (create-participant address :cc message-id)) (.getRecipients message Message$RecipientType/BCC))]
+        bcc-participants (mapv (fn [address] (create-participant address :bcc message-id)) (.getRecipients message Message$RecipientType/BCC))]
     (flatten [sender-participant recipient-participants cc-participants bcc-participants])))
 
 (defn message->email [^IMAPMessage message]
@@ -386,14 +386,31 @@
         (t/log! :info ["IMAP store in connection" (:id (:config connection-data)) "is not connected. Cancelling the move attempt."])
         false))))
 
+(defn- invalid-grant-error?
+  "True only when the provider explicitly rejected the refresh token (HTTP 4xx with an
+   invalid_grant error), as opposed to a transient network/5xx error or a timeout."
+  [e]
+  (let [{:keys [status body]} (ex-data e)]
+    (boolean (and status (<= 400 status 499)
+                  (re-find #"invalid_grant" (str body))))))
+
 (defn refresh-access-token [connection-config]
   (let [provider (db/get-auth-provider (:auth-provider connection-config))
         token-data (db/get-oauth-tokens (:id connection-config))
-        new-access-token (try (oauth/exchange-refresh-token-for-access-token provider (:refresh-token token-data)) (catch Exception e (t/log! :error e)))]
-    (if (some? new-access-token)
-      (db/update-access-token (:id connection-config) new-access-token)
-      (do (t/log! :info ["Data for new access token was nil. Deleting the access token data in the database. The user will need to log in manually again."])
-          (db/delete-access-token (:id connection-config))))))
+        result (try {:token (oauth/exchange-refresh-token-for-access-token provider (:refresh-token token-data))}
+                    (catch Exception e {:error e}))]
+    (cond
+      (some? (:token result))
+      (db/update-access-token (:id connection-config) (:token result))
+
+      (invalid-grant-error? (:error result))
+      (do (t/log! :info ["Refresh token was rejected by the provider (invalid_grant). Deleting the stored token; the user must log in manually again."])
+          (db/delete-access-token (:id connection-config)))
+
+      :else
+      ;; Transient failure (network, 5xx, timeout, or empty response): keep the refresh token and retry on the next cycle.
+      (t/log! {:level :error :error (:error result)}
+              ["Could not refresh the access token due to a transient error. Keeping the stored refresh token to retry later."]))))
 
 (defn monitor-folder-name [folder-name]
   (if (or (nil? folder-name) (s/blank? folder-name)) "INBOX" folder-name))

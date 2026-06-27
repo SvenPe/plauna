@@ -55,9 +55,26 @@
                   (t/log! :info ["Connection failed for config:" client-config]))))))))
   (t/log! :debug "Listening to new emails from listen-channel"))
 
+(defn- register-shutdown-hook!
+  "Ensure IMAP connections, the web server, and the watchdog are torn down cleanly on SIGTERM
+   (e.g. `docker stop`) instead of the JVM being killed mid-flight."
+  []
+  (.addShutdownHook
+   (Runtime/getRuntime)
+   (Thread.
+    ^Runnable (fn []
+                (t/log! :info "Shutdown signal received. Stopping Plauna gracefully.")
+                (doseq [[label teardown] [["web server" server/stop-server]
+                                          ["IMAP connections" client/disconnect-all]
+                                          ["watchdog" diagnostics/stop-watchdog!]]]
+                  (try (teardown)
+                       (catch Throwable e
+                         (t/log! {:level :error :error e} ["Error while stopping" label]))))))))
+
 (defn -main
   [& args]
   (setup-logging)
+  (register-shutdown-hook!)
   (let [application-config (files/parse-config-from-cli-arguments args)
         context {:config application-config :client (ImapClient.) :db (SqliteDB.) :analyzer (BasicAnalyzer.)}]
     (let [db-config (db-cfg/load-config)]

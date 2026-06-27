@@ -21,6 +21,7 @@
             [plauna.markup :as markup]
             [plauna.messaging :as messaging]
             [plauna.preferences :as p]
+            [plauna.settings :as settings]
             [ring.adapter.jetty :as jetty]
             [ring.middleware.keyword-params :refer [wrap-keyword-params]]
             [ring.middleware.multipart-params :refer [wrap-multipart-params]]
@@ -592,7 +593,7 @@
 
    (comp/POST "/repl" request
      (let [operation (get-in request [:params :operation])]
-       (cond (= operation "start") (swap! repl-server (fn [_] (t/log! :info "Starting repl server") (nrepl/start-server :bind "0.0.0.0" :port 7888)))
+       (cond (= operation "start") (swap! repl-server (fn [_] (t/log! :info "Starting repl server") (nrepl/start-server :bind "127.0.0.1" :port 7888)))
              (= operation "stop") (swap! repl-server (fn [_] (t/log! :info "Stopping repl server") (nrepl/stop-server @repl-server) nil))
              :else (t/log! :error ["Unsupported operation" operation "at /repl"]))
        (redirect-request request)))
@@ -647,7 +648,11 @@
                         wrap-keyword-params
                         (wrap-multipart-params {:progress-fn upload-progress})
                         wrap-params
-                        (wrap-session {:store (cookie-store)})))
+                        (wrap-session {:store (cookie-store {:key (settings/session-key)})
+                                       ;; HttpOnly keeps the cookie out of JS; SameSite=Lax blocks forged
+                                       ;; cross-site POSTs (CSRF) while still allowing the OAuth provider's
+                                       ;; top-level redirect back to /oauth2/callback to carry the session.
+                                       :cookie-attrs {:http-only true :same-site :lax}})))
 
 (defn get-random-port []
   (with-open [socket (ServerSocket. 0)]

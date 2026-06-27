@@ -18,8 +18,8 @@
     (sub @main-publisher target-type target-channel)
     (go-loop []
       (when-some [_ (<! target-channel)]
-        (<! bucket-channel))
-      (recur))
+        (<! bucket-channel)
+        (recur)))
     bucket-channel))
 
 (comment

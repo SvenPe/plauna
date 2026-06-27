@@ -16,23 +16,29 @@
    (url-encode csrf-token)
    "&access_type=offline"))
 
+(def ^:private http-timeouts
+  ;; Never let a hung token endpoint block the calling thread (incl. the health-check executor) forever.
+  {:socket-timeout 15000 :connection-timeout 15000})
+
 (defn exchange-code-for-access-token [provider code]
   (-> (http/post (:token-url provider)
-                 {:form-params {:code         code
-                                :grant_type   "authorization_code"
-                                :access_type "offline"
-                                :client_id    (:client-id provider)
-                                :redirect_uri (:redirect-url provider)}
-                  :basic-auth [(:client-id provider) (:client-secret provider)]
-                  :as          :json})
+                 (merge http-timeouts
+                        {:form-params {:code         code
+                                       :grant_type   "authorization_code"
+                                       :access_type "offline"
+                                       :client_id    (:client-id provider)
+                                       :redirect_uri (:redirect-url provider)}
+                         :basic-auth [(:client-id provider) (:client-secret provider)]
+                         :as          :json}))
       :body))
 
 (defn exchange-refresh-token-for-access-token [provider refresh-token]
   (-> (http/post (:token-url provider)
-                 {:form-params {:refresh_token refresh-token
-                                :access_type "offline"
-                                :grant_type   "refresh_token"
-                                :client_id (:client-id provider)
-                                :client_secret (:client-secret provider)}
-                  :as          :json})
+                 (merge http-timeouts
+                        {:form-params {:refresh_token refresh-token
+                                       :access_type "offline"
+                                       :grant_type   "refresh_token"
+                                       :client_id (:client-id provider)
+                                       :client_secret (:client-secret provider)}
+                         :as          :json}))
       :body))

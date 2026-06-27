@@ -43,6 +43,23 @@
 (defn update-setting! [k v]
   (save-settings! (assoc (load-settings) (keyword (name k)) (coerce k v))))
 
+(defn- random-session-key
+  "A 16-character (16-byte) random string, suitable as an AES-128 key for the session cookie store."
+  []
+  (let [chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        rng   (java.security.SecureRandom.)]
+    (apply str (repeatedly 16 #(nth chars (.nextInt rng (count chars)))))))
+
+(defn session-key
+  "Persistent secret key for the session cookie store. Generated and stored in settings.json on first
+   use so that sessions survive restarts (a fresh random key per boot would log everyone out)."
+  []
+  (let [m (load-settings)]
+    (or (:session-key m)
+        (let [k (random-session-key)]
+          (save-settings! (assoc m :session-key k))
+          k))))
+
 (defn migrate-from-db-values!
   "One-shot migration from DB preference strings to settings.json.
    Coerces all raw values in memory first, then writes atomically in one shot.
