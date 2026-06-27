@@ -23,7 +23,10 @@
 
 (set! *warn-on-reflection* true)
 
-(defonce executor-service (Executors/newSingleThreadScheduledExecutor))
+;; A small pool rather than a single thread: each connection's health check does blocking IMAP/HTTP
+;; work, so one slow or hung connection on a single-thread scheduler would stall every other
+;; connection's health check.
+(defonce executor-service (Executors/newScheduledThreadPool 4))
 
 (defonce parent-folder-name "Categories")
 
