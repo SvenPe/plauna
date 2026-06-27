@@ -145,7 +145,11 @@
        (recur store (rest folder-names) result)))))
 
 (defn swap-new-period-check [identifier future]
-  (swap! health-checks (fn [futures new-future] (conj futures {identifier new-future})) future))
+  ;; Cancel any health check already scheduled for this connection before replacing it; otherwise a
+  ;; reconnect orphans the previous ScheduledFuture, which keeps running forever on the shared executor.
+  (when-let [^ScheduledFuture existing (get @health-checks identifier)]
+    (.cancel existing true))
+  (swap! health-checks assoc identifier future))
 
 ;; Primitives
 
@@ -278,7 +282,9 @@
     (t/log! :debug ["Copied" message])
     (.setFlag message Flags$Flag/DELETED true)
     (t/log! :debug ["Set DELETED flag for" message])
-    (.expunge source-folder)
+    ;; Expunge ONLY the message we copied. The no-arg expunge would remove every DELETED-flagged
+    ;; message in the folder, including unrelated ones a concurrent operation may have flagged.
+    (.expunge ^IMAPFolder source-folder (into-array Message [message]))
     (t/log! :debug ["Expunged source folder"])
     true
     (catch Exception e (t/log! {:level :error :error e} ["There was an error copying and deleting the message" message])
@@ -368,12 +374,16 @@
               (if (= target-folder-name (:folder (:config connection-data)))
                 (do
                   (stop-monitoring connection-data)
-                  (set-messages-as-peek found-messages)
-                  (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
-                  (.moveMessages source-folder (into-array Message found-messages) target-folder)
-                  (db/update-email-folder message-id target-folder-name)
-                  (start-monitoring connection-data context)
-                  true)
+                  ;; The move happens on the monitored folder, so monitoring is paused first. Use
+                  ;; try/finally so a failure mid-move can never leave monitoring permanently off.
+                  (try
+                    (set-messages-as-peek found-messages)
+                    (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
+                    (.moveMessages source-folder (into-array Message found-messages) target-folder)
+                    (db/update-email-folder message-id target-folder-name)
+                    true
+                    (finally
+                      (start-monitoring connection-data context))))
                 (do
                   (set-messages-as-peek found-messages)
                   (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])

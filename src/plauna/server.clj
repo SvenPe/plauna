@@ -89,7 +89,8 @@
 
 (defn redirect-to-referer [request]
   {:status 303
-   :headers {"Location" (get (:headers request) "referer")}})
+   ;; Fall back to the app root when no Referer header is present, so we never emit a 303 with a nil Location.
+   :headers {"Location" (or (get (:headers request) "referer") "/")}})
 
 (defn redirect-request
   ([request]
@@ -643,11 +644,27 @@
       (handler request)
       (redirect "/login"))))
 
+(defn wrap-exception-handling
+  "Catch exceptions escaping a handler so bad input or unexpected failures return a clean response
+   instead of a 500 with a leaked stack trace. A NumberFormatException (e.g. a non-numeric port or
+   category param) becomes a 400 rather than crashing the request handler."
+  [handler]
+  (fn [request]
+    (try
+      (handler request)
+      (catch NumberFormatException e
+        (t/log! {:level :warn :error e} ["Non-numeric value in a numeric parameter for" (:uri request)])
+        {:status 400 :headers html-headers :body "Invalid request: a numeric field received a non-numeric value."})
+      (catch Throwable e
+        (t/log! {:level :error :error e} ["Unhandled error while processing" (:uri request)])
+        {:status 500 :headers html-headers :body "An unexpected error occurred."}))))
+
 (defn app [context] (-> (fn [req] ((make-routes context) req))
                         wrap-authentication
                         wrap-keyword-params
                         (wrap-multipart-params {:progress-fn upload-progress})
                         wrap-params
+                        wrap-exception-handling
                         (wrap-session {:store (cookie-store {:key (settings/session-key)})
                                        ;; HttpOnly keeps the cookie out of JS; SameSite=Lax blocks forged
                                        ;; cross-site POSTs (CSRF) while still allowing the OAuth provider's
