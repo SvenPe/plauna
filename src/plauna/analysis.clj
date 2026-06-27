@@ -1,6 +1,7 @@
 (ns plauna.analysis
   (:require [clojure.string :as st]
             [plauna.database :as db]
+            [plauna.settings :as settings]
             [plauna.core.events :as events]
             [plauna.core.email :as core-email]
             [plauna.preferences :as p]
@@ -52,7 +53,7 @@
 
 (defn normalize [^String text] (.normalize normalizer text))
 
-(defn categorization-algorithm ^String [] (or (:categorization-algorithm (db/fetch-preference :categorization-algorithm)) NaiveBayesTrainer/NAIVE_BAYES_VALUE))
+(defn categorization-algorithm ^String [] (or (settings/fetch-setting :categorization-algorithm) NaiveBayesTrainer/NAIVE_BAYES_VALUE))
 
 (lang/default-init!)
 

@@ -8,6 +8,7 @@
    [plauna.core.events :as events]
    [plauna.database :as db]
    [plauna.db-config :as db-cfg]
+   [plauna.settings :as settings]
    [plauna.diagnostics :as diagnostics]
    [plauna.files :as files]
    [plauna.messaging :as messaging]
@@ -64,6 +65,12 @@
       (when (= :sqlite (:type db-config))
         (files/check-and-create-database-file)))
     (db/create-db)
+    (let [db-vals (into {} (map #(vector % (db/fetch-preference %))
+                               [:log-level :language-detection-threshold
+                                :categorization-threshold :client-health-check-interval
+                                :categorization-algorithm]))]
+      (when (settings/migrate-from-db-values! db-vals)
+        (t/log! :info "Preferences migrated to settings.json.")))
     (auth/initialize!)
     (t/log! :info "Setting log level according to preferences.")
     (t/set-min-level! (preferences/log-level))

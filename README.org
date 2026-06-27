@@ -89,6 +89,28 @@ You can also configure these values using the cli parameters --data-folder, and 
 
 E.g. java -jar plauna.jar --server-port 80
 
+*** settings.json
+
+Application preferences (log level, detection thresholds, health-check interval) are stored in =settings.json= in the data directory (default =/var/lib/plauna/settings.json=). The file is created automatically on first startup, and you can edit the values through "Admin" → "Preferences" in the web UI.
+
+Example file with all keys and their defaults:
+
+#+begin_src json
+{
+  "log-level": "info",
+  "language-detection-threshold": 0.8,
+  "categorization-threshold": 0.65,
+  "client-health-check-interval": 60
+}
+#+end_src
+
+- =log-level= — =error=, =info=, or =debug=.
+- =language-detection-threshold= — confidence (0–1) below which a language is not assigned; default 0.8.
+- =categorization-threshold= — confidence (0–1) below which a category is not assigned; default 0.65.
+- =client-health-check-interval= — IMAP connection health-check period in seconds; default 60.
+
+If you are upgrading from an earlier version that stored preferences in the database, Plauna migrates them into =settings.json= automatically on the first startup after the upgrade.
+
 *** Order of Priority
 
 In case multiple values are provided, plauna decides on which value to use according to the priority list below:

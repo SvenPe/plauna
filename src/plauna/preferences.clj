@@ -1,15 +1,15 @@
 (ns plauna.preferences
   (:require
    [clojure.core.cache.wrapped :as w]
-   [plauna.database :as db]))
+   [plauna.settings :as settings]))
 
 (def cache (w/ttl-cache-factory {} :ttl 6000))
 
-(def fetch-fn (atom db/fetch-preference))
+(def fetch-fn (atom settings/fetch-setting))
 
-(def converters {clojure.lang.Keyword (fn [^String s] (keyword (.substring s 1)))
-                 java.lang.Double Double/parseDouble
-                 java.lang.Long Long/parseLong})
+(def converters {clojure.lang.Keyword (fn [^String s] (keyword (cond-> s (.startsWith s ":") (.substring 1))))
+                 java.lang.Double (fn [v] (if (instance? Number v) (double v) (Double/parseDouble (str v))))
+                 java.lang.Long   (fn [v] (if (instance? Number v) (long v)   (Long/parseLong (str v))))})
 
 (defmacro preference-with-default [property pred default]
   `(let [value# (~pred (@fetch-fn ~property) ~default)
@@ -20,7 +20,7 @@
        ((get converters default-type#) value#))))
 
 (defn update-preference [key value]
-  (db/update-preference key value)
+  (settings/update-setting! key value)
   (w/evict cache key))
 
 (defn log-level [] (w/lookup-or-miss cache
