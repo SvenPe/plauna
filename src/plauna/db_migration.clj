@@ -25,7 +25,7 @@
    {:jdbcUrl (str "jdbc:sqlite:" (files/path-to-db-file)
                   "?busy_timeout=10000&journal_mode=WAL")}))
 
-(defn- mariadb-ds [{:keys [host port name user password]}]
+(defn- mariadb-ds ^HikariDataSource [{:keys [host port name user password]}]
   (let [hcfg (HikariConfig.)]
     (.setJdbcUrl hcfg (str "jdbc:mariadb://" host ":" port "/" name))
     (.setUsername hcfg user)

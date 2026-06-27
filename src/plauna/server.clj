@@ -87,23 +87,43 @@
    :headers {"Content-Type" "text/html; charset=UTF-8"}
    :body    body})
 
+(defn safe-redirect-path
+  "Only allow same-origin, relative redirect targets (a single leading slash, not \"//host\" or a scheme).
+   Anything else (an absolute URL, protocol-relative URL, or nil) falls back to `default`, preventing an
+   attacker-supplied redirect-url from turning into an open redirect."
+  [target default]
+  (if (and (string? target)
+           (re-matches #"/[^/].*|/" target))
+    target
+    default))
+
+(defn same-origin-referer
+  "Extract the path (+query) from the request's Referer only when its host matches the request Host,
+   so a cross-origin Referer can never be used as an open-redirect target. Returns nil otherwise."
+  [request]
+  (let [referer (get (:headers request) "referer")
+        host    (get (:headers request) "host")]
+    (when (and referer host)
+      (try
+        (let [uri (java.net.URI. referer)]
+          (when (= (.getAuthority uri) host)
+            (let [path (.getRawPath uri)
+                  q    (.getRawQuery uri)]
+              (str (if (st/blank? path) "/" path) (when q (str "?" q))))))
+        (catch Exception _ nil)))))
+
 (defn redirect-to-referer [request]
   {:status 303
-   ;; Fall back to the app root when no Referer header is present, so we never emit a 303 with a nil Location.
-   :headers {"Location" (or (get (:headers request) "referer") "/")}})
+   ;; Fall back to the app root when the Referer is absent or off-site, so we never emit a 303 with a
+   ;; nil Location or redirect the user to an attacker-controlled origin.
+   :headers {"Location" (or (same-origin-referer request) "/")}})
 
 (defn redirect-request
   ([request]
-   (let [redirect-url (get-in request [:params :redirect-url])]
-     (if (some? redirect-url)
-       {:status 303 :headers {"Location" redirect-url}}
-       {:status 303 :headers {"Location" (-> request :uri)}})))
+   {:status 303 :headers {"Location" (safe-redirect-path (get-in request [:params :redirect-url]) (:uri request))}})
   ([request messages]
    (swap! global-messages (fn [m] (conj m messages)))
-   (let [redirect-url (get-in request [:params :redirect-url])]
-     (if (some? redirect-url)
-       {:status 303 :headers {"Location" redirect-url}}
-       {:status 303 :headers {"Location" (-> request :uri)}}))))
+   {:status 303 :headers {"Location" (safe-redirect-path (get-in request [:params :redirect-url]) (:uri request))}}))
 
 (defn- normalize-prefs [prefs]
   (mapv #(update % :use_in_training (fn [v] (or (true? v) (= 1 v)))) prefs))
