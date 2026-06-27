@@ -103,34 +103,41 @@
        {:status 303 :headers {"Location" redirect-url}}
        {:status 303 :headers {"Location" (-> request :uri)}}))))
 
+(defn- normalize-prefs [prefs]
+  (mapv #(update % :use_in_training (fn [v] (or (true? v) (= 1 v)))) prefs))
+
 (defn language-preferences []
   (let [preferences (db/get-language-preferences)
         languages (filterv #(not (= "n/a" %)) (mapv :language (db/get-languages)))]
     (if (empty? languages)
       []
-      (if (< (count preferences) (count languages))
-        (let [existing-languages-in-pref (mapv :language preferences)
-              diff (cd/diff (set existing-languages-in-pref) (set languages))]
-          (db/add-language-preferences
-           (mapv vector (second diff) (repeat (count (second diff)) false)))
-          (db/get-language-preferences))
-        preferences))))
+      (normalize-prefs
+       (if (< (count preferences) (count languages))
+         (let [existing-languages-in-pref (mapv :language preferences)
+               diff (cd/diff (set existing-languages-in-pref) (set languages))]
+           (db/add-language-preferences
+            (mapv vector (second diff) (repeat (count (second diff)) false)))
+           (db/get-language-preferences))
+         preferences)))))
 
 (defn languages-to-use-in-training []
-  (sequence (comp (filter #(= 1 (:use_in_training %))) (map :language)) (db/get-language-preferences)))
+  (map :language (db/get-activated-language-preferences)))
 
 (defn write-all-categorized-emails-to-training-files []
   (files/delete-files-with-type :train)
   (doseq [language (languages-to-use-in-training)
           :let [entity-query {:entity :enriched-email :page {:size 100 :page 1}}
                 sql-query {:where [:and [:<> :category nil] [:= :language language]]}
-                write-func (fn [data] (files/write-to-training-file language (analysis/format-training-data data)))]]
+                write-func (fn [data]
+                             (let [formatted (analysis/format-training-data data)]
+                               (when (seq formatted)
+                                 (files/write-to-training-file language formatted))))]]
     (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false)))
 
 (defn write-emails-to-training-files-and-train []
   (if (seq (languages-to-use-in-training))
     (do (write-all-categorized-emails-to-training-files)
-        (doseq [training-model (analysis/train-data (files/training-files))]
+        (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
           (let [os (io/output-stream (files/model-file (:language training-model)))]
             (analysis/serialize-and-write-model! (:model training-model) os))))
     {:type :alert :content "There are no selected languages to train in. Cannot proceed."}))
@@ -499,7 +506,7 @@
 
    (comp/POST "/admin/connections" request
      (let [params (:params request)
-           config {:host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (get params :port) :check-ssl-certs (= "true" (get params :check-ssl-certs))}
+           config {:host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs))}
            id (client/id-from-config config)]
        (db/add-connection (merge config {:id id}))
        (redirect-request request)))
@@ -546,7 +553,7 @@
 
    (comp/PUT "/admin/connections/:id" request
      (let [params (:params request)]
-       (db/update-connection {:id (get params :id) :host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (get params :port) :check-ssl-certs (= "true" (get params :check-ssl-certs)) :auth-type (get params :auth-type) :auth-provider (get params :auth-provider)})
+       (db/update-connection {:id (get params :id) :host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs)) :auth-type (get params :auth-type) :auth-provider (get params :auth-provider)})
        {:status 200}))
 
    (comp/POST "/admin/connections/:id/controls" request

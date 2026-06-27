@@ -143,7 +143,7 @@
                  (->> (builder/for-insert-multi
                        :communications
                        [:message_id :contact_key :type]
-                       (mapv (juxt :message-id :contact-key :type) contacts) {})
+                       (mapv (juxt :message-id :contact-key (comp name :type)) contacts) {})
                       (insert->insert-ignore))
                  {:batch true}))
 
@@ -175,12 +175,20 @@
       (update updated-buffer :metadata conj (:metadata e-mail))
       updated-buffer)))
 
+(defn- bodyless-message-ids [headers bodies]
+  (let [covered (set (map :message-id bodies))]
+    (vec (remove covered (map :message-id headers)))))
+
 (defn save-emails-in-buffer [buffer]
   (try
     (save-headers (:headers buffer))
-    (save-bodies (:bodies buffer))
-    (save-contacts (:participants buffer))
-    (save-communications (:participants buffer))
+    (let [missing (bodyless-message-ids (:headers buffer) (:bodies buffer))]
+      (when (seq missing)
+        (t/log! :warn ["No body parts parsed for message ID(s):" missing])))
+    (when (seq (:bodies buffer)) (save-bodies (:bodies buffer)))
+    (when (seq (:participants buffer))
+      (save-contacts (:participants buffer))
+      (save-communications (:participants buffer)))
     (when (seq (:metadata buffer)) (update-metadata-batch (:metadata buffer)))
     (catch Exception e (t/log! {:level :error :error e} (.getMessage e)))))
 
@@ -544,7 +552,10 @@
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (save-email [_ email]
     (save-headers [(:header email)])
-    (save-bodies (:body email))
-    (save-contacts (:participants email))
-    (save-communications (:participants email))
-    (when (not (empty? (:metadata email))) (update-metadata-batch [(:metadata email)]))))
+    (if (seq (:body email))
+      (save-bodies (:body email))
+      (t/log! :warn ["No body parts parsed for message ID:" (-> email :header :message-id)]))
+    (when (seq (:participants email))
+      (save-contacts (:participants email))
+      (save-communications (:participants email)))
+    (when (seq (:metadata email)) (update-metadata-batch [(:metadata email)]))))

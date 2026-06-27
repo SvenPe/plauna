@@ -14,7 +14,7 @@
   </thead>
   <tbody>
     {% for preference in language-preferences %}
-    <tr><td>{{preference.language}}</td><td><input {% if preference.use_in_training = 1 %}checked{% endif %} form="preferences" class="checkbox" name="use" type="checkbox" value="{{preference.language}}"></td></tr>
+    <tr><td>{{preference.language}}</td><td><input {% if preference.use_in_training %}checked{% endif %} form="preferences" class="checkbox" name="use" type="checkbox" value="{{preference.language}}"></td></tr>
     {% endfor %}
 </tbody></table>
 <button class="btn btn-primary my-2"  form="preferences">Update</button>

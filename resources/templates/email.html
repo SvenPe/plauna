@@ -61,6 +61,7 @@
 
 <h3 class="uppercase text-lg my-8">Contents</h3>
 
+{% if email.body|empty? %}<p class="text-base-content/60 italic">Email has no parseable text content.</p>{% endif %}
 {% for body-part in email.body %}
 <table class="table">
   <tr><td><strong>Mime Type: </strong></td><td>{{body-part.mime-type}}</td></tr>

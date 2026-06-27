@@ -85,6 +85,7 @@
 (defn format-training-data [data]
   (transduce
    (comp (map (fn [email] [(get-in email [:metadata :category]) (training-body-part email)]))
+         (filter (fn [[_ body-part]] (some? body-part)))
          (map (fn [[category body-part]] [category
                                           (if (some? (:subject body-part)) (st/trim (:subject body-part)) "")
                                           (tt/clean-text-content (:content body-part) (core-email/text-content-type body-part))]))
@@ -132,7 +133,7 @@
 
 (defn category-for-text [text language-code]
   (when (and (some? text) (some? language-code))
-    (let [allowed-languages (mapv :language (filter #(= 1 (:use_in_training %)) (db/get-language-preferences)))]
+    (let [allowed-languages (mapv :language (db/get-activated-language-preferences))]
       (when (some #(= language-code %) allowed-languages) (categorize text (files/model-file language-code))))))
 
 (defn detect-language-and-categorize-event [event]
