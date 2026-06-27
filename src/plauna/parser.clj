@@ -21,7 +21,7 @@
     (copy is baos)
     (.toByteArray baos)))
 
-(defn uuid [^String name] (str (java.util.UUID/nameUUIDFromBytes (.getBytes name))))
+(defn uuid [^String name] (str (java.util.UUID/nameUUIDFromBytes (.getBytes name java.nio.charset.StandardCharsets/UTF_8))))
 
 (defn parse-participants [message-id type mailbox]
   (cond (instance? Mailbox mailbox)
@@ -51,8 +51,10 @@
                                charset-string)))
 
 (defn decode-body [^BinaryBody body]
-  (try (new String ^bytes (stream->bytes (.getInputStream body)))
-       (catch java.io.UnsupportedEncodingException e (t/log! {:level :error :error e} (.getMessage e)) (new String ^bytes (stream->bytes (.getInputStream body))))))
+  ;; Decode explicitly as UTF-8 (the dominant email charset) instead of the JVM's platform-default
+  ;; charset, so parsing is deterministic across machines. Fall back to empty on any decode failure.
+  (try (String. ^bytes (stream->bytes (.getInputStream body)) java.nio.charset.StandardCharsets/UTF_8)
+       (catch Exception e (t/log! {:level :error :error e} (.getMessage e)) "")))
 
 (defn reader->string [^Reader reader]
   (with-open [r reader] (slurp r)))

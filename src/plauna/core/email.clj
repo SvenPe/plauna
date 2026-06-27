@@ -50,9 +50,12 @@
 
 (defn iterate-over-all-pages [call-with-pagination fun query sql-query mutates?]
   (let [data-with-current-page (call-with-pagination query sql-query)
-        remaining-pages (-> (/ (:total data-with-current-page) (:size (:page query)))
-                            math/ceil
-                            (- (:page data-with-current-page)))]
+        size (:size (:page query))
+        remaining-pages (if (and size (pos? size) (:total data-with-current-page))
+                          (-> (/ (:total data-with-current-page) size)
+                              math/ceil
+                              (- (:page data-with-current-page)))
+                          0)]
     (fun (:data data-with-current-page))
     (if (> remaining-pages 0)
       (recur call-with-pagination fun (if mutates? query (update-in query [:page :page] inc)) sql-query mutates?)
@@ -60,13 +63,14 @@
 
 (defn attachment? [body-part] (or (= "attachment" (:content-disposition body-part)) (some? (:filename body-part))))
 
-(defn text-content? [mime-type] (.startsWith ^String mime-type "text"))
+(defn text-content? [mime-type] (and (some? mime-type) (.startsWith ^String mime-type "text")))
 
 (defn body-text-content? [body-part] (text-content? (:mime-type body-part)))
 
 (defn text-content-type [body-part]
   (let [mime-type (:mime-type body-part)]
-    (cond (.endsWith ^String mime-type "html") :html
+    (cond (nil? mime-type) :plain
+          (.endsWith ^String mime-type "html") :html
           (.endsWith ^String mime-type "rtf") :rtf
           :else :plain)))
 

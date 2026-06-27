@@ -58,15 +58,22 @@
 (lang/default-init!)
 
 (defn lang-code-set3 [language]
-  (.getISO3Language (new Locale language)))
+  ;; forLanguageTag handles hyphenated langdetect codes like "zh-cn"/"zh-tw" (new Locale would throw
+  ;; MissingResourceException on .getISO3Language). Fall back to the raw code if no ISO3 form exists.
+  (try
+    (let [iso3 (.getISO3Language (Locale/forLanguageTag language))]
+      (if (st/blank? iso3) language iso3))
+    (catch Exception _ language)))
 
 (defn detect-language [^String text]
   (when (some? text)
     (try
       (if (> (count text) 3)
-        (let [result (second (lang/detect text))
-              confidence (Double/parseDouble (first (vals result)))
-              lang-code (lang-code-set3 (first (keys result)))]
+        ;; lang/detect returns [best-language probabilities-map]. Use the explicitly detected best
+        ;; language and look up its probability, rather than relying on the (unordered) map's first entry.
+        (let [[best-lang probabilities] (lang/detect text)
+              confidence (Double/parseDouble (or (get probabilities best-lang) "0.0"))
+              lang-code (lang-code-set3 best-lang)]
           {:code (if (< confidence (p/language-detection-threshold)) "n/a" lang-code)
            :confidence confidence})
         {:code "n/a" :confidence 0.0})
@@ -117,7 +124,7 @@
       (catch Exception e (t/log! {:level :error :error e} (.getMessage e))))))
 
 (defn categorize [text ^File model-file]
-  (if (.exists model-file)
+  (if (and (.exists model-file) (not (st/blank? text)))
     (let [doccat (DocumentCategorizerME. (DoccatModel. model-file))
           cat-results (.categorize doccat (into-array String (st/split text #" ")))
           best-category (.getBestCategory doccat cat-results)

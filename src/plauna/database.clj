@@ -351,7 +351,12 @@
 
 (defn convert-to-count [sql-result entity]
   (let [sql (first sql-result)
-        to-format (string/replace (string/replace sql #"SELECT .* FROM" "SELECT COUNT(%s) as count FROM") #"ORDER.*$" "")]
+        ;; Non-greedy ".*?" so the projection is replaced up to the FIRST "FROM" (a subquery's FROM must
+        ;; not be matched); (?is) makes it case-insensitive and dot-matches-newline. Strip a trailing
+        ;; ORDER BY (counts must not carry ordering).
+        to-format (-> sql
+                      (string/replace #"(?is)SELECT .*? FROM" "SELECT COUNT(%s) as count FROM")
+                      (string/replace #"(?is)\s+ORDER BY .*$" ""))]
     (cond (= entity :enriched-email) (flatten [(format to-format "headers.message_id") (rest sql-result)])
           (= entity :body-part) (flatten [(format to-format "bodies.message_id") (rest sql-result)]))))
 

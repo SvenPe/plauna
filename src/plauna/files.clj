@@ -93,7 +93,9 @@
           (recur fn (rest sq) [line "\r\n"]))
         (if (nil? line)
           (do
-            (fn acc)
+            ;; Only flush a final email if we actually accumulated one; an empty/whitespace mbox would
+            ;; otherwise emit a spurious empty "email".
+            (when (peek acc) (fn acc))
             nil)
           (recur fn (rest sq) (conj acc line "\r\n")))))))
 
@@ -131,12 +133,20 @@
 (defmulti parse-cli-arg (fn [arg] (first arg)))
 (defmethod parse-cli-arg "--config-file" [arg-pair]  {:config-file (second arg-pair)})
 (defmethod parse-cli-arg "--data-folder" [arg-pair] {:data-folder (second arg-pair)})
-(defmethod parse-cli-arg "--server-port" [arg-pair] {:server {:port (Integer/parseInt (second arg-pair))}})
+(defmethod parse-cli-arg "--server-port" [arg-pair]
+  (if-let [port (try (some-> (second arg-pair) Integer/parseInt)
+                     (catch NumberFormatException _ nil))]
+    {:server {:port port}}
+    (do (t/log! :warn ["Ignoring --server-port: expected a numeric port but got" (pr-str (second arg-pair))])
+        nil)))
 (defmethod parse-cli-arg :default [arg-pair]
   (t/log! :info ["Received non Plauna specific argument" arg-pair "- Doing nothing."])
   nil)
 
-(defn partition-cli-args [args] (partition 2 args))
+(defn partition-cli-args [args]
+  (when (odd? (count args))
+    (t/log! :warn ["Ignoring trailing CLI argument with no value:" (last args)]))
+  (partition 2 args))
 
 (defn aggregate-config-map
   ([acc val] (conj acc val))
