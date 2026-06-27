@@ -23,7 +23,7 @@
 
 (defonce ^:private active-db-type (atom :sqlite))
 
-(defonce ^:private ^:volatile-mutable mariadb-pool nil)
+(defonce ^:private mariadb-pool (atom nil))
 
 (defn sqlite-url []
   (str "jdbc:sqlite:" (files/path-to-db-file)
@@ -45,18 +45,18 @@
         (.setMinimumIdle hcfg 2)
         (.setConnectionTimeout hcfg 30000)
         (.setValidationTimeout hcfg 5000)
-        (set! mariadb-pool (HikariDataSource. hcfg))
+        (reset! mariadb-pool (HikariDataSource. hcfg))
         (t/log! :info ["Connected to MariaDB at" (str host ":" port "/" name)]))
       (catch Exception e
         (t/log! :error ["Failed to initialise MariaDB connection pool, falling back to SQLite:" (.getMessage e)])
         (reset! active-db-type :sqlite)
-        (set! mariadb-pool nil))))
+        (reset! mariadb-pool nil))))
   cfg)
 
 (defn ds
   "Return the active datasource (HikariCP pool for MariaDB, JDBC URL for SQLite)."
   []
-  (or mariadb-pool
+  (or @mariadb-pool
       (jdbc/get-datasource {:jdbcUrl (sqlite-url)})))
 
 (defn db-type [] @active-db-type)
@@ -528,9 +528,9 @@
 (defn close-pool!
   "Shut down the MariaDB connection pool gracefully (called on app stop)."
   []
-  (when mariadb-pool
-    (.close ^HikariDataSource mariadb-pool)
-    (set! mariadb-pool nil)))
+  (when-let [pool ^HikariDataSource @mariadb-pool]
+    (.close pool)
+    (reset! mariadb-pool nil)))
 
 (deftype SqliteDB []
   int/DB
