@@ -108,6 +108,19 @@
   (let [insert-part (first insert-query)]
     (conj (rest insert-query) (string/replace insert-part #"INSERT" "INSERT OR REPLACE"))))
 
+(defn insert->metadata-upsert
+  "SQLite upsert for metadata that updates ONLY the supplied columns on conflict, preserving the rest of
+   the row (e.g. folder, category_modified, language_modified). INSERT OR REPLACE must NOT be used here:
+   it deletes and re-inserts the row, wiping any columns not present in the INSERT."
+  [insert-query]
+  (conj (rest insert-query)
+        (str (first insert-query)
+             " ON CONFLICT(message_id) DO UPDATE SET"
+             " language = excluded.language,"
+             " language_confidence = excluded.language_confidence,"
+             " category = excluded.category,"
+             " category_confidence = excluded.category_confidence")))
+
 (defn save-headers [headers]
   (jdbc/execute! (ds)
                  (->>
@@ -159,7 +172,7 @@
                            :metadata
                            [:message_id :language :language_confidence :category :category_confidence]
                            (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
-                          (insert->insert-update))
+                          (insert->metadata-upsert))
                      {:batch true}))))
 
 (def batch-size 500)
@@ -391,6 +404,47 @@
         participants (map core.email/construct-participants (fetch-participants message-id))]
     (core.email/->EnrichedEmail header bodies participants metadata)))
 
+(defn- in-clause-placeholders [n] (string/join ", " (repeat n "?")))
+
+(defn fetch-metadata-for [message-ids]
+  (when (seq message-ids)
+    (jdbc/execute! (ds)
+                   (into [(str "SELECT message_id, language, language_modified, language_confidence, metadata.category AS category_id, category_modified, category_confidence, categories.name AS category FROM metadata LEFT JOIN categories ON metadata.category = categories.id WHERE metadata.message_id IN (" (in-clause-placeholders (count message-ids)) ")")]
+                         message-ids)
+                   builder-function-kebab)))
+
+(defn fetch-bodies-for [message-ids]
+  (when (seq message-ids)
+    (jdbc/execute! (ds)
+                   (into [(str "SELECT * FROM bodies WHERE message_id IN (" (in-clause-placeholders (count message-ids)) ")")]
+                         message-ids)
+                   builder-function-kebab)))
+
+(defn fetch-participants-for [message-ids]
+  (when (seq message-ids)
+    (jdbc/execute! (ds)
+                   (into [(str "SELECT * FROM communications LEFT JOIN contacts ON contacts.contact_key = communications.contact_key WHERE message_id IN (" (in-clause-placeholders (count message-ids)) ")")]
+                         message-ids)
+                   builder-function-kebab)))
+
+(defn related-data-to-headers
+  "Batch variant of related-data-to-header. Loads metadata, bodies and participants for a whole page of
+   headers in three queries total (instead of three per header), then assembles the EnrichedEmails.
+   Preserves the order of the incoming headers."
+  [headers]
+  (let [message-ids        (mapv :message-id headers)
+        metadata-by-id     (into {} (map (juxt :message-id identity)) (fetch-metadata-for message-ids))
+        bodies-by-id       (group-by :message-id (fetch-bodies-for message-ids))
+        participants-by-id (group-by :message-id (fetch-participants-for message-ids))]
+    (mapv (fn [header]
+            (let [mid (:message-id header)]
+              (core.email/->EnrichedEmail
+               header
+               (map core.email/construct-body-part (get bodies-by-id mid))
+               (map core.email/construct-participants (get participants-by-id mid))
+               (db->metadata (get metadata-by-id mid)))))
+          headers)))
+
 (defmulti fetch-data (fn [options _] (:entity options)))
 
 (defmethod fetch-data :body-part [entity-clause sql-clause]
@@ -408,10 +462,10 @@
 
 (defmethod fetch-data :enriched-email [entity-clause sql-clause]
   (if (nil? (:page entity-clause))
-    (map related-data-to-header (map core.email/construct-header (fetch-headers entity-clause sql-clause)))
+    (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause)))
     (let [limit-offset (page/page-request->limit-offset (:page entity-clause))
           sql-clause-with-limit-offset (conj sql-clause limit-offset)
-          data (map related-data-to-header (map core.email/construct-header (fetch-headers entity-clause sql-clause-with-limit-offset)))]
+          data (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause-with-limit-offset)))]
       {:data  data
        :size  (count data)
        :page  (inc (quot (:offset limit-offset) (:limit limit-offset)))
