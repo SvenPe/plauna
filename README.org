@@ -93,7 +93,7 @@ E.g. java -jar plauna.jar --server-port 80
 
 Application preferences (log level, detection thresholds, health-check interval) are stored in =settings.json= in the data directory (default =/var/lib/plauna/settings.json=). The file is created automatically on first startup, and you can edit the values through "Admin" → "Preferences" in the web UI.
 
-Example file with all keys and their defaults:
+Example file with the user-facing keys and their defaults:
 
 #+begin_src json
 {
