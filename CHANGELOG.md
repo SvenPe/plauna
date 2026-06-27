@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-06-28.0] - 2026-06-28
+
+### 🔒 Security
+
+- Bind the in-app nREPL to localhost instead of all network interfaces
+- Persist the session cookie key and set HttpOnly + SameSite=Lax (mitigates CSRF)
+- Reject off-site redirect targets from redirect-url/Referer (open redirect)
+- Return 400/500 with a generic message instead of leaking stack traces on bad input
+
+### 🐛 Bug Fixes
+
+- IMAP connections always used plaintext instead of SSL
+- BCC recipients were stored with the CC type
+- Message rate limiter could busy-spin after the main channel closed
+- OAuth refresh token was deleted on transient network errors; add HTTP timeouts
+- Add graceful shutdown of IMAP connections, server and watchdog on SIGTERM
+- Language detection picked an arbitrary candidate instead of the best match, and crashed on hyphenated codes (e.g. zh-cn)
+- Categorizing an email with empty content no longer kills the process
+- Guard against nil MIME types and nil content while parsing emails
+- Plain-text bodies are no longer mangled by HTML stripping
+- Decode message bodies as UTF-8 deterministically
+- Empty mbox files no longer emit a spurious empty email
+- IMAP moves restore monitoring even on failure; health-check tasks no longer leak; only the moved message is expunged
+
+### ⚡ Performance
+
+- Batch-load email listing data, eliminating per-row N+1 queries
+- Run IMAP health checks on a thread pool so one slow connection cannot stall the others
+- Index metadata(language) and metadata(category)
+- Fix a MariaDB pagination crash on the first page (negative OFFSET)
+- Use a column-preserving upsert for the SQLite metadata batch (was INSERT OR REPLACE)
+
+### 🚜 Refactor
+
+- Remove the unused specs namespace and clear migration reflection warnings
+
 ## [2026-03-18.0] - 2026-03-18
 
 ### 🚀 Features
