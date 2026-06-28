@@ -217,19 +217,26 @@
   [message-id]
   (if-let [refetched (client/refetch-message-by-id message-id)]
     (do
-      ;; Save in two groups so refetch is idempotent AND can repair a row whose content was missing:
-      ;;  - Content-bearing parts (text): rely on the DB's UNIQUE(mime_type, message_id, content) +
-      ;;    INSERT OR IGNORE to dedupe identical rows. A part whose stored content was blank has different
-      ;;    content, so it would otherwise be inserted alongside the empty row; delete the stale blank row
-      ;;    of that mime-type first so the repair replaces it instead of duplicating.
+      ;; Save in two groups so refetch is idempotent AND can repair a row whose content was missing.
+      ;; A body part's identity is (mime-type, filename, content-disposition) so that, e.g., the main
+      ;; text/plain body and a text/plain "note.txt" attachment are treated as distinct rows.
+      ;;  - Content-bearing parts (text): deduped by the DB's UNIQUE(mime_type, message_id, content) via
+      ;;    INSERT OR IGNORE. A part whose stored content was blank has different content, so we first
+      ;;    delete that one stale empty row (matched by identity + blank content, by id) so the repair
+      ;;    replaces it rather than leaving an empty duplicate.
       ;;  - Attachment parts (nil content): a UNIQUE constraint does not dedupe NULLs, so only add one when
-      ;;    no row of the same mime-type + filename exists yet.
+      ;;    no row of the same identity exists yet.
       (let [blank?           (fn [p] (st/blank? (str (:content p))))
-            stored-key       (juxt :mime-type :filename)
-            already-stored   (set (map stored-key (db/fetch-bodies-for [message-id])))
+            part-key         (juxt :mime-type :filename :content-disposition)
+            existing         (db/fetch-bodies-for [message-id])
+            existing-keys    (set (map part-key existing))
             content-parts    (remove blank? (:body refetched))
-            attachment-parts (remove (comp already-stored stored-key) (filter blank? (:body refetched)))]
-        (db/delete-blank-bodies-of-types message-id (map :mime-type content-parts))
+            content-keys     (set (map part-key content-parts))
+            attachment-parts (remove (comp existing-keys part-key) (filter blank? (:body refetched)))
+            stale-ids        (->> existing
+                                  (filter (fn [r] (and (blank? r) (contains? content-keys (part-key r)))))
+                                  (keep :id))]
+        (when (seq stale-ids) (db/delete-bodies-by-ids stale-ids))
         (when (seq content-parts) (db/save-bodies content-parts))
         (when (seq attachment-parts) (db/save-bodies attachment-parts)))
       ;; The body text is available now, so fill in the language if it was never detected. We leave an

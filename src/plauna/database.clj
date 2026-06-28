@@ -141,17 +141,15 @@
                   (insert->insert-ignore))
                  {:batch true}))
 
-(defn delete-blank-bodies-of-types
-  "Delete stored body rows for a message that have no content (NULL or empty) and whose mime-type is in
-   mime-types. Used by refetch to drop a stale empty text row before saving the repaired, content-bearing
-   version (a UNIQUE constraint would otherwise leave both, since the contents differ). Attachment rows
-   are unaffected because their mime-type (application/*, image/*, ...) is never in the repaired set."
-  [message-id mime-types]
-  (when (seq mime-types)
+(defn delete-bodies-by-ids
+  "Delete the body rows with the given primary-key ids. Used by refetch to drop a specific stale (empty)
+   body row before saving its repaired, content-bearing version. Deleting by id keeps the match exact
+   (and dialect-agnostic) instead of relying on null-safe multi-column SQL."
+  [ids]
+  (when (seq ids)
     (jdbc/execute! (ds)
-                   (into [(str "DELETE FROM bodies WHERE message_id = ? AND (content IS NULL OR content = '') AND mime_type IN ("
-                               (string/join ", " (repeat (count mime-types) "?")) ")")]
-                         (cons message-id mime-types)))))
+                   (into [(str "DELETE FROM bodies WHERE id IN (" (string/join ", " (repeat (count ids) "?")) ")")]
+                         ids))))
 
 (defn save-contacts [contacts]
   (jdbc/execute! (ds)
