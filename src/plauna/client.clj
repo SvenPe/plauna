@@ -234,7 +234,11 @@
   (new Body-Part (.getMessageID message) (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) nil (.getFileName message) (.getDisposition message)))
 
 (defmethod create-body-part Multipart [^Multipart multipart ^IMAPMessage message]
-  (for [i (range 0 (.getCount multipart))] (doall (create-body-part (.getBodyPart multipart i) message))))
+  (mapv (fn [i] (create-body-part (.getBodyPart multipart i) message))
+        (range 0 (.getCount multipart))))
+
+(defn- realize-body-parts [body-parts]
+  (vec (flatten [body-parts])))
 
 ;; TODO remove duplication with parser.clj
 (defn uuid [^String name] (str (java.util.UUID/nameUUIDFromBytes (.getBytes name))))
@@ -259,7 +263,7 @@
 (defn message->email [^IMAPMessage message]
   (new Email
        (create-header message)
-       (flatten [(create-body-part (.getContent message) message)])
+       (realize-body-parts (create-body-part (.getContent message) message))
        (create-participants message)))
 
 ;; Calls

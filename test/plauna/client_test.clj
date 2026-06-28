@@ -120,6 +120,20 @@
     (is (= empty "INBOX"))
     (is (= valid "MyInbox"))))
 
+(deftest body-parts-are-eagerly-realized
+  (let [realized (atom [])
+        plain (core-email/->Body-Part "msg" "utf-8" "text/plain" nil "plain body" nil nil)
+        html (core-email/->Body-Part "msg" "utf-8" "text/html" nil "<p>html body</p>" nil nil)
+        body-parts (lazy-seq
+                    (swap! realized conj :outer)
+                    [(lazy-seq
+                      (swap! realized conj :inner)
+                      [plain html])])
+        result (#'client/realize-body-parts body-parts)]
+    (is (= [:outer :inner] @realized))
+    (is (vector? result))
+    (is (= [plain html] result))))
+
 (deftest create-category-does-nothing-when-not-connected
   (let [create-folder-called (atom nil)]
     (with-redefs [client/connected? (fn [_] false)
