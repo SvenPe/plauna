@@ -217,7 +217,14 @@
   [message-id]
   (if-let [refetched (client/refetch-message-by-id message-id)]
     (do
-      (when (seq (:body refetched)) (db/save-bodies (:body refetched)))
+      ;; Only save parts that aren't already stored. Attachment rows have a nil :content, and a UNIQUE
+      ;; constraint does not dedupe NULLs, so blindly re-saving them would accumulate a duplicate
+      ;; attachment row on every refetch. Keying on mime-type + filename keeps refetch idempotent for
+      ;; both text and attachment parts.
+      (let [stored-key      (juxt :mime-type :filename)
+            already-stored  (set (map stored-key (db/fetch-bodies-for [message-id])))
+            missing-parts   (remove (comp already-stored stored-key) (:body refetched))]
+        (when (seq missing-parts) (db/save-bodies missing-parts)))
       ;; The body text is available now, so fill in the language if it was never detected. We leave an
       ;; already-set language alone so a manual correction is never clobbered.
       (let [current-lang (:language (db/fetch-metadata message-id))]
