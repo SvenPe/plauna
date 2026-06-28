@@ -2,6 +2,7 @@
   (:require [clojure.test :refer :all]
             [plauna.application :as app]
             [plauna.client :as client]
+            [plauna.database :as db]
             [plauna.server :as server]))
 
 (defn- ok-handler [_] {:status 200 :body "secret"})
@@ -49,3 +50,20 @@
                @calls))
         (is (= 303 (:status response)))
         (is (= "/admin/connections" (get-in response [:headers "Location"])))))))
+
+(deftest refetch-email-saves-participants
+  (let [participants [{:message-id "msg-1" :contact-key "sender-key" :name "Sender" :address "sender@example.com" :type :sender}
+                      {:message-id "msg-1" :contact-key "to-key" :name "Receiver" :address "to@example.com" :type :receiver}
+                      {:message-id "msg-1" :contact-key "cc-key" :name "Copy" :address "cc@example.com" :type :cc}
+                      {:message-id "msg-1" :contact-key "bcc-key" :name "Blind" :address "bcc@example.com" :type :bcc}]
+        calls (atom [])]
+    (with-redefs [client/refetch-message-by-id (fn [_] {:body [] :participants participants})
+                  db/fetch-bodies-for (fn [_] [])
+                  db/save-contacts (fn [contacts] (swap! calls conj [:contacts contacts]))
+                  db/save-communications (fn [contacts] (swap! calls conj [:communications contacts]))
+                  db/fetch-metadata (fn [_] {:language "en"})]
+      (is (= {:type :success :content "Re-fetched the email from the server and filled in its contents."}
+             (server/refetch-email-and-fill! "msg-1")))
+      (is (= [[:contacts participants]
+              [:communications participants]]
+             @calls)))))

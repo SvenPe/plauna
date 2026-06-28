@@ -22,7 +22,7 @@
 (defn- render
   "render-file wrapper that injects disconnected-connections into every authenticated page."
   [template ctx]
-  (render-file template (merge {:disconnected (client/disconnected-connections)} ctx)))
+  (render-file template (merge {:disconnected (seq (client/disconnected-connections))} ctx)))
 
 (defn timestamp->date [timestamp]
   (if (nil? timestamp)

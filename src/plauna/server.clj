@@ -239,6 +239,9 @@
         (when (seq stale-ids) (db/delete-bodies-by-ids stale-ids))
         (when (seq content-parts) (db/save-bodies content-parts))
         (when (seq attachment-parts) (db/save-bodies attachment-parts)))
+      (when (seq (:participants refetched))
+        (db/save-contacts (:participants refetched))
+        (db/save-communications (:participants refetched)))
       ;; The body text is available now, so fill in the language if it was never detected. We leave an
       ;; already-set language alone so a manual correction is never clobbered.
       (let [current-lang (:language (db/fetch-metadata message-id))]
