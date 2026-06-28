@@ -190,9 +190,15 @@
 
 (defonce fallback-charset "us-ascii")
 
-(defn charset [content-type] (if (text? content-type)
-                               (s/lower-case (or (second (s/split (second (s/split content-type #";")) #"=")) fallback-charset))
-                               fallback-charset))
+(defn charset [content-type]
+  ;; Extract the charset parameter wherever it appears (handling optional quotes). A text/* part is not
+  ;; required to declare a charset (e.g. "Content-Type: text/plain"); fall back rather than NPE when the
+  ;; charset parameter is absent or malformed.
+  (or (when (text? content-type)
+        (some-> (re-find #"(?i)charset\s*=\s*\"?([^\";\s]+)" content-type)
+                second
+                s/lower-case))
+      fallback-charset))
 
 (defn disposition [disposition] (when (some? disposition) (s/lower-case disposition)))
 

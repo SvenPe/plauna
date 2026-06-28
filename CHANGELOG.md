@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   first, so the email survived without any body). Attachment content is now dropped at
   parse time, matching the mbox parser and the documented "attachments are not stored"
   behaviour, so the text parts are saved.
+- Live IMAP parsing no longer fails for a text part with no charset parameter (e.g.
+  "Content-Type: text/plain"); the charset helper falls back instead of throwing an NPE.
 
 ## [2026-06-28.0] - 2026-06-28
 
