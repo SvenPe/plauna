@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-06-28.1] - 2026-06-28
+
+### 🐛 Bug Fixes
+
+- IMAP emails with a non-text attachment (e.g. a PDF) were stored with no body parts
+  ("Email has no parseable text content"). JavaMail returns an attachment's content as
+  an InputStream; storing it broke the body insert on MariaDB (the header was saved
+  first, so the email survived without any body). Attachment content is now dropped at
+  parse time, matching the mbox parser and the documented "attachments are not stored"
+  behaviour, so the text parts are saved.
+
 ## [2026-06-28.0] - 2026-06-28
 
 ### 🔒 Security

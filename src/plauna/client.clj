@@ -205,9 +205,22 @@
   (new Body-Part (.getMessageID message) (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) content (.getFileName message) (.getDisposition message)))
 
 (defmethod create-body-part BodyPart [^BodyPart bodypart ^IMAPMessage message]
-  (if (instance? Multipart (.getContent bodypart))
-    (create-body-part (.getContent bodypart) message)
-    (new Body-Part (.getMessageID message) (charset (.getContentType bodypart)) (mime-type (.getContentType bodypart)) (first (.getHeader bodypart "Content-transfer-encoding")) (.getContent bodypart) (.getFileName bodypart) (disposition (.getDisposition bodypart)))))
+  (let [content-type (.getContentType bodypart)
+        content (.getContent bodypart)]
+    (if (instance? Multipart content)
+      (create-body-part content message)
+      (new Body-Part (.getMessageID message) (charset content-type) (mime-type content-type) (first (.getHeader bodypart "Content-transfer-encoding"))
+           ;; Only persist textual content (as a String). For attachments (PDFs, images, ...) JavaMail
+           ;; returns the content as an InputStream; storing that bloats the DB and, on MariaDB, fails the
+           ;; insert outright (leaving a header with no body parts). Attachments are intentionally not
+           ;; stored, mirroring the mbox parser.
+           (when (and (text? content-type) (string? content)) content)
+           (.getFileName bodypart) (disposition (.getDisposition bodypart))))))
+
+(defmethod create-body-part :default [_ ^IMAPMessage message]
+  ;; A non-multipart message whose body is neither a String nor a recognised part (e.g. a bare
+  ;; attachment): keep its metadata but do not store the (binary) content.
+  (new Body-Part (.getMessageID message) (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) nil (.getFileName message) (.getDisposition message)))
 
 (defmethod create-body-part Multipart [^Multipart multipart ^IMAPMessage message]
   (for [i (range 0 (.getCount multipart))] (doall (create-body-part (.getBodyPart multipart i) message))))
