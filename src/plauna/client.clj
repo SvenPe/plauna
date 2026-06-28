@@ -482,8 +482,13 @@
 (defn reconnect [^ConnectionData connection-data]
   (try
     (t/log! :info ["Trying to reconnect to" (-> connection-data .config :host) "as" (-> connection-data .config :user)])
-    (when (oauth2? (.config connection-data)) (refresh-access-token (.config connection-data)))
-    (login (.config connection-data) (.store connection-data))
+    (if (connected? connection-data)
+      (do
+        (t/log! :info ["IMAP store is already connected for" (-> connection-data .config :user) "- leaving it open."])
+        connection-data)
+      (do
+        (when (oauth2? (.config connection-data)) (refresh-access-token (.config connection-data)))
+        (login (.config connection-data) (.store connection-data))))
     (catch AuthenticationFailedException e (t/log! :error e))))
 
 (defn start-monitoring [connection-data context]

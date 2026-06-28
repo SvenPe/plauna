@@ -280,6 +280,25 @@
     (client/folders-in-store (:store (client/connection-data-from-id (:id conn))))
     []))
 
+(defn- connect-control-response [context request id]
+  (let [action (app/connect-to-client context id)]
+    (cond
+      (= :redirect (:result action))
+      (let [csrf (.toString (UUID/randomUUID))]
+        (-> (redirect (oauth/authorize-uri (:provider action) csrf))
+            (assoc :session (merge (:session request) {:oauth-csrf csrf :connection-id id :provider (:provider action)}))))
+
+      (= :ok (:result action))
+      (redirect-request request)
+
+      (= :error (:result action))
+      (redirect-request request {:type :alert :content "Connection failed. Please see the logs for the details."}))))
+
+(defn- reconnect-control-response [context request id]
+  (when-let [connection-data (client/connection-data-from-id id)]
+    (client/disconnect connection-data))
+  (connect-control-response context request id))
+
 (defn empty-global-messages [] (reset! global-messages []))
 
 (defmacro result-with-messages [markup-call messages-var]
@@ -624,19 +643,9 @@
    (comp/POST "/admin/connections/:id/controls" request
      (let [id (:id (:route-params request))
            operation (:operation (:params request))]
-       (cond (= "reconnect" operation) (do (client/reconnect (client/connection-data-from-id id)) (redirect-request request))
+       (cond (= "reconnect" operation) (reconnect-control-response context request id)
              (= "disconnect" operation) (do (client/disconnect (client/connection-data-from-id id)) (redirect-request request))
-             (= "connect" operation)
-             (let [action (app/connect-to-client context id)]
-               (cond
-                 (= :redirect (:result action))
-                 (let [csrf (.toString (UUID/randomUUID))]
-                   (-> (redirect (oauth/authorize-uri (:provider action) csrf))
-                       (assoc :session (merge (:session request) {:oauth-csrf csrf :connection-id id :provider (:provider action)}))))
-                 (= :ok (:result action))
-                 (redirect-request request)
-                 (= :error (:result action))
-                 (redirect-request request {:type :alert :content "Connection failed. Please see the logs for the details."})))
+             (= "connect" operation) (connect-control-response context request id)
              (= "parse" operation) (let [params (:params request)
                                          folder (:folder params)
                                          move (some? (:move params))

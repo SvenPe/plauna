@@ -134,6 +134,23 @@
       (client/create-category-folders! {:store nil} "my-cat")
       (is (= "my-cat" @create-folder-called)))))
 
+(deftest reconnect-does-not-login-an-already-connected-store
+  (let [login-called? (atom false)
+        connection-data (->ConnectionData {:id "id1" :host "imap.example.com" :user "me@example.com"} nil nil nil nil nil)]
+    (with-redefs [client/connected? (fn [_] true)
+                  client/login (fn [& _] (reset! login-called? true))]
+      (is (= connection-data (client/reconnect connection-data)))
+      (is (false? @login-called?)))))
+
+(deftest reconnect-logs-in-a-disconnected-store
+  (let [login-args (atom nil)
+        config {:id "id1" :host "imap.example.com" :user "me@example.com" :auth-type "basic"}
+        connection-data (->ConnectionData config :store nil nil nil nil)]
+    (with-redefs [client/connected? (fn [_] false)
+                  client/login (fn [cfg store] (reset! login-args [cfg store]) :logged-in)]
+      (is (= :logged-in (client/reconnect connection-data)))
+      (is (= [config :store] @login-args)))))
+
 (deftest connection-id-for-email-happy-path
   (let [test-email (->Email nil nil
                             [(->Participant "find@me.com" nil nil :receiver nil)
@@ -208,4 +225,3 @@
                 client/inbox-or-category-folder-name (fn [_ folder-name _] (if (= folder-name "projects") "Recorded/Folder" "Derived/Work"))]
     (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
   "The recorded folder drives source resolution: the recorded source equals the resolved target so the move is a no-op (true). If the category-derived folder were used instead, source would be 'Derived/Work' != target and the code would try to open a (nil) store and fail.")
-
