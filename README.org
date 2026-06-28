@@ -34,6 +34,8 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Responsive web UI that also works on mobile, so you can recategorize e-mails on the go.
 
+- Re-fetch an individual e-mail from the IMAP server to fill in content that was missed when it was first read.
+
 
 * What Plauna is NOT
 
@@ -223,6 +225,8 @@ Changes in the list are saved *immediately* when you change a field - there is n
 - Changing an e-mail's *language* saves it right away as well. Clearing the field removes the stored language.
 
 Each field briefly outlines itself to show the result: green when fully saved, amber when the category could not be moved (and was therefore not saved), and red on unexpected failure.
+
+On an e-mail's details page, the "Contents" section has a *Re-fetch from server* button. It re-reads that message from your IMAP server and fills in data that could not be extracted when the e-mail was first read - for example body text that was missed by an earlier parsing bug, and the detected language if it had never been set. Existing content and a language you set yourself are left untouched. The message is located by its Message-ID across your connected accounts, so the account must be connected for this to work.
 
 The UI is responsive and works on phones, so you can recategorize e-mails on the go: the e-mail list keeps the category dropdown visible on small screens, and each change is saved instantly.
 

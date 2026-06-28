@@ -561,6 +561,31 @@
       (try (.close store)
            (catch Exception e (t/log! {:level :error :error e} "Error closing bulk-read store"))))))
 
+(defn refetch-message-by-id
+  "Re-read a single message from the IMAP server by its Message-ID and return a freshly parsed Email,
+   or nil if it cannot be found on any connected account. Searches the email's recorded folder first,
+   then each account's monitored folder and INBOX. Uses a dedicated bulk-read connection so the IDLE
+   monitor is left undisturbed."
+  [message-id]
+  (let [recorded (db/email-folder message-id)
+        candidate-folders (fn [^ConnectionData cd]
+                            (distinct (remove s/blank? [recorded (-> cd :config :folder) "INBOX"])))]
+    (some (fn [^ConnectionData cd]
+            (when (connected? cd)
+              (some (fn [folder-name]
+                      (let [bulk (try (open-folder-for-bulk-read cd folder-name)
+                                      (catch Exception e
+                                        (t/log! {:level :warn :error e} ["Could not open folder" folder-name "while re-fetching" message-id])
+                                        nil))]
+                        (when bulk
+                          (try
+                            (when-let [^IMAPMessage msg (first (.search ^IMAPFolder (:folder bulk) (MessageIDTerm. message-id)))]
+                              (set-message-as-peek msg)
+                              (message->email msg))
+                            (finally (close-folder-for-bulk-read bulk))))))
+                    (candidate-folders cd))))
+          (vals @connections))))
+
 (defmulti connect (fn [config _] (:auth-type config)))
 
 (defmethod connect "oauth2" [connection-config context]

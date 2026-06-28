@@ -210,6 +210,24 @@
 
 (defn enriched-email-by-message-id [id] (first (db/fetch-data {:entity :enriched-email :strict false} {:where [:= :message-id id]})))
 
+(defn refetch-email-and-fill!
+  "Re-read a message from the IMAP server and fill in data that is now parseable: the body parts (saved
+   if missing; existing rows are left untouched) and the language when it was never detected. Returns a
+   message map for the UI."
+  [message-id]
+  (if-let [refetched (client/refetch-message-by-id message-id)]
+    (do
+      (when (seq (:body refetched)) (db/save-bodies (:body refetched)))
+      ;; The body text is available now, so fill in the language if it was never detected. We leave an
+      ;; already-set language alone so a manual correction is never clobbered.
+      (let [current-lang (:language (db/fetch-metadata message-id))]
+        (when (or (nil? current-lang) (st/blank? (str current-lang)) (= "n/a" current-lang))
+          (let [lang (analysis/language-result refetched)]
+            (when (and (:code lang) (not= "n/a" (:code lang)))
+              (db/update-metadata-language message-id (:code lang) (:confidence lang))))))
+      {:type :success :content "Re-fetched the email from the server and filled in its contents."})
+    {:type :alert :content "Could not re-fetch this email: it was not found on any connected account."}))
+
 ;; TODO change name template
 (def emails-template {:size {:default 20 :type-fn Integer/parseInt}
                       :page {:default 1 :type-fn Integer/parseInt}
@@ -518,6 +536,10 @@
    (comp/DELETE "/emails/:id" [id]
      (db/delete-email-by-message-id (new String ^"[B" (base64-decode id)))
      {:status  200})
+
+   (comp/POST "/emails/:id/refetch" [id :as request]
+     (add-to-messages (refetch-email-and-fill! (new String ^"[B" (base64-decode id))))
+     (redirect-to-referer request))
 
    (comp/GET "/admin/connections" _
      (let [messages @global-messages]

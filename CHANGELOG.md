@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-06-28.2] - 2026-06-28
+
+### 🚀 Features
+
+- Add a "Re-fetch from server" button on the e-mail details page. It re-reads the
+  message from the IMAP server by Message-ID and fills in data that could not be
+  extracted earlier (body parts, and the language when it was never detected),
+  without clobbering content or a language the user set manually.
+
 ## [2026-06-28.1] - 2026-06-28
 
 ### 🐛 Bug Fixes

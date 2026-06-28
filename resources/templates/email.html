@@ -61,6 +61,11 @@
 
 <h3 class="uppercase text-lg my-8">Contents</h3>
 
+<form action="/emails/{{email.header.message-id|base64-encode}}/refetch" method="post" class="my-4 flex items-center gap-3">
+  <button class="btn" type="submit">Re-fetch from server</button>
+  <span class="text-base-content/60 text-sm">Re-read this message from the IMAP server to fill in content that was missed earlier.</span>
+</form>
+
 {% if email.body|empty? %}<p class="text-base-content/60 italic">Email has no parseable text content.</p>{% endif %}
 {% for body-part in email.body %}
 <table class="table">
