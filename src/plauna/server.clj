@@ -217,14 +217,21 @@
   [message-id]
   (if-let [refetched (client/refetch-message-by-id message-id)]
     (do
-      ;; Only save parts that aren't already stored. Attachment rows have a nil :content, and a UNIQUE
-      ;; constraint does not dedupe NULLs, so blindly re-saving them would accumulate a duplicate
-      ;; attachment row on every refetch. Keying on mime-type + filename keeps refetch idempotent for
-      ;; both text and attachment parts.
-      (let [stored-key      (juxt :mime-type :filename)
-            already-stored  (set (map stored-key (db/fetch-bodies-for [message-id])))
-            missing-parts   (remove (comp already-stored stored-key) (:body refetched))]
-        (when (seq missing-parts) (db/save-bodies missing-parts)))
+      ;; Save in two groups so refetch is idempotent AND can repair a row whose content was missing:
+      ;;  - Content-bearing parts (text): rely on the DB's UNIQUE(mime_type, message_id, content) +
+      ;;    INSERT OR IGNORE to dedupe identical rows. A part whose stored content was blank has different
+      ;;    content, so it would otherwise be inserted alongside the empty row; delete the stale blank row
+      ;;    of that mime-type first so the repair replaces it instead of duplicating.
+      ;;  - Attachment parts (nil content): a UNIQUE constraint does not dedupe NULLs, so only add one when
+      ;;    no row of the same mime-type + filename exists yet.
+      (let [blank?           (fn [p] (st/blank? (str (:content p))))
+            stored-key       (juxt :mime-type :filename)
+            already-stored   (set (map stored-key (db/fetch-bodies-for [message-id])))
+            content-parts    (remove blank? (:body refetched))
+            attachment-parts (remove (comp already-stored stored-key) (filter blank? (:body refetched)))]
+        (db/delete-blank-bodies-of-types message-id (map :mime-type content-parts))
+        (when (seq content-parts) (db/save-bodies content-parts))
+        (when (seq attachment-parts) (db/save-bodies attachment-parts)))
       ;; The body text is available now, so fill in the language if it was never detected. We leave an
       ;; already-set language alone so a manual correction is never clobbered.
       (let [current-lang (:language (db/fetch-metadata message-id))]
