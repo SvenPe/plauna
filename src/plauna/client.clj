@@ -370,6 +370,16 @@
 
 (defn connected? [^ConnectionData connection-data] (.isConnected ^Store (:store connection-data)))
 
+(defn disconnected-connections
+  "Returns configured connections (from DB) that are not currently connected.
+   A connection is disconnected when it has no active ConnectionData or its store reports false."
+  []
+  (let [active @connections]
+    (filterv (fn [conn]
+               (let [cd (get active (:id conn))]
+                 (or (nil? cd) (not (connected? cd)))))
+             (db/get-connections))))
+
 (defn- set-message-as-peek [^IMAPMessage message] (.setPeek message true))
 
 (defn- set-messages-as-peek [messages] (doseq [message messages] (set-message-as-peek message)))

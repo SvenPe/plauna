@@ -63,6 +63,18 @@
         </ul>
 	  </div>
     </div>
+    {% if disconnected %}
+    <div class="alert alert-error my-2" role="alert">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+      </svg>
+      <span>
+        IMAP connection not active:
+        {% for conn in disconnected %}{{conn.user}}@{{conn.host}}{% if not forloop.last %}, {% endif %}{% endfor %}.
+        Go to <a class="underline font-semibold" href="/admin/connections">Connections</a> to reconnect.
+      </span>
+    </div>
+    {% endif %}
     <main class="mx-2 my-4">
     {% block content %}
     {% endblock %}

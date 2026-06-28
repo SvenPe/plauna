@@ -4,6 +4,7 @@
             [selmer.filters :refer [add-filter!]]
             [clojure.java.io :as io]
             [ring.util.codec :refer [base64-encode]]
+            [plauna.client :as client]
             [scicloj.tableplot.v1.hanami :as hanami]
             [tablecloth.api :as tc]
             [tablecloth.column.api :as tcc]
@@ -17,6 +18,11 @@
 
 (comment
   (selmer.parser/cache-off!))
+
+(defn- render
+  "render-file wrapper that injects disconnected-connections into every authenticated page."
+  [template ctx]
+  (render-file template (merge {:disconnected (client/disconnected-connections)} ctx)))
 
 (defn timestamp->date [timestamp]
   (if (nil? timestamp)
@@ -40,14 +46,14 @@
     :else message))
 
 (defn administration
-  ([data] (render-file "admin.html" {:active-nav :admin :data data}))
-  ([data messages] (render-file "admin.html" {:messages (mapv type->toast-role messages) :active-nav :admin :data data})))
+  ([data] (render "admin.html" {:active-nav :admin :data data}))
+  ([data messages] (render "admin.html" {:messages (mapv type->toast-role messages) :active-nav :admin :data data})))
 
 (defn login-page
   ([] (login-page {}))
   ([data] (render-file "login.html" data)))
 
-(defn password-page [data] (render-file "admin-password.html" (conj {:active-nav :admin} data)))
+(defn password-page [data] (render "admin-password.html" (conj {:active-nav :admin} data)))
 
 (defn concat-string [contact]
   (if (nil? (:name contact))
@@ -90,16 +96,16 @@
 (defn list-emails
   ([emails page-info categories]
    (let [emails-with-java-date (map #(update-in % [:header :date] timestamp->date) emails)]
-     (render-file "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :active-nav :emails})))
+     (render "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :active-nav :emails})))
   ([emails page-info categories messages]
    (let [emails-with-java-date (map #(update-in % [:header :date] timestamp->date) emails)]
-     (render-file "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :messages (mapv type->toast-role messages) :active-nav :emails}))))
+     (render "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :messages (mapv type->toast-role messages) :active-nav :emails}))))
 
 (defn list-email-contents
   ([email-data categories]
-   (render-file "email.html" {:email (update-in email-data [:header :date] timestamp->date) :categories categories :active-nav :emails}))
+   (render "email.html" {:email (update-in email-data [:header :date] timestamp->date) :categories categories :active-nav :emails}))
   ([email-data categories messages]
-   (render-file "email.html" {:email (update-in email-data [:header :date] timestamp->date) :categories categories :active-nav :emails :messages (mapv type->toast-role messages)})))
+   (render "email.html" {:email (update-in email-data [:header :date] timestamp->date) :categories categories :active-nav :emails :messages (mapv type->toast-role messages)})))
 
 (defmacro pie-chart [data-values key key-label description]
   `{:data {:values ~data-values}
@@ -159,35 +165,35 @@
                                 (transform-into-overview-dataset 'category)
                                 (pie-chart 'category "Category" "Category Overview"))
         categories-bar-data (hanami/plot categories-data hanami/bar-chart {:=x :interval :=y :count :=background nil :=color :category :=x-title "Year" :=y-title "Categories"})]
-    (render-file "statistics.html"
-                 {:statistics [{:title "Overall"
-                                :contents [{:type :bar-chart :header "" :id "emails" :json-data (json/write-str overall-email)}
-                                           {:type :bar-chart :id "overview" :json-data (json/write-str mime-type-overview)}
-                                           {:type :bar-chart :id "most-common" :json-data (json/write-str mime-type-bar-data)}]}
-                               {:title "Languages"
-                                :contents [{:type :bar-chart :id "languages-overview" :json-data (json/write-str language-overview)}
-                                           {:type :bar-chart :id "languages" :json-data (json/write-str language-bar-data)}]}
-                               {:title "Categories"
-                                :contents [{:type :bar-chart :id "categories-overview" :json-data (json/write-str categories-overview)}
-                                           {:type :bar-chart :id "categories" :json-data (json/write-str categories-bar-data)}]}]
-                  :active-nav :statistics
-                  :no-data (empty? yearly-emails)})))
+    (render "statistics.html"
+            {:statistics [{:title "Overall"
+                           :contents [{:type :bar-chart :header "" :id "emails" :json-data (json/write-str overall-email)}
+                                      {:type :bar-chart :id "overview" :json-data (json/write-str mime-type-overview)}
+                                      {:type :bar-chart :id "most-common" :json-data (json/write-str mime-type-bar-data)}]}
+                          {:title "Languages"
+                           :contents [{:type :bar-chart :id "languages-overview" :json-data (json/write-str language-overview)}
+                                      {:type :bar-chart :id "languages" :json-data (json/write-str language-bar-data)}]}
+                          {:title "Categories"
+                           :contents [{:type :bar-chart :id "categories-overview" :json-data (json/write-str categories-overview)}
+                                      {:type :bar-chart :id "categories" :json-data (json/write-str categories-bar-data)}]}]
+             :active-nav :statistics
+             :no-data (empty? yearly-emails)})))
 
-(defn categories-page [categories] (render-file "admin-categories.html" {:categories categories :active-nav :admin}))
+(defn categories-page [categories] (render "admin-categories.html" {:categories categories :active-nav :admin}))
 
 (defn languages-admin-page [language-preferences]
-  (render-file "admin-languages.html" {:language-preferences language-preferences :active-nav :admin}))
+  (render "admin-languages.html" {:language-preferences language-preferences :active-nav :admin}))
 
 (defn connections-list
-  ([connections] (render-file "admin-connections.html" {:configs connections :active-nav :admin}))
-  ([connections messages] (render-file "admin-connections.html" {:configs connections :active-nav :admin :messages (mapv type->toast-role messages)})))
+  ([connections] (render "admin-connections.html" {:configs connections :active-nav :admin}))
+  ([connections messages] (render "admin-connections.html" {:configs connections :active-nav :admin :messages (mapv type->toast-role messages)})))
 
 (defn connection
-  ([config folders categories] (render-file "admin-connection.html" (merge config {:folders folders :active-nav :admin :categories (cons nil categories)})))
-  ([config folders messages categories] (render-file "admin-connection.html" (merge config {:folders folders :messages (mapv type->toast-role messages) :active-nav :admin :categories (cons nil categories)}))))
+  ([config folders categories] (render "admin-connection.html" (merge config {:folders folders :active-nav :admin :categories (cons nil categories)})))
+  ([config folders messages categories] (render "admin-connection.html" (merge config {:folders folders :messages (mapv type->toast-role messages) :active-nav :admin :categories (cons nil categories)}))))
 
 (defn preferences-page [data] (let [log-levels {:log-level-options [{:key :error :name "Error"} {:key :info :name "Info"} {:key :debug :name "Debug"}] :active-nav :admin}]
-                                (render-file "admin-preferences.html" (conj data log-levels))))
+                                (render "admin-preferences.html" (conj data log-levels))))
 
 (defn new-connection [providers]
-  (render-file "admin-new-connection.html" {:auth-providers providers}))
+  (render "admin-new-connection.html" {:auth-providers providers}))
