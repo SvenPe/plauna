@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-06-28.3] - 2026-06-28
+
+### 🐛 Bug Fixes
+
+- Fix IMAP IDLE monitoring for SSL connections, which broke with "Folder is not using
+  SocketChannels" during health checks. SSL is enabled via mail.imap.ssl.enable on the
+  "imap" store; switching SSL configs to the "imaps" store (in 2026-06-28.0) moved
+  property resolution to the mail.imaps.* prefix, so mail.imap.usesocketchannels no
+  longer applied and IdleManager could not watch the folder.
+
 ## [2026-06-28.2] - 2026-06-28
 
 ### 🚀 Features

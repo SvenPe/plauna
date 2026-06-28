@@ -101,10 +101,12 @@
       ((set-debug-mode connection-config))))
 
 (defn connection-config->store [connection-config]
-  (let [session ^Session (config->session connection-config)]
-    (if (= (security connection-config) "ssl")
-      (.getStore session "imaps")
-      (.getStore session "imap"))))
+  ;; Always use the "imap" store. SSL is enabled via mail.imap.ssl.enable (see security-properties), not
+  ;; by switching to the "imaps" store. This matters because IdleManager requires the folder to use
+  ;; socket channels (mail.imap.usesocketchannels=true), and that — along with every other property here —
+  ;; lives under the mail.imap.* prefix. The "imaps" store reads mail.imaps.* instead, so usesocketchannels
+  ;; would be ignored and IdleManager.watch would fail with "Folder is not using SocketChannels".
+  (.getStore ^Session (config->session connection-config) "imap"))
 
 (defn login
   ([connection-config ^Store store]
