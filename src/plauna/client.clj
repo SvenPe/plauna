@@ -203,7 +203,10 @@
 (defn disposition [disposition] (when (some? disposition) (s/lower-case disposition)))
 
 (defn create-header [^IMAPMessage message]
-  (new Header (.getMessageID message) (.getInReplyTo message) (.getSubject message) (mime-type (.getContentType message)) (quot (.getTime (.getSentDate message)) 1000)))
+  (let [sent (.getSentDate message)]
+    (new Header (.getMessageID message) (.getInReplyTo message) (.getSubject message)
+                (mime-type (.getContentType message))
+                (when sent (quot (.getTime sent) 1000)))))
 
 (defmulti create-body-part (fn [body-part _] (type body-part)))
 
@@ -245,11 +248,11 @@
 (defn create-participants [^IMAPMessage message]
   (let [sender (.getSender message)
         message-id (.getMessageID message)
-        sender-participant (create-participant sender :sender message-id)
+        sender-participant (when sender (create-participant sender :sender message-id))
         recipient-participants (mapv (fn [address] (create-participant address :receiver message-id)) (.getRecipients message Message$RecipientType/TO))
         cc-participants (mapv (fn [address] (create-participant address :cc message-id)) (.getRecipients message Message$RecipientType/CC))
         bcc-participants (mapv (fn [address] (create-participant address :bcc message-id)) (.getRecipients message Message$RecipientType/BCC))]
-    (flatten [sender-participant recipient-participants cc-participants bcc-participants])))
+    (filterv some? (flatten [sender-participant recipient-participants cc-participants bcc-participants]))))
 
 (defn message->email [^IMAPMessage message]
   (new Email
