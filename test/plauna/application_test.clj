@@ -159,14 +159,18 @@
 
 (deftest handle-incoming-email-db-exception
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] "test"))
-        db (reify int/DB (save-email [_ _] (throw (ex-info "test exception" {}))))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ _] (throw (ex-info "test exception" {}))))
         test-result (app/handle-incoming-imap-email {} {} {:analyzer analyzer :db db})]
     (is (= :error (:result test-result))))
   "Return an error result of something goes wrong with the database")
 
 (deftest handle-incoming-email-client-exception
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
-        db (reify int/DB (save-email [_ _] true))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ _] true))
         client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] (throw (ex-info "test exception" {}))))
         test-result (app/handle-incoming-imap-email {} {:move? true} {:analyzer analyzer :db db :client client})]
     (is (= :error (:result test-result))))
@@ -174,7 +178,9 @@
 
 (deftest handle-incoming-email-client-exception-move-false
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
-        db (reify int/DB (save-email [_ _] true))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ _] true))
         client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] (throw (ex-info "test exception" {}))))
         test-result (app/handle-incoming-imap-email {} {:move? false} {:analyzer analyzer :db db :client client})]
     (is (= :ok (:result test-result))))
@@ -182,7 +188,9 @@
 
 (deftest handle-incoming-email-client-exception-move-true
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category nil}}))
-        db (reify int/DB (save-email [_ _] true))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ _] true))
         client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] (throw (ex-info "test exception" {}))))
         test-result (app/handle-incoming-imap-email {} {:move? true} {:analyzer analyzer :db db :client client})]
     (is (= :ok (:result test-result))))
@@ -192,6 +200,7 @@
   (let [recorded (atom nil)
         analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
         db (reify int/DB
+             (email-exists? [_ _] false)
              (save-email [_ _] true)
              (update-email-folder [_ message-id folder] (reset! recorded [message-id folder])))
         client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] "Categories/Test"))
@@ -204,6 +213,7 @@
   (let [recorded (atom nil)
         analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
         db (reify int/DB
+             (email-exists? [_ _] false)
              (save-email [_ _] true)
              (update-email-folder [_ message-id folder] (reset! recorded [message-id folder])))
         client (reify int/EmailClient
@@ -213,6 +223,23 @@
     (is (= :ok (:result test-result)))
     (is (= ["fail-1" ":inbox"] @recorded) "A failed move records the email's actual (source) folder, not the destination"))
   "When a move does not complete, the email stays in its source folder and that folder is recorded so later recategorization can still find it.")
+
+(deftest handle-incoming-email-skips-existing-email
+  (let [analyzer (reify int/Analyzer
+                   (enrich-email [_ _] (throw (ex-info "existing email should not be enriched" {})))
+                   (detect-language [_ _] (throw (ex-info "existing email should not be language-detected" {}))))
+        db (reify int/DB
+             (email-exists? [_ message-id] (= "known-1" message-id))
+             (save-email [_ _] (throw (ex-info "existing email should not be saved" {})))
+             (update-email-folder [_ _ _] (throw (ex-info "existing email folder should not be updated" {}))))
+        client (reify int/EmailClient
+                 (move-email-to-category [_ _ _ _ _] (throw (ex-info "existing email should not be moved" {}))))
+        test-result (app/handle-incoming-imap-email {:header {:message-id "known-1"}}
+                                                    {:move? true :origin-folder :spam :message :message}
+                                                    {:analyzer analyzer :db db :client client})]
+    (is (= :ok (:result test-result)))
+    (is (nil? (:move test-result))))
+  "Existing emails are not re-categorized, re-saved, or moved when a folder parse sees them again.")
 
 (deftest read-emails-from-folder-continues-after-read-exception
   (let [read-attempts (atom [])
@@ -230,6 +257,7 @@
         analyzer (reify int/Analyzer
                    (enrich-email [_ email] (assoc email :metadata {:category nil})))
         db (reify int/DB
+             (email-exists? [_ _] false)
              (save-email [_ email] (swap! saved-subjects conj (-> email :header :subject)))
              (update-email-folder [_ _ _] nil))]
     (is (= 3 (app/read-emails-from-folder {} "Newsletter" {:move? false} {:client client :analyzer analyzer :db db})))
