@@ -10,6 +10,7 @@
   (save-category [this category-name destination-folder])
   (update-category-destination-folder [this id destination-folder] "Set the IMAP folder that emails of this category should be moved to. A blank value restores the default 'Categories/<Name>' behaviour.")
   (update-email-folder [this message-id folder] "Record the IMAP folder a message currently lives in.")
+  (email-exists? [this message-id] "Return true if a header with this message-id is already in the database.")
   (save-email [this email]))
 
 (defprotocol EmailClient

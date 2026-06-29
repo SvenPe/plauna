@@ -121,6 +121,11 @@
              " category = excluded.category,"
              " category_confidence = excluded.category_confidence")))
 
+(defn email-exists? [message-id]
+  (some? (jdbc/execute-one! (ds)
+           (honey/format {:select [1] :from :headers :where [:= :message_id message-id]})
+           builder-function)))
+
 (defn save-headers [headers]
   (jdbc/execute! (ds)
                  (->>
@@ -619,6 +624,7 @@
   (save-category [_ category-name destination-folder] (create-category category-name destination-folder))
   (update-category-destination-folder [_ id destination-folder] (update-category-destination-folder id destination-folder))
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
+  (email-exists? [_ message-id] (email-exists? message-id))
   (save-email [_ email]
     (save-headers [(:header email)])
     (if (seq (:body email))

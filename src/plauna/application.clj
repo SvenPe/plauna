@@ -165,18 +165,21 @@
           :na))))
 
 (defn- incoming-email-workflow [email-message connection-id folder {:keys [move? assigned-category assigned-category-id]} {:keys [analyzer db] :as context}]
-  (if (some? assigned-category)
-    (let [language-result (int/detect-language analyzer (:email email-message))
-          enriched-email (core-email/construct-enriched-email (:email email-message) {:language (:code language-result) :language-confidence (:confidence language-result)} {:category assigned-category :category-id assigned-category-id :category-confidence 1})]
-      (int/save-email db enriched-email)
-      (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
-      (move-message move? folder connection-id email-message assigned-category context))
-    (let [enriched-email (int/enrich-email analyzer (:email email-message))
-          category (:category (:metadata enriched-email))]
-      (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was categorized as" category])
-      (int/save-email db enriched-email)
-      (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
-      (move-message move? folder connection-id email-message category context))))
+  (let [message-id (-> email-message :email :header :message-id)]
+    (if (int/email-exists? db message-id)
+      (t/log! :info ["Email" message-id "already in database — skipping re-categorization"])
+      (if (some? assigned-category)
+        (let [language-result (int/detect-language analyzer (:email email-message))
+              enriched-email (core-email/construct-enriched-email (:email email-message) {:language (:code language-result) :language-confidence (:confidence language-result)} {:category assigned-category :category-id assigned-category-id :category-confidence 1})]
+          (int/save-email db enriched-email)
+          (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
+          (move-message move? folder connection-id email-message assigned-category context))
+        (let [enriched-email (int/enrich-email analyzer (:email email-message))
+              category (:category (:metadata enriched-email))]
+          (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was categorized as" category])
+          (int/save-email db enriched-email)
+          (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
+          (move-message move? folder connection-id email-message category context))))))
 
 (defn handle-incoming-imap-email
   "Handle incoming emails synchronously on a single thread. Returns a result."
