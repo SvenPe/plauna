@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-07.2] - 2026-07-07
+
+### 🐛 Bug Fixes
+
+- Fix the Subject filter added in 2026-07-07.1: it rendered full-width inside the
+  table header, which distorted the column widths and hid other columns. Removed it
+  and restored the normal-sized "Search Text" field in the filter card instead.
+
 ## [2026-07-07.1] - 2026-07-07
 
 ### 🚀 Features
