@@ -417,6 +417,8 @@
                   (stop-monitoring connection-data)
                   ;; The move happens on the monitored folder, so monitoring is paused first. Use
                   ;; try/finally so a failure mid-move can never leave monitoring permanently off.
+                  ;; stop-monitoring also cancels the periodic health check, so it must be
+                  ;; rescheduled here — otherwise the connection silently loses auto-reconnect.
                   (try
                     (set-messages-as-peek found-messages)
                     (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
@@ -424,7 +426,7 @@
                     (db/update-email-folder message-id target-folder-name)
                     true
                     (finally
-                      (start-monitoring connection-data context))))
+                      (schedule-health-checks (start-monitoring connection-data context)))))
                 (do
                   (set-messages-as-peek found-messages)
                   (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
@@ -495,9 +497,13 @@
         (login (.config connection-data) (.store connection-data))))
     (catch AuthenticationFailedException e (t/log! :error e))))
 
-(defn start-monitoring [connection-data context]
+(defn start-monitoring [connection-data _context]
   (try
-    (.addMessageCountListener ^IMAPFolder (:folder connection-data) (message-count-listener (:id (:config connection-data)) (:folder connection-data) (-> connection-data :config :folder) context))
+    ;; Attach the listener stored in the ConnectionData record — the same instance stop-monitoring
+    ;; removes. Attaching a freshly created listener here would make the removal in stop-monitoring a
+    ;; no-op, so every stop/start cycle (e.g. a category move on the monitored folder) would stack one
+    ;; more listener and each new email would get processed once per stacked listener.
+    (.addMessageCountListener ^IMAPFolder (:folder connection-data) ^MessageCountListener (:message-count-listener connection-data))
     (t/log! :info ["Started monitoring for" (:folder (:config connection-data)) "in" (.getURLName ^Store (:store connection-data))])
     (.watch ^IdleManager (:idle-manager connection-data) ^Folder (:folder connection-data))
     (catch Exception e

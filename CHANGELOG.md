@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-07.0] - 2026-07-07
+
+### 🐛 Bug Fixes
+
+- Fix the IMAP message listener being recreated (instead of reused) on every
+  monitoring restart. Since `stop-monitoring` only ever removed the listener
+  stored on the connection, each restart (e.g. after moving an email into the
+  monitored folder) left the old listener attached and added a new one, so
+  incoming emails were processed once per stacked listener.
+- Restart the periodic health check after a category move that pauses and
+  resumes monitoring on the connection's own folder. It was being cancelled
+  but never rescheduled, so the connection silently lost automatic reconnect
+  after the first such move.
+- Fix connections read from the config file on first boot never actually
+  connecting: the code looked up the freshly generated connection id in the
+  wrong map, always got `nil`, and only succeeded on the next restart once the
+  connection existed in the database.
+- Fix "Categorize Fresh Data" always clearing the category (and never setting
+  one) because it read a `:sanitized-content` field that only exists on
+  emails prepared for display, not on raw body parts from the database.
+- Fix a broken redirect URL after deleting an auth provider (the status code
+  ended up appended inside the URL string instead of being passed to the
+  redirect).
+- Close the output stream used to write a freshly trained language model
+  instead of leaking the file descriptor.
+- Fix a rate limiter that could freeze the whole event pipeline (e.g. on a
+  second mbox upload) if an earlier upload or "detect languages" run left its
+  limiter's token bucket abandoned and blocked on.
+
 ## [2026-06-28.3] - 2026-06-28
 
 ### 🐛 Bug Fixes

@@ -18,7 +18,12 @@
     (sub @main-publisher target-type target-channel)
     (go-loop []
       (when-some [_ (<! target-channel)]
-        (<! bucket-channel)
+        ;; Consume a token without blocking. A limiter is never unsubscribed, so a blocking take on an
+        ;; abandoned limiter's empty bucket would park this loop while its target-channel still receives
+        ;; every event — and since pub/mult only deliver the next event once ALL subscribers accepted,
+        ;; one stale limiter would freeze the whole topic (e.g. on the second mbox upload). The producer
+        ;; puts its token before its event, so for a live limiter the token is always already here.
+        (async/poll! bucket-channel)
         (recur)))
     bucket-channel))
 

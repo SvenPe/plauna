@@ -49,9 +49,9 @@
             (t/log! :info ["Adding connection data from the config file to the database. Next time Plauna will use the data from the database."])
             (let [connection-with-id (core.email/construct-imap-connection-from-config-file (conj client-config {:id (client/id-from-config client-config)}))]
               (db/add-connection connection-with-id)
-              (let [connection-result (app/connect-to-client context (:id client-config))]
+              (let [connection-result (app/connect-to-client context (:id connection-with-id))]
                 (if (= :ok (:result connection-result))
-                  (client/create-category-folders! (get @client/connections (:id client-config)) (mapv :name (db/get-categories)))
+                  (client/create-category-folders! (get @client/connections (:id connection-with-id)) (mapv :name (db/get-categories)))
                   (t/log! :info ["Connection failed for config:" client-config]))))))))
   (t/log! :debug "Listening to new emails from listen-channel"))
 

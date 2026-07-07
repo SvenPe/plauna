@@ -160,7 +160,7 @@
   (if (seq (languages-to-use-in-training))
     (do (write-all-categorized-emails-to-training-files)
         (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
-          (let [os (io/output-stream (files/model-file (:language training-model)))]
+          (with-open [os (io/output-stream (files/model-file (:language training-model)))]
             (analysis/serialize-and-write-model! (:model training-model) os))))
     {:type :alert :content "There are no selected languages to train in. Cannot proceed."}))
 
@@ -173,8 +173,14 @@
 (defn categorize-uncategorized-n-emails [n]
   (let [languages-to-use (map :language (db/get-activated-language-preferences))
         uncategorized-bodies (:data (db/fetch-data {:entity :body-part :page {:page 0 :size n}} {:where [:and [:in :language languages-to-use] [:<> :language nil] [:= :category nil] [:= :mime-type "text/html"]]}))
-        trained-emails (map (fn [email] (conj {:message-id (-> email :body-part :message-id)} (categorize-content (-> email :body-part :sanitized-content) (-> email :metadata :language)))) uncategorized-bodies)]
-    (doseq [trained-email trained-emails] (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email)))))
+        ;; Body parts fetched from the DB carry raw :content; :sanitized-content only exists on emails
+        ;; prepared for display. Normalize the raw content here or the categorizer always receives nil.
+        trained-emails (map (fn [email] (conj {:message-id (-> email :body-part :message-id)} (categorize-content (analysis/normalize-body-part (:body-part email)) (-> email :metadata :language)))) uncategorized-bodies)]
+    (doseq [trained-email trained-emails
+            ;; Below-threshold results come back with a nil category; skip them instead of
+            ;; overwriting the row with category nil / confidence 0.
+            :when (some? (:id trained-email))]
+      (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email)))))
 
 (defn mime-type-statistics [period]
   ;; MariaDB does not allow SELECT aliases in WHERE; reference the source column directly.
@@ -615,7 +621,7 @@
        (db/delete-auth-provider (get params :id))
        (if (empty? (:conn-id body))
          (redirect "/admin/new-connection" 303)
-         (redirect (str "/admin/connections/" (:conn-id body) 303)))))
+         (redirect (str "/admin/connections/" (:conn-id body)) 303))))
 
    (comp/POST "/admin/auth-providers" request
      (let [params (:params request)]
