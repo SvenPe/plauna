@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-07.1] - 2026-07-07
+
+### 🚀 Features
+
+- Add a calendar date-range picker for the e-mail list's date filter, replacing the
+  two separate "Date From"/"Date To" boxes. Vendored locally rather than loaded from
+  a CDN, so it keeps working without internet access.
+- Add a "Subject" filter directly in the e-mail list's header row, and a new "From"
+  filter that matches a sender's name or address.
+- Make the e-mail list's page size a free-form field (previously a fixed 10/20/30
+  dropdown), moved to the bottom of the list.
+
+### 🐛 Bug Fixes
+
+- Fix a crash (500) when using the new "From" filter: the pagination count query
+  rewrote SQL text with a regex that also matched the filter's own subquery,
+  producing an unfillable placeholder.
+- Escape `%` and `_` in Subject/From search text so they match literally instead of
+  acting as SQL LIKE wildcards.
+- Match e-mails whose sender participant type was stored as the legacy `:sender`
+  spelling (with the leading colon), not just `sender`.
+- Skip loading full e-mail body content for the list view, which never renders it -
+  relevant now that the page size can go as high as 500.
+
 ## [2026-07-07.0] - 2026-07-07
 
 ### 🐛 Bug Fixes
