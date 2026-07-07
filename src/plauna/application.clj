@@ -80,9 +80,26 @@
 
 (defn- error-result [exception alert-content] {:result :error :exception exception :message {:type :alert :content alert-content}})
 
+(def default-category-color
+  "Used for the 'n/a' pseudo-category and any category saved before color-coding existed."
+  "#9ca3af")
+
+(defn- valid-hex-color?
+  "True for a '#' followed by exactly 6 hex digits, the format <input type=\"color\"> always submits.
+   Rejects anything else so a hand-crafted request can't smuggle arbitrary text into the color
+   attribute rendered on every category select."
+  [color]
+  (boolean (re-matches #"#[0-9a-fA-F]{6}" (or color ""))))
+
+(defn- clean-color
+  "A valid hex color, trimmed; nil for a blank or invalid one so it falls back to default-category-color."
+  [color]
+  (let [trimmed (when (string? color) (str/trim color))]
+    (when (valid-hex-color? trimmed) trimmed)))
+
 (defn categories
   "There is no entry for 'no entry' in the database. This function adds a 'n/a' entry to the actual list."
-  [db] (conj (int/fetch-categories db) {:id nil :name "n/a"}))
+  [db] (conj (int/fetch-categories db) {:id nil :name "n/a" :color default-category-color}))
 
 (defn connect-to-client
   "Returns {:result :ok} or {:result :redirect :provider provider} in case of oauth2"
@@ -132,22 +149,23 @@
                   :date-to (:date-to parameters)}
      :optional {:categories cat-list}}))
 
-(defn create-new-category! [context category destination-folder]
+(defn create-new-category! [context category destination-folder color]
   (let [db (:db context)
         client (:client context)
         cleaned (when-not (str/blank? destination-folder) (str/trim destination-folder))]
-    (int/save-category db category cleaned)
+    (int/save-category db category cleaned (clean-color color))
     (doseq [connection-data (vals (int/connections client))]
       (int/create-category-directories! client connection-data [category]))))
 
-(defn update-category-destination-folder!
-  "Persist the destination folder for a category and make sure the folder exists on every active connection.
-   A blank destination-folder restores the default 'Categories/<Name>' behaviour. Existing emails are not moved."
-  [context id category-name destination-folder]
+(defn update-category!
+  "Persist the destination folder and display color for a category, and make sure the folder exists on
+   every active connection. A blank destination-folder restores the default 'Categories/<Name>'
+   behaviour; an invalid or blank color falls back to default-category-color. Existing emails are not moved."
+  [context id category-name destination-folder color]
   (let [db (:db context)
         client (:client context)
         cleaned (when-not (str/blank? destination-folder) (str/trim destination-folder))]
-    (int/update-category-destination-folder db id cleaned)
+    (int/update-category db id cleaned (clean-color color))
     (doseq [connection-data (vals (int/connections client))]
       (int/create-category-directories! client connection-data [category-name]))))
 

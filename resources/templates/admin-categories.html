@@ -5,13 +5,17 @@
 <div class="flex w-full overflow-x-auto">
   <table class="table-zebra table">
     <tbody>
-      <tr><th>Category Name</th><th>Destination Folder</th><th>Delete</th></tr>
+      <tr><th>Color</th><th>Category Name</th><th>Destination Folder</th><th>Delete</th></tr>
       {% for category in categories %}
       <tr>
+        <td>
+          <span class="inline-block w-4 h-4 rounded-full align-middle" style="background-color: {{category.color|category-color}};"></span>
+        </td>
         <td>{{category.name}}</td>
         <td>
           <form action="/admin/categories/{{category.id}}" method="POST" class="flex gap-2 items-center">
             <input type="hidden" name="name" value="{{category.name}}">
+            <input type="color" class="input p-1 w-12" name="color" value="{{category.color|category-color}}" title="Category color">
             <input class="input" name="destination-folder" value="{{category.destination_folder}}" placeholder="default: Categories/{{category.name}}">
             <button class="btn btn-primary" type="submit">Save</button>
           </form>
@@ -44,6 +48,7 @@
 <p class="text-sm text-gray-600 mt-2">Set a destination folder to move emails of a category to a custom IMAP folder (e.g. <code>Archive/Newsletters</code>) instead of the default <code>Categories/&lt;Name&gt;</code>. Use your mail server's folder hierarchy separator. Leave blank to keep the default. If the destination is the same folder the mail is already in (e.g. <code>INBOX</code>), the mail is left in place instead of being moved. Existing emails are not moved.</p>
 <h3 class="uppercase text-lg my-8">New Category</h3>
 <form action="/admin/categories" method="POST" class="flex gap-2 items-center flex-wrap">
+  <input type="color" class="input p-1 w-12" name="color" value="#3b82f6" title="Category color">
   <input class="input" name="name" value="" placeholder="Category name">
   <input class="input" name="destination-folder" value="" placeholder="Destination folder (optional)">
   <button class="btn btn-primary mx-4" type="submit">Add category</button>

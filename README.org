@@ -215,6 +215,10 @@ By default, e-mails of a category are moved to a sub-folder of "Categories" name
 
 Changing a destination folder does not move e-mails that were already filed; it only affects future moves.
 
+*** Category Colors
+
+Each category has a color, set with a color picker in "Admin" -> "Categories" (both on the "New Category" form and next to each existing category). The category dropdown on the e-mail list and on an e-mail's details page is color-coded with a left border matching the currently selected category, so you can tell categories apart at a glance. A category created before this feature, or one an invalid color was submitted for, falls back to a neutral gray.
+
 *** Categorize E-mails
 
 Under the tab "E-mails" you can edit the language and category of every e-mail directly in the list, or by clicking on an e-mail and changing it on the details page.

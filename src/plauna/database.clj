@@ -313,16 +313,17 @@
   (jdbc/execute! (ds) (honey/format {:select [:*] :from :categories}) builder-function))
 
 (defn create-category
-  ([category] (create-category category nil))
-  ([category destination-folder]
-   (jdbc/execute! (ds) (honey/format {:insert-into :categories :columns [:name :destination_folder] :values [[category destination-folder]]}))))
+  ([category] (create-category category nil nil))
+  ([category destination-folder] (create-category category destination-folder nil))
+  ([category destination-folder color]
+   (jdbc/execute! (ds) (honey/format {:insert-into :categories :columns [:name :destination_folder :color] :values [[category destination-folder color]]}))))
 
 (defn delete-category-by-id [id]
   (jdbc/execute! (ds) (honey/format {:delete-from :categories :where [:= :id id]})))
 
-(defn update-category-destination-folder [id destination-folder]
+(defn update-category [id destination-folder color]
   (jdbc/execute! (ds) (honey/format {:update :categories
-                                     :set    {:destination_folder destination-folder}
+                                     :set    {:destination_folder destination-folder :color color}
                                      :where  [:= :id id]})))
 
 (defn delete-email-by-message-id [message-id]
@@ -629,8 +630,8 @@
   (fetch-auth-provider [_ id] (get-auth-provider id))
   (fetch-categories [_] (get-categories))
   (fetch-emails [_ entity customization] (fetch-data entity customization))
-  (save-category [_ category-name destination-folder] (create-category category-name destination-folder))
-  (update-category-destination-folder [_ id destination-folder] (update-category-destination-folder id destination-folder))
+  (save-category [_ category-name destination-folder color] (create-category category-name destination-folder color))
+  (update-category [_ id destination-folder color] (update-category id destination-folder color))
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (email-exists? [_ message-id] (email-exists? message-id))
   (save-email [_ email]

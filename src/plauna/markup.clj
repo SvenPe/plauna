@@ -3,6 +3,7 @@
             [selmer.parser :refer [render-file set-resource-path!]]
             [selmer.filters :refer [add-filter!]]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [ring.util.codec :refer [base64-encode]]
             [plauna.client :as client]
             [scicloj.tableplot.v1.hanami :as hanami]
@@ -92,6 +93,16 @@
                                          (let [n (double n)]
                                            (format (str "%." (if decimal-places decimal-places "1") "f")
                                                    n)))))
+
+(def default-category-color
+  "Used for a category saved before color-coding existed, or with a corrupted value.
+   Must match plauna.application/default-category-color."
+  "#9ca3af")
+
+(add-filter! :category-color
+             ;; Re-validate here too (not just on save): renders straight into a style="" attribute,
+             ;; so a malformed value must never reach the page even if it somehow got into the DB.
+             (fn [color] (if (re-matches #"#[0-9a-fA-F]{6}" (str color)) color default-category-color)))
 
 (defn list-emails
   ([emails page-info categories]

@@ -88,10 +88,10 @@
         <td class="hidden lg:table-cell"><input class="input" type="text" value="{{email.metadata.language}}" data-message-id="{{email.header.message-id}}" onchange="updateLanguage(this)"></td>
         <td class="hidden lg:table-cell">{{email.metadata.language-confidence|double-format-nillable:10}}</td>
         <td>
-          <select class="select w-28 sm:w-32"
+          <select class="select w-28 sm:w-32 category-select" style="border-left: 6px solid transparent;"
                   data-message-id="{{email.header.message-id}}" onchange="recategorizeEmail(this)">
             {% for category in categories %}
-            <option value="{{category.id}}" {% if email.metadata.category-id = category.id %} selected {% endif %}>{{category.name}}</option>
+            <option value="{{category.id}}" data-color="{{category.color|category-color}}" {% if email.metadata.category-id = category.id %} selected {% endif %}>{{category.name}}</option>
             {% endfor %}
         </select></td>
         <td class="hidden lg:table-cell">{{email.metadata.category-confidence|double-format-nillable:10}}</td>
@@ -147,8 +147,17 @@
     });
   }
 
+  // Color-code a category dropdown with its selected category's configured color (left border, so
+  // it works regardless of how the browser renders the closed <select>'s own background).
+  function applyCategoryColor(select) {
+    var option = select.options[select.selectedIndex];
+    select.style.borderLeftColor = (option && option.dataset.color) || 'transparent';
+  }
+  document.querySelectorAll('.category-select').forEach(applyCategoryColor);
+
   // Recategorize (and move) an e-mail when its category dropdown changes - no "Batch Update" needed.
   function recategorizeEmail(select) {
+    applyCategoryColor(select);
     autosave(select, '/metadata/category', {'message-id': select.dataset.messageId, 'category': select.value});
   }
 

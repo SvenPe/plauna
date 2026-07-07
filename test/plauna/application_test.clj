@@ -98,14 +98,46 @@
 (deftest create-a-category
   (let [db-called (atom false)
         client-called (atom false)
-        database (reify int/DB (save-category [_ _ _] (swap! db-called (fn [_] true))))
+        database (reify int/DB (save-category [_ _ _ _] (swap! db-called (fn [_] true))))
         client (reify int/EmailClient
                  (connections [_] {"does not matter" "some-data"})
                  (create-category-directories! [_ _ _] (swap! client-called (fn [_] true))))]
-    (app/create-new-category! {:db database :client client} "test" nil)
+    (app/create-new-category! {:db database :client client} "test" nil nil)
     (is (= true @db-called))
     (is (= true @client-called)))
   "Creating a new category makes correct database and client calls")
+
+(deftest create-category-passes-through-a-valid-color
+  (let [captured-color (atom :not-called)
+        database (reify int/DB (save-category [_ _ _ color] (reset! captured-color color)))
+        client (reify int/EmailClient
+                 (connections [_] {})
+                 (create-category-directories! [_ _ _] nil))]
+    (app/create-new-category! {:db database :client client} "test" nil "#3b82f6")
+    (is (= "#3b82f6" @captured-color)))
+  "A valid hex color is saved as-is")
+
+(deftest create-category-drops-an-invalid-color
+  (let [captured-color (atom :not-called)
+        database (reify int/DB (save-category [_ _ _ color] (reset! captured-color color)))
+        client (reify int/EmailClient
+                 (connections [_] {})
+                 (create-category-directories! [_ _ _] nil))]
+    (app/create-new-category! {:db database :client client} "test" nil "javascript:alert(1)")
+    (is (nil? @captured-color))
+    (app/create-new-category! {:db database :client client} "test" nil "")
+    (is (nil? @captured-color)))
+  "An invalid or blank color is saved as nil rather than trusted verbatim")
+
+(deftest update-category-passes-through-destination-and-color
+  (let [captured (atom nil)
+        database (reify int/DB (update-category [_ id destination-folder color] (reset! captured [id destination-folder color])))
+        client (reify int/EmailClient
+                 (connections [_] {})
+                 (create-category-directories! [_ _ _] nil))]
+    (app/update-category! {:db database :client client} "7" "test" "Archive/Test" "#ff0000")
+    (is (= ["7" "Archive/Test" "#ff0000"] @captured)))
+  "update-category! forwards the trimmed destination folder and the validated color")
 
 (deftest move-email-without-connections
   (let [client (reify int/EmailClient

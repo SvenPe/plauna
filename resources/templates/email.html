@@ -43,9 +43,9 @@
   <input form="email" hidden="true" name="redirect-url" type="text" value="/emails">
     <tr><td><strong>Language: </strong></td><td><input form="email" class="input" name="language" type="text" value="{{email.metadata.language}}"></td></tr>
     <tr><td><p><strong>Language Confidence: </strong></td><td>{{email.metadata.language-confidence}}</td></tr>
-    <tr><td><strong>Category: </strong></td><td><select class="select" form="email" name="category" autocomplete="off">
+    <tr><td><strong>Category: </strong></td><td><select class="select category-select" style="border-left: 6px solid transparent;" form="email" name="category" autocomplete="off" onchange="applyCategoryColor(this)">
       {% for category in categories %}
-      <option value="{{category.id}}" {% if category.id = email.metadata.category-id %}selected{% endif %}>{{category.name}}</option>
+      <option value="{{category.id}}" data-color="{{category.color|category-color}}" {% if category.id = email.metadata.category-id %}selected{% endif %}>{{category.name}}</option>
       {% endfor %}
     </select></td></tr>
     <tr><td><strong>Category Confidence: </strong></td><td>{{email.metadata.category-confidence}}</td></tr>
@@ -101,5 +101,15 @@
   Non-text content
   {% endif %}
 {% endfor %}
+
+<script>
+  // Color-code the category dropdown with its selected category's configured color (left border,
+  // so it works regardless of how the browser renders the closed <select>'s own background).
+  function applyCategoryColor(select) {
+    var option = select.options[select.selectedIndex];
+    select.style.borderLeftColor = (option && option.dataset.color) || 'transparent';
+  }
+  document.querySelectorAll('.category-select').forEach(applyCategoryColor);
+</script>
 
 {% endblock %}
