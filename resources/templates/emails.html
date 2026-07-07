@@ -31,6 +31,11 @@
           </select>
         </fieldset>
         <fieldset class="fieldset">
+          <legend class="fieldset-legend">Search Text</legend>
+          <input type="text" name="search-text" class="input" placeholder="Subject contains..." value="{{page.search-text}}" />
+          <p class="label">Currently you can only search in email subjects.</p>
+        </fieldset>
+        <fieldset class="fieldset">
           <legend class="fieldset-legend">From</legend>
           <input type="text" name="from-search-text" class="input" placeholder="Sender name or address" value="{{page.from-search-text}}" />
         </fieldset>
@@ -57,18 +62,14 @@
 
 {% include "emails-pagination.html" %}
 
-<!-- The table (and the subject filter input in its header) renders even with zero results:
-     hiding it would make an active subject filter invisible and drop it from the next submit. -->
+<!-- The table renders even with zero results: hiding it along with the filter bar would make an
+     active filter invisible and drop it from the next submit. -->
 <div class="w-full">
   <table class="table table-zebra">
     <thead class="table-header-group">
       <tr class="table-row">
         <th class="table-cell text-left"><strong>Date</strong></th>
-        <th class="table-cell text-left">
-          <strong>Subject</strong>
-          <input type="text" name="search-text" class="input input-sm mt-1 w-full" placeholder="Filter by subject..."
-                 value="{{page.search-text}}" form="page-form" />
-        </th>
+        <th class="table-cell text-left"><strong>Subject</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>From</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>To</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
