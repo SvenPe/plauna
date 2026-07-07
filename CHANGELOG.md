@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-07.3] - 2026-07-07
+
+### 🚀 Features
+
+- Add color-coding for e-mail categories. Set a category's color with a color picker
+  in Admin > Categories; the category dropdown on the e-mail list and on an e-mail's
+  details page shows a left-border accent matching the selected category's color.
+
 ## [2026-07-07.2] - 2026-07-07
 
 ### 🐛 Bug Fixes
