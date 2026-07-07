@@ -235,10 +235,12 @@ The UI is responsive and works on phones, so you can recategorize e-mails on the
 The filter bar above the list lets you narrow the e-mails down by:
 
 - Metadata: all e-mails, enriched (categorized and language-detected) e-mails only, or e-mails without a category.
-- Search text: matches the e-mail subject.
-- A date range: "Date From" and "Date To" restrict the list to e-mails within those dates (either bound may be left empty). The "To" date is inclusive.
+- From: matches the sender's name or address.
+- A date range: click the date field to open a calendar and pick a start and end date (either may be left empty, and the "Clear" button next to it resets the range). The end date is inclusive.
 
-Click "Apply" to run the filter. Pagination controls appear both above and below the list, with "First", "Back", "Next" and "Last" buttons; the current filter (including the date range) is preserved as you page through the results.
+A "Subject" filter box sits directly in the e-mail list's header row, above the Subject column, so you can narrow by subject without leaving the list. Press Enter in either the header's Subject box or the filter bar's From box to apply it, or use the "Apply" button.
+
+Click "Apply" to run the filter. Pagination controls appear both above and below the list, with "First", "Back", "Next" and "Last" buttons; the current filter (including the date range) is preserved as you page through the results. The number of e-mails shown per page can be set below the list (default 20).
 
 #+CAPTION: List emails and edit metadata
 [[./docs/resources/plauna-new-1.png]]

@@ -17,6 +17,16 @@
 
 (use-fixtures :once setup-clean-db)
 
+(deftest convert-to-count-ignores-subquery-select-from
+  ;; A WHERE EXISTS (SELECT ... FROM ...) subquery (e.g. the "From" e-mail filter) has its own
+  ;; "SELECT ... FROM" later in the SQL string. convert-to-count must rewrite only the outer
+  ;; projection; rewriting the subquery's too leaves a second "%s" with no argument to fill it,
+  ;; which throws a MissingFormatArgumentException at query time.
+  (let [sql-result ["SELECT headers.message_id, subject FROM headers WHERE EXISTS (SELECT 1 FROM communications WHERE communications.message_id = headers.message_id) ORDER BY headers.date DESC" "param1"]
+        [count-sql & params] (db/convert-to-count sql-result :enriched-email)]
+    (is (= "SELECT COUNT(headers.message_id) as count FROM headers WHERE EXISTS (SELECT 1 FROM communications WHERE communications.message_id = headers.message_id)" count-sql))
+    (is (= ["param1"] params))))
+
 (deftest save-email-batch
   (let [example {:type :parsed-email :payload {:header {:message-id "test" :date 0 :subject "Test" :in-reply-to nil :mime-type "text/plain"} :body [{:message-id "test" :mime-type "text/plain" :charset "fake" :transfer-encoding "fake" :content "Test" :sanitized-content "Test"}] :participants [{:type :sender :message-id "test" :name "fake" :address "fake" :contact-key "fake"} {:type :receiver :message-id "test" :name "fake" :address "fake" :contact-key "fake"}]}}
         to-insert (repeatedly 6 (fn [] example))

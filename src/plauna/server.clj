@@ -258,12 +258,20 @@
       {:type :success :content "Re-fetched the email from the server and filled in its contents."})
     {:type :alert :content "Could not re-fetch this email: it was not found on any connected account."}))
 
+(defn- int-or-default
+  "Parse an integer request parameter, falling back to the default on blank or non-numeric input.
+   The page-size field is a free-form number input that submits size= when cleared, so a bare
+   Integer/parseInt would reject the whole request over a fixable value."
+  [default]
+  (fn [value] (try (Integer/parseInt value) (catch NumberFormatException _ default))))
+
 ;; TODO change name template
-(def emails-template {:size {:default 20 :type-fn Integer/parseInt}
-                      :page {:default 1 :type-fn Integer/parseInt}
+(def emails-template {:size {:default 20 :type-fn (int-or-default 20)}
+                      :page {:default 1 :type-fn (int-or-default 1)}
                       :filter {:default "all" :type-fn identity}
                       :search-field {:default "subject" :type-fn identity}
                       :search-text {:default nil :type-fn identity}
+                      :from-search-text {:default nil :type-fn identity}
                       :date-from {:default nil :type-fn identity}
                       :date-to {:default nil :type-fn identity}})
 

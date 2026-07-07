@@ -83,7 +83,7 @@
                      (swap! query (fn [_] important-query))
                      {:total 10 :size 1 :page 1}))]
     (app/fetch-emails {:db database} {:search-field "subject" :search-text "test text" :size 1})
-    (is (= {:where [:like :headers.subject "%test text%"] :order-by [[:date :desc]]} @query))))
+    (is (= {:where [:like :headers.subject [:escape "%test text%" "\\"]] :order-by [[:date :desc]]} @query))))
 
 (deftest emails-query-search-filter
   (let [query (atom "")
@@ -93,7 +93,7 @@
                      (swap! query (fn [_] important-query))
                      {:total 10 :size 1 :page 1}))]
     (app/fetch-emails {:db database} {:filter "enriched-only" :search-field "subject" :search-text "test text" :size 1})
-    (is (= {:where [:and [:and [:<> :metadata.category nil] [:<> :metadata.language nil]] [:like :headers.subject "%test text%"]] :order-by [[:date :desc]]} @query))))
+    (is (= {:where [:and [:and [:<> :metadata.category nil] [:<> :metadata.language nil]] [:like :headers.subject [:escape "%test text%" "\\"]]] :order-by [[:date :desc]]} @query))))
 
 (deftest create-a-category
   (let [db-called (atom false)
@@ -284,6 +284,78 @@
       (is (some #{:<} where-flat) "Upper date bound is present")
       (is (some #{:date} where-flat) "Filters on the date column")))
   "Date-from/date-to are translated into a date-range filter on the email date")
+
+(deftest fetch-emails-applies-from-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :from-search-text "someone@example.com" :page 1 :size 20})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:communications.message-id]
+                     :from [:communications]
+                     :join [:contacts [:= :contacts.contact-key :communications.contact-key]]
+                     ;; ":sender" too: legacy rows stored the printed keyword (see core.email/construct-participants)
+                     :where [:and
+                             [:in :communications.type ["sender" ":sender"]]
+                             [:or
+                              [:like :contacts.name [:escape "%someone@example.com%" "\\"]]
+                              [:like :contacts.address [:escape "%someone@example.com%" "\\"]]]]}]
+            :order-by [[:date :desc]]}
+           @captured)))
+  "A from-search-text value is translated into a message-id semi-join on the sender's name/address")
+
+(deftest fetch-emails-escapes-like-wildcards
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :from-search-text "a_b%c\\d" :page 1 :size 20})
+    (let [likes (filter #(and (vector? %) (= :like (first %))) (tree-seq coll? seq (:where @captured)))]
+      (is (seq likes) "The from filter produces LIKE clauses")
+      (doseq [[_ _ [_ pattern escape-char]] likes]
+        (is (= "%a\\_b\\%c\\\\d%" pattern) "LIKE wildcards and the escape char itself are escaped")
+        (is (= "\\" escape-char) "An explicit ESCAPE character is set (SQLite has no default)"))))
+  "User input containing % _ or \\ matches literally instead of acting as LIKE wildcards")
+
+(deftest fetch-emails-applies-subject-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text "invoice" :page 1 :size 20})
+    (is (= [:like :headers.subject [:escape "%invoice%" "\\"]] (:where @captured))))
+  "A subject search-text is translated into an escaped LIKE on the subject")
+
+(deftest fetch-emails-no-subject-filter-when-blank
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil :page 1 :size 20})
+    (is (not (contains? @captured :where))
+        "No LIKE '%%' clause: it would silently exclude e-mails with a NULL subject"))
+  "A blank subject search adds no filter")
+
+(deftest fetch-emails-no-from-filter-when-blank
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :from-search-text "" :page 1 :size 20})
+    (is (not (contains? @captured :where))))
+  "A blank from-search-text adds no filter")
+
+(deftest fetch-emails-clamps-page-size
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ entity-clause _] (reset! captured entity-clause) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :page 1 :size 0})
+    (is (= 1 (:size (:page @captured))) "A size of 0 is clamped up to 1, never an invalid LIMIT")
+    (app/fetch-emails {:db db} {:filter "all" :page 1 :size 100000})
+    (is (= 500 (:size (:page @captured))) "An unbounded size is capped at 500"))
+  "fetch-emails clamps a free-form page size into a safe range")
 
 (deftest fetch-emails-no-date-filter-when-blank
   (let [captured (atom nil)

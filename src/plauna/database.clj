@@ -366,11 +366,14 @@
 
 (defn convert-to-count [sql-result entity]
   (let [sql (first sql-result)
-        ;; Non-greedy ".*?" so the projection is replaced up to the FIRST "FROM" (a subquery's FROM must
-        ;; not be matched); (?is) makes it case-insensitive and dot-matches-newline. Strip a trailing
-        ;; ORDER BY (counts must not carry ordering).
+        ;; replace-first (not replace): a WHERE ... IN (SELECT ... FROM ...) subquery (e.g. the "From"
+        ;; e-mail filter) has its own "SELECT ... FROM" later in the string. A global replace would
+        ;; rewrite that one too, leaving a second unfilled "%s" for the single `format` argument below.
+        ;; Non-greedy ".*?" keeps this first replacement scoped to the outer projection up to its FROM;
+        ;; (?is) makes it case-insensitive and dot-matches-newline. Strip a trailing ORDER BY (counts
+        ;; must not carry ordering).
         to-format (-> sql
-                      (string/replace #"(?is)SELECT .*? FROM" "SELECT COUNT(%s) as count FROM")
+                      (string/replace-first #"(?is)SELECT .*? FROM" "SELECT COUNT(%s) as count FROM")
                       (string/replace #"(?is)\s+ORDER BY .*$" ""))]
     (cond (= entity :enriched-email) (flatten [(format to-format "headers.message_id") (rest sql-result)])
           (= entity :body-part) (flatten [(format to-format "bodies.message_id") (rest sql-result)]))))
@@ -450,20 +453,23 @@
 (defn related-data-to-headers
   "Batch variant of related-data-to-header. Loads metadata, bodies and participants for a whole page of
    headers in three queries total (instead of three per header), then assembles the EnrichedEmails.
-   Preserves the order of the incoming headers."
-  [headers]
-  (let [message-ids        (mapv :message-id headers)
-        metadata-by-id     (into {} (map (juxt :message-id identity)) (fetch-metadata-for message-ids))
-        bodies-by-id       (group-by :message-id (fetch-bodies-for message-ids))
-        participants-by-id (group-by :message-id (fetch-participants-for message-ids))]
-    (mapv (fn [header]
-            (let [mid (:message-id header)]
-              (core.email/->EnrichedEmail
-               header
-               (map core.email/construct-body-part (get bodies-by-id mid))
-               (map core.email/construct-participants (get participants-by-id mid))
-               (db->metadata (get metadata-by-id mid)))))
-          headers)))
+   Preserves the order of the incoming headers. Pass {:with-bodies false} to skip loading body
+   content (fetch-bodies-for pulls the full MIME text of every e-mail) for consumers that only
+   render header-level data, like the e-mail list."
+  ([headers] (related-data-to-headers headers {:with-bodies true}))
+  ([headers {:keys [with-bodies]}]
+   (let [message-ids        (mapv :message-id headers)
+         metadata-by-id     (into {} (map (juxt :message-id identity)) (fetch-metadata-for message-ids))
+         bodies-by-id       (if with-bodies (group-by :message-id (fetch-bodies-for message-ids)) {})
+         participants-by-id (group-by :message-id (fetch-participants-for message-ids))]
+     (mapv (fn [header]
+             (let [mid (:message-id header)]
+               (core.email/->EnrichedEmail
+                header
+                (map core.email/construct-body-part (get bodies-by-id mid))
+                (map core.email/construct-participants (get participants-by-id mid))
+                (db->metadata (get metadata-by-id mid)))))
+           headers))))
 
 (defmulti fetch-data (fn [options _] (:entity options)))
 
@@ -481,15 +487,17 @@
        :total (:count (jdbc/execute-one! (ds) (convert-to-count (data->sql entity-clause sql-clause) (:entity entity-clause)) builder-function-kebab))})))
 
 (defmethod fetch-data :enriched-email [entity-clause sql-clause]
-  (if (nil? (:page entity-clause))
-    (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause)))
-    (let [limit-offset (page/page-request->limit-offset (:page entity-clause))
-          sql-clause-with-limit-offset (conj sql-clause limit-offset)
-          data (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause-with-limit-offset)))]
-      {:data  data
-       :size  (count data)
-       :page  (inc (quot (:offset limit-offset) (:limit limit-offset)))
-       :total (:count (jdbc/execute-one! (ds) (convert-to-count (data->sql entity-clause sql-clause) (:entity entity-clause)) builder-function-kebab))})))
+  ;; :with-bodies defaults to true; only an explicit false skips body content.
+  (let [related-opts {:with-bodies (not (false? (:with-bodies entity-clause)))}]
+    (if (nil? (:page entity-clause))
+      (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause)) related-opts)
+      (let [limit-offset (page/page-request->limit-offset (:page entity-clause))
+            sql-clause-with-limit-offset (conj sql-clause limit-offset)
+            data (related-data-to-headers (map core.email/construct-header (fetch-headers entity-clause sql-clause-with-limit-offset)) related-opts)]
+        {:data  data
+         :size  (count data)
+         :page  (inc (quot (:offset limit-offset) (:limit limit-offset)))
+         :total (:count (jdbc/execute-one! (ds) (convert-to-count (data->sql entity-clause sql-clause) (:entity entity-clause)) builder-function-kebab))}))))
 
 (defmethod fetch-data :participant [entity-clause sql-clause]
   (map core.email/map->Participant (jdbc/execute! (ds) (data->sql entity-clause sql-clause) builder-function-kebab)))

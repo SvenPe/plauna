@@ -1,0 +1,10 @@
+<!-- The full filter state every pagination form must carry, shared so a new filter
+     parameter is added once instead of once per First/Back/Next/Last form.
+     The form-specific "page" input stays in emails-pagination.html. -->
+<input type="hidden" name="size" value="{{page.size}}" />
+<input type="hidden" name="search-field" value="subject" />
+<input type="hidden" name="search-text" value="{{page.search-text}}" />
+<input type="hidden" name="from-search-text" value="{{page.from-search-text}}" />
+<input type="hidden" name="filter" value="{{page.filter}}" />
+<input type="hidden" name="date-from" value="{{page.date-from}}" />
+<input type="hidden" name="date-to" value="{{page.date-to}}" />

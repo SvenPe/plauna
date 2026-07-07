@@ -21,6 +21,17 @@
     (is (= "secret" (:body response))))
   "A logged-in session can reach protected paths")
 
+(deftest emails-parameters-tolerate-blank-numbers
+  ;; The page-size field is a free-form number input; clearing it submits size= (empty string).
+  ;; That must fall back to the default instead of throwing NumberFormatException and 400-ing
+  ;; the whole request.
+  (let [parse-fn (server/template->request-parameters server/emails-template)]
+    (is (= 20 (:size (parse-fn {:size ""}))) "A blank size falls back to the default")
+    (is (= 20 (:size (parse-fn {:size "abc"}))) "A non-numeric size falls back to the default")
+    (is (= 50 (:size (parse-fn {:size "50"}))) "A valid size is parsed")
+    (is (= 1 (:page (parse-fn {:page ""}))) "A blank page falls back to the default"))
+  "Blank or non-numeric size/page parameters fall back to their defaults")
+
 (deftest wrap-authentication-allows-public-paths
   (let [handler (server/wrap-authentication ok-handler)]
     (doseq [uri ["/login" "/css/tailwind.css" "/favicon-32x32.png"

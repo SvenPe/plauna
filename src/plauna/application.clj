@@ -6,16 +6,47 @@
             [plauna.core.email :as core-email]
             [plauna.util.page :as page]))
 
-(defn- filter->sql-clause [filter]
-  (cond
-    (= filter "enriched-only") {:where [:and [:<> :metadata.category nil] [:<> :metadata.language nil]] :order-by [[:date :desc]]}
-    (= filter "without-category") {:where [:= :metadata.category nil] :order-by [[:date :desc]]}
-    :else {:order-by [[:date :desc]]}))
+(defn- escape-like
+  "Escape LIKE wildcards (% and _) and the escape character itself so user input matches literally.
+   Must be paired with an explicit ESCAPE '\\' in the LIKE expression: SQLite has no default escape
+   character, so without it '_' matches any character and '%' matches everything."
+  [text]
+  (str/replace text #"([\\%_])" "\\\\$1"))
 
-(defn- search->sql-clause [search-field search-text]
+(defn- like-contains [column text]
+  [:like column [:escape (str "%" (escape-like text) "%") "\\"]])
+
+(defn- filter->where [filter]
   (cond
-    (= search-field "subject") {:where [:like :headers.subject (str "%" search-text "%")] :order-by [[:date :desc]]}
-    :else {:order-by [[:date :desc]]}))
+    (= filter "enriched-only") [:and [:<> :metadata.category nil] [:<> :metadata.language nil]]
+    (= filter "without-category") [:= :metadata.category nil]
+    :else nil))
+
+(defn- subject->where
+  "A blank search-text adds no filter. Without this guard a nil text builds LIKE '%%',
+   which silently excludes e-mails whose subject is NULL."
+  [search-field search-text]
+  (when (and (= search-field "subject") (not (str/blank? search-text)))
+    (like-contains :headers.subject search-text)))
+
+(defn- from->where
+  "Build a where-clause matching e-mails whose sender's name or address contains search-text.
+   A blank/nil search-text adds no filter. A non-correlated IN subquery (not a correlated EXISTS):
+   the matching message-ids are resolved once instead of probing contacts for every header row —
+   the count query re-runs the whole clause, so a correlated probe would run twice per page load.
+   Legacy rows may store the participant type as \":sender\" (see the defensive strip in
+   core.email/construct-participants), so match both spellings."
+  [search-text]
+  (when-not (str/blank? search-text)
+    [:in :headers.message-id
+     {:select [:communications.message-id]
+      :from [:communications]
+      :join [:contacts [:= :contacts.contact-key :communications.contact-key]]
+      :where [:and
+              [:in :communications.type ["sender" ":sender"]]
+              [:or
+               (like-contains :contacts.name search-text)
+               (like-contains :contacts.address search-text)]]}]))
 
 (defn- date-string->epoch-seconds
   "Convert a 'YYYY-MM-DD' string to a UTC unix timestamp (seconds) at the start of that day,
@@ -25,24 +56,25 @@
         ^java.time.LocalDate day (if next-day? (.plusDays base 1) base)]
     (.toEpochSecond (.atStartOfDay day java.time.ZoneOffset/UTC))))
 
-(defn- date->sql-clause
+(defn- date->where
   "Build a where-clause filtering headers.date (stored as unix seconds) between the given dates.
    Either bound may be blank/nil. The upper bound is inclusive of the whole 'to' day."
   [date-from date-to]
   (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false))
         to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true))]
     (cond
-      (and from to) {:where [:and [:>= :date from] [:< :date to]] :order-by [[:date :desc]]}
-      from {:where [:>= :date from] :order-by [[:date :desc]]}
-      to {:where [:< :date to] :order-by [[:date :desc]]}
-      :else {:order-by [[:date :desc]]})))
+      (and from to) [:and [:>= :date from] [:< :date to]]
+      from [:>= :date from]
+      to [:< :date to]
+      :else nil)))
 
-(defn- combine-maps-with [map1 map2 key combination-key]
-  (let [val1 (get map1 key)
-        val2 (get map2 key)]
-    (cond (nil? val1) map2
-          (nil? val2) map1
-          :else (conj map1 {key [combination-key val1 val2]}))))
+(defn- combine-wheres
+  "AND together the active where-clauses; nil (no filter at all) when none are active."
+  [wheres]
+  (let [active (remove nil? wheres)]
+    (cond (empty? active) nil
+          (= 1 (count active)) (first active)
+          :else (into [:and] active))))
 
 (defn- success-result [result-type data] (conj {:result result-type} data))
 
@@ -73,23 +105,29 @@
 
 (defn fetch-emails
   "Returns a list of emails. Customizable by parameters which can contain the following keys:
-   :size, :page, :filter (all, enrieched-only, or without-category), :search-field (subject), :search-text"
+   :size, :page, :filter (all, enrieched-only, or without-category), :search-field (subject), :search-text,
+   :from-search-text (matches the sender's name or address), :date-from, :date-to"
   [context parameters]
   (let [db (:db context)
         cat-list (categories db)
-        customization-clause (-> (combine-maps-with (filter->sql-clause (:filter parameters))
-                                                    (search->sql-clause (:search-field parameters) (:search-text parameters))
-                                                    :where :and)
-                                 (combine-maps-with (date->sql-clause (:date-from parameters) (:date-to parameters))
-                                                    :where :and))
-        result (int/fetch-emails db {:entity :enriched-email :strict false :page (page/page-request (:page parameters) (:size parameters))} customization-clause)]
+        where (combine-wheres [(filter->where (:filter parameters))
+                               (subject->where (:search-field parameters) (:search-text parameters))
+                               (from->where (:from-search-text parameters))
+                               (date->where (:date-from parameters) (:date-to parameters))])
+        customization-clause (cond-> {:order-by [[:date :desc]]}
+                               where (assoc :where where))
+        page-req (page/page-request (:page parameters) (:size parameters))
+        ;; :with-bodies false — the list renders no body content, so don't materialize
+        ;; up to 500 e-mails' full MIME bodies per page.
+        result (int/fetch-emails db {:entity :enriched-email :strict false :page page-req :with-bodies false} customization-clause)]
     {:data (:data result)
      :parameters {:filter (:filter parameters)
-                  :total-pages (page/calculate-pages-total (:total result) (:size parameters))
-                  :size (:size parameters)
+                  :total-pages (page/calculate-pages-total (:total result) (:size page-req))
+                  :size (:size page-req)
                   :page (:page result)
                   :total (:total result)
                   :search-text (:search-text parameters)
+                  :from-search-text (:from-search-text parameters)
                   :date-from (:date-from parameters)
                   :date-to (:date-to parameters)}
      :optional {:categories cat-list}}))

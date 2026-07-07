@@ -1,8 +1,13 @@
 {% extends "base.html" %}
 
-{% block content %}
+{% block head-extra %}
+<!-- Vendored locally (resources/public): Plauna is self-hosted and must not depend on a CDN
+     for a core control — without flatpickr the date filter would be unusable offline. -->
+<link rel="stylesheet" href="/css/flatpickr.min.css">
+<script src="/js/flatpickr.min.js"></script>
+{% endblock %}
 
-{% if emails|not-empty %}
+{% block content %}
 
 <div class="flex flex-col lg:flex-row gap-4">
   <div class="card grow place-items-center">
@@ -26,26 +31,17 @@
           </select>
         </fieldset>
         <fieldset class="fieldset">
-          <legend class="fieldset-legend">Search Text</legend>
-          <input type="text" name="search-text" class="input" value="{{page.search-text}}" />
-          <p class="label">Currently you can only search in email subjects.</p>
+          <legend class="fieldset-legend">From</legend>
+          <input type="text" name="from-search-text" class="input" placeholder="Sender name or address" value="{{page.from-search-text}}" />
         </fieldset>
         <fieldset class="fieldset">
-          <legend class="fieldset-legend">Date From</legend>
-          <input type="date" name="date-from" class="input" value="{{page.date-from}}" />
-        </fieldset>
-        <fieldset class="fieldset">
-          <legend class="fieldset-legend">Date To</legend>
-          <input type="date" name="date-to" class="input" value="{{page.date-to}}" />
-        </fieldset>
-        <fieldset class="fieldset">
-          <legend class="fieldset-legend">Page Size</legend>
-          <select class="select" name="size">
-            <div tabindex="0" role="button" class="btn">Page Size: {{page.size}}</div>
-            <option {% if page.size = 10 %}selected{% endif %}>10</option>
-            <option {% if page.size = 20 %}selected{% endif %}>20</option>
-            <option {% if page.size = 30 %}selected{% endif %}>30</option>
-          </select>
+          <legend class="fieldset-legend">Date Range</legend>
+          <div class="flex items-center gap-1">
+            <input type="text" id="date-range-input" class="input" placeholder="All dates" autocomplete="off" readonly />
+            <button type="button" id="date-range-clear" class="btn btn-square btn-ghost btn-sm" title="Clear date range">✕</button>
+          </div>
+          <input type="hidden" name="date-from" id="date-from-input" value="{{page.date-from}}" />
+          <input type="hidden" name="date-to" id="date-to-input" value="{{page.date-to}}" />
         </fieldset>
       </div>
       <button class="btn btn-primary" type="submit">Apply</button>
@@ -61,12 +57,18 @@
 
 {% include "emails-pagination.html" %}
 
+<!-- The table (and the subject filter input in its header) renders even with zero results:
+     hiding it would make an active subject filter invisible and drop it from the next submit. -->
 <div class="w-full">
   <table class="table table-zebra">
     <thead class="table-header-group">
       <tr class="table-row">
         <th class="table-cell text-left"><strong>Date</strong></th>
-        <th class="table-cell text-left"><strong>Subject</strong></th>
+        <th class="table-cell text-left">
+          <strong>Subject</strong>
+          <input type="text" name="search-text" class="input input-sm mt-1 w-full" placeholder="Filter by subject..."
+                 value="{{page.search-text}}" form="page-form" />
+        </th>
         <th class="hidden lg:table-cell text-left"><strong>From</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>To</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
@@ -98,7 +100,28 @@
     </table>
   </div>
 
+{% if emails|empty? %}
+
+<div role="alert" class="alert my-4">
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-info h-6 w-6 shrink-0">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+  </svg>
+  <span>There are no e-mails matching the current filter</span>
+</div>
+
+{% endif %}
+
 {% include "emails-pagination.html" %}
+
+<div class="flex justify-center my-4">
+  <fieldset class="fieldset">
+    <legend class="fieldset-legend">Page Size</legend>
+    <div class="flex items-center gap-2">
+      <input type="number" name="size" min="1" max="500" class="input w-24" value="{{page.size}}" form="page-form" />
+      <button class="btn btn-primary btn-sm" type="submit" form="page-form">Apply</button>
+    </div>
+  </fieldset>
+</div>
 
 <script>
   // Briefly outline a field to show the outcome of an auto-save. color: green/amber/red.
@@ -132,20 +155,42 @@
   function updateLanguage(input) {
     autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
   }
+
+  // Date range filter: a single flatpickr calendar drives the two hidden date-from/date-to fields
+  // that #page-form actually submits.
+  (function () {
+    var fromInput = document.getElementById('date-from-input');
+    var toInput = document.getElementById('date-to-input');
+    var rangeInput = document.getElementById('date-range-input');
+    var clearButton = document.getElementById('date-range-clear');
+    if (typeof flatpickr === 'undefined') {
+      // The picker script failed to load: fall back to the hidden bounds as plain native date
+      // inputs so the filter stays usable (and an active range clearable) without it.
+      rangeInput.style.display = 'none';
+      clearButton.style.display = 'none';
+      fromInput.type = 'date';
+      toInput.type = 'date';
+      fromInput.className = toInput.className = 'input';
+      return;
+    }
+    // Range mode cannot represent a one-sided bound: a single defaultDate renders as the range
+    // START and the next click extends from it, so a "to"-only filter would display — and then
+    // submit — as a "from" date. Preselect only complete ranges; describe one-sided bounds as text.
+    var completeRange = (fromInput.value && toInput.value) ? [fromInput.value, toInput.value] : [];
+    var picker = flatpickr(rangeInput, {
+      mode: 'range',
+      dateFormat: 'Y-m-d',
+      defaultDate: completeRange,
+      onChange: function (selectedDates) {
+        fromInput.value = selectedDates[0] ? flatpickr.formatDate(selectedDates[0], 'Y-m-d') : '';
+        toInput.value = selectedDates[1] ? flatpickr.formatDate(selectedDates[1], 'Y-m-d') : '';
+      }
+    });
+    if (fromInput.value && !toInput.value) { rangeInput.value = 'From ' + fromInput.value; }
+    if (!fromInput.value && toInput.value) { rangeInput.value = 'Until ' + toInput.value; }
+    // clear() fires onChange with no dates, which already blanks both hidden fields.
+    clearButton.addEventListener('click', function () { picker.clear(); });
+  })();
 </script>
-
-{% endif %}
-
-{% if emails|empty? %}
-
-
-<div role="alert" class="alert">
-  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-info h-6 w-6 shrink-0">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-  </svg>
-  <span>There are no e-mails to list</span>
-</div>
-
-{% endif %}
 
 {% endblock %}

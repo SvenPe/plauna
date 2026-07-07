@@ -4,7 +4,9 @@
 (defrecord PageRequest [page size])
 
 (defn page-request [page size]
-  (->PageRequest (or page 1) (or size 10)))
+  ;; Clamp size to [1, 500]: a size <= 0 makes LIMIT invalid on MariaDB, and an unbounded size (the
+  ;; page-size field is now free-form, not a fixed dropdown) could otherwise pull the whole table.
+  (->PageRequest (or page 1) (min 500 (max 1 (or size 10)))))
 
 (defn calculate-pages-total [total size] (max 1 (int (ceil (/ (double total) size)))))
 

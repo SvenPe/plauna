@@ -4,22 +4,12 @@
     <div class="pagination flex flex-nowrap text-xs lg:text-md items-center gap-1">
       {% if page.page > 1 %}
       <form action="/emails" method="get">
-        <input type="hidden" name="size" value="{{page.size}}" />
-        <input type="hidden" name="search-field" value="subject" />
-        <input type="hidden" name="search-text" value="{{page.search-text}}" />
-        <input type="hidden" name="filter" value="{{page.filter}}" />
-        <input type="hidden" name="date-from" value="{{page.date-from}}" />
-        <input type="hidden" name="date-to" value="{{page.date-to}}" />
+        {% include "emails-pagination-fields.html" %}
         <input type="hidden" name="page" value="1" />
         <button class="btn join-item text-xs lg:text-md text-nowrap">&laquo; First</button>
       </form>
       <form action="/emails" method="get">
-        <input type="hidden" name="size" value="{{page.size}}" />
-        <input type="hidden" name="search-field" value="subject" />
-        <input type="hidden" name="search-text" value="{{page.search-text}}" />
-        <input type="hidden" name="filter" value="{{page.filter}}" />
-        <input type="hidden" name="date-from" value="{{page.date-from}}" />
-        <input type="hidden" name="date-to" value="{{page.date-to}}" />
+        {% include "emails-pagination-fields.html" %}
         <input type="hidden" name="page" value="{{page.page|add:-1}}" />
         <button class="btn join-item text-xs lg:text-md text-nowrap">&lsaquo; Back</button>
       </form>
@@ -30,22 +20,12 @@
       <p class="text-sm lg:text-md text-nowrap mx-2">{{page.page}} of {{page.total-pages}}</p>
       {% if page.page < page.total-pages %}
       <form action="/emails" method="get">
-        <input type="hidden" name="size" value="{{page.size}}" />
-        <input type="hidden" name="search-field" value="subject" />
-        <input type="hidden" name="search-text" value="{{page.search-text}}" />
-        <input type="hidden" name="filter" value="{{page.filter}}" />
-        <input type="hidden" name="date-from" value="{{page.date-from}}" />
-        <input type="hidden" name="date-to" value="{{page.date-to}}" />
+        {% include "emails-pagination-fields.html" %}
         <input type="hidden" name="page" value="{{page.page|add:1}}" />
         <button class="btn join-item text-xs lg:text-md text-nowrap">Next &rsaquo;</button>
       </form>
       <form action="/emails" method="get">
-        <input type="hidden" name="size" value="{{page.size}}" />
-        <input type="hidden" name="search-field" value="subject" />
-        <input type="hidden" name="search-text" value="{{page.search-text}}" />
-        <input type="hidden" name="filter" value="{{page.filter}}" />
-        <input type="hidden" name="date-from" value="{{page.date-from}}" />
-        <input type="hidden" name="date-to" value="{{page.date-to}}" />
+        {% include "emails-pagination-fields.html" %}
         <input type="hidden" name="page" value="{{page.total-pages}}" />
         <button class="btn join-item text-xs lg:text-md text-nowrap">Last &raquo;</button>
       </form>
