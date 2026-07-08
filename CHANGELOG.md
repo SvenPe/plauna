@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-08.3] - 2026-07-08
+
+### 🚀 Features
+
+- Each Subject/From/To/Category filter checklist now only lists values still
+  reachable given every other active filter (e.g. once a category is picked, the
+  From checklist only shows senders who actually have mail in that category),
+  matching Excel's own AutoFilter behavior. The per-row category reassignment
+  dropdown is unaffected and always offers every category.
+
+### 🐛 Bug Fixes
+
+- Fix long subjects and sender names/addresses overflowing the filter dropdowns:
+  widened the popovers and switched to proper CSS ellipsis truncation, with the
+  full value still available as a hover tooltip.
+
 ## [2026-07-08.2] - 2026-07-08
 
 ### 🐛 Bug Fixes
