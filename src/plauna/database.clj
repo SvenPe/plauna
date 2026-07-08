@@ -339,6 +339,43 @@
 (defn category-by-id [id]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from :categories :where [:= :id id]}) builder-function))
 
+(def distinct-value-limit
+  "Cap the Subject/From/To filter dropdowns to this many distinct values. They're rendered as
+   checkboxes in the page (with a client-side search box to narrow them), so an unbounded list
+   could mean tens of thousands of DOM nodes on a large mailbox."
+  500)
+
+(defn distinct-subjects []
+  (let [result (jdbc/execute! (ds) (honey/format {:select-distinct [:subject]
+                                                   :from [:headers]
+                                                   :where [:and [:is-not :subject nil] [:<> :subject ""]]
+                                                   :order-by [[:subject :asc]]
+                                                   :limit distinct-value-limit})
+                              builder-function)]
+    (when (= distinct-value-limit (count result))
+      (t/log! :info ["Subject filter: more than" distinct-value-limit "distinct subjects exist; showing only the first" distinct-value-limit]))
+    result))
+
+(defn- distinct-contacts-by-type
+  "Distinct (contact-key, name, address) contacts that appear with any of participant-types
+   (e.g. [\"sender\" \":sender\"] — legacy rows may store the type with a leading colon, see the
+   defensive strip in core.email/construct-participants)."
+  [participant-types]
+  (let [result (jdbc/execute! (ds) (honey/format {:select-distinct [:contacts.contact-key :contacts.name :contacts.address]
+                                                   :from [:contacts]
+                                                   :join [:communications [:= :communications.contact-key :contacts.contact-key]]
+                                                   :where [:in :communications.type participant-types]
+                                                   :order-by [[:contacts.address :asc]]
+                                                   :limit distinct-value-limit})
+                              builder-function)]
+    (when (= distinct-value-limit (count result))
+      (t/log! :info ["Contact filter: more than" distinct-value-limit "distinct contacts exist for types" participant-types "; showing only the first" distinct-value-limit]))
+    result))
+
+(defn distinct-senders [] (distinct-contacts-by-type ["sender" ":sender"]))
+
+(defn distinct-recipients [] (distinct-contacts-by-type ["receiver" ":receiver"]))
+
 (defn get-languages []
   (jdbc/execute! (ds) ["select language from metadata group by language"] builder-function))
 
@@ -629,6 +666,9 @@
   (fetch-oauth-token-data [_ connection-id] (get-oauth-tokens connection-id))
   (fetch-auth-provider [_ id] (get-auth-provider id))
   (fetch-categories [_] (get-categories))
+  (fetch-distinct-subjects [_] (distinct-subjects))
+  (fetch-distinct-senders [_] (distinct-senders))
+  (fetch-distinct-recipients [_] (distinct-recipients))
   (fetch-emails [_ entity customization] (fetch-data entity customization))
   (save-category [_ category-name destination-folder color] (create-category category-name destination-folder color))
   (update-category [_ id destination-folder color] (update-category id destination-folder color))

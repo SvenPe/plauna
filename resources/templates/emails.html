@@ -13,7 +13,6 @@
   <div class="card grow place-items-center">
     <h3>Filter</h3>
     <form action="/emails" method="get" id="page-form">
-      <input type="hidden" name="search-field" value="subject" />
       <input type="hidden" name="page" value="1" /> <!-- whenever the filter is used, we want to go back to page 1 -->
       <div class="flex" style="gap: 4px; flex-wrap: wrap;">
         <fieldset class="fieldset">
@@ -32,12 +31,8 @@
         </fieldset>
         <fieldset class="fieldset">
           <legend class="fieldset-legend">Search Text</legend>
-          <input type="text" name="search-text" class="input" placeholder="Subject contains..." value="{{page.search-text}}" />
-          <p class="label">Currently you can only search in email subjects.</p>
-        </fieldset>
-        <fieldset class="fieldset">
-          <legend class="fieldset-legend">From</legend>
-          <input type="text" name="from-search-text" class="input" placeholder="Sender name or address" value="{{page.from-search-text}}" />
+          <input type="text" name="search-text" class="input" placeholder="E-mail content contains..." value="{{page.search-text}}" />
+          <p class="label">Searches the e-mail body content. Use the Subject, From, and To column filters for those fields.</p>
         </fieldset>
         <fieldset class="fieldset">
           <legend class="fieldset-legend">Date Range</legend>
@@ -69,9 +64,84 @@
     <thead class="table-header-group">
       <tr class="table-row">
         <th class="table-cell text-left"><strong>Date</strong></th>
-        <th class="table-cell text-left"><strong>Subject</strong></th>
-        <th class="hidden lg:table-cell text-left"><strong>From</strong></th>
-        <th class="hidden lg:table-cell text-left"><strong>To</strong></th>
+        <th class="table-cell text-left">
+          <div class="dropdown">
+            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+              <strong>Subject</strong>
+              <span aria-hidden="true">▾</span>
+            </div>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
+              <input type="text" class="input input-sm mb-2" placeholder="Search subjects..." oninput="filterChecklist(this, 'subject-checklist')">
+              <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
+                <input type="checkbox" class="checkbox checkbox-sm" id="subject-filter-select-all"
+                       onclick="toggleAllInChecklist(this, 'subject-filter-checkbox')" {% if page.subject-values|empty? %}checked{% endif %}>
+                <span class="font-semibold">(Select All)</span>
+              </label>
+              <div id="subject-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+                {% for subject-row in subjects %}
+                <label class="flex items-center gap-2" title="{{subject-row.subject}}">
+                  <input type="checkbox" class="checkbox checkbox-sm subject-filter-checkbox" name="subject-values"
+                         value="{{subject-row.subject}}" form="page-form" {% if subject-row.checked? %}checked{% endif %}>
+                  <span>{{subject-row.subject|abbreviate:40}}</span>
+                </label>
+                {% endfor %}
+              </div>
+              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+            </div>
+          </div>
+        </th>
+        <th class="hidden lg:table-cell text-left">
+          <div class="dropdown">
+            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+              <strong>From</strong>
+              <span aria-hidden="true">▾</span>
+            </div>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
+              <input type="text" class="input input-sm mb-2" placeholder="Search senders..." oninput="filterChecklist(this, 'from-checklist')">
+              <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
+                <input type="checkbox" class="checkbox checkbox-sm" id="from-filter-select-all"
+                       onclick="toggleAllInChecklist(this, 'from-filter-checkbox')" {% if page.from-keys|empty? %}checked{% endif %}>
+                <span class="font-semibold">(Select All)</span>
+              </label>
+              <div id="from-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+                {% for sender in senders %}
+                <label class="flex items-center gap-2" title="{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}">
+                  <input type="checkbox" class="checkbox checkbox-sm from-filter-checkbox" name="from-keys"
+                         value="{{sender.contact_key}}" form="page-form" {% if sender.checked? %}checked{% endif %}>
+                  <span>{% if sender.name %}{{sender.name}} - {{sender.address|abbreviate:30}}{% else %}{{sender.address|abbreviate:30}}{% endif %}</span>
+                </label>
+                {% endfor %}
+              </div>
+              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+            </div>
+          </div>
+        </th>
+        <th class="hidden lg:table-cell text-left">
+          <div class="dropdown">
+            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+              <strong>To</strong>
+              <span aria-hidden="true">▾</span>
+            </div>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
+              <input type="text" class="input input-sm mb-2" placeholder="Search recipients..." oninput="filterChecklist(this, 'to-checklist')">
+              <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
+                <input type="checkbox" class="checkbox checkbox-sm" id="to-filter-select-all"
+                       onclick="toggleAllInChecklist(this, 'to-filter-checkbox')" {% if page.to-keys|empty? %}checked{% endif %}>
+                <span class="font-semibold">(Select All)</span>
+              </label>
+              <div id="to-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+                {% for recipient in recipients %}
+                <label class="flex items-center gap-2" title="{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}">
+                  <input type="checkbox" class="checkbox checkbox-sm to-filter-checkbox" name="to-keys"
+                         value="{{recipient.contact_key}}" form="page-form" {% if recipient.checked? %}checked{% endif %}>
+                  <span>{% if recipient.name %}{{recipient.name}} - {{recipient.address|abbreviate:30}}{% else %}{{recipient.address|abbreviate:30}}{% endif %}</span>
+                </label>
+                {% endfor %}
+              </div>
+              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+            </div>
+          </div>
+        </th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
         <th class="text-left">
@@ -83,7 +153,7 @@
             <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-56 p-3">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
                 <input type="checkbox" class="checkbox checkbox-sm" id="category-filter-select-all"
-                       onclick="toggleAllCategoryFilters(this)" {% if page.category-ids|empty? %}checked{% endif %}>
+                       onclick="toggleAllInChecklist(this, 'category-filter-checkbox')" {% if page.category-ids|empty? %}checked{% endif %}>
                 <span class="font-semibold">(Select All)</span>
               </label>
               <div class="max-h-56 overflow-y-auto flex flex-col gap-1">
@@ -205,10 +275,20 @@
     autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
   }
 
-  // The Category column header's "(Select All)" checkbox in its Excel-style filter dropdown.
-  function toggleAllCategoryFilters(masterCheckbox) {
-    document.querySelectorAll('.category-filter-checkbox').forEach(function (checkbox) {
+  // Each column header's "(Select All)" checkbox in its Excel-style filter dropdown.
+  function toggleAllInChecklist(masterCheckbox, checkboxClass) {
+    document.querySelectorAll('.' + checkboxClass).forEach(function (checkbox) {
       checkbox.checked = masterCheckbox.checked;
+    });
+  }
+
+  // The search box at the top of a Subject/From/To filter dropdown: narrows the (possibly long)
+  // checklist to matching entries, purely client-side - the underlying filter is still whichever
+  // boxes end up checked, exactly like Excel's own column filter search box.
+  function filterChecklist(searchInput, listId) {
+    var query = searchInput.value.toLowerCase();
+    document.getElementById(listId).querySelectorAll('label').forEach(function (label) {
+      label.style.display = label.textContent.toLowerCase().indexOf(query) === -1 ? 'none' : '';
     });
   }
 

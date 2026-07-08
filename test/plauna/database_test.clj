@@ -64,3 +64,28 @@
   (is (= "Archive/Projects" (db/email-folder "folder-rt")) "Recorded folder is persisted and read back through metadata.folder")
   (is (nil? (db/email-folder "no-such-message")) "Unknown message has no recorded folder"))
 
+(deftest distinct-subjects-excludes-duplicates-and-blanks
+  (db/save-headers [{:mime-type "text/plain" :subject "Unique Subject A" :message-id "subj-1" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "Unique Subject A" :message-id "subj-2" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "Unique Subject B" :message-id "subj-3" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "" :message-id "subj-4" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject nil :message-id "subj-5" :date 0 :in-reply-to nil}])
+  (let [subjects (set (map :subject (db/distinct-subjects)))]
+    (is (contains? subjects "Unique Subject A"))
+    (is (contains? subjects "Unique Subject B"))
+    (is (not (contains? subjects "")) "A blank subject is excluded")
+    (is (not (contains? subjects nil)) "A NULL subject is excluded")))
+
+(deftest distinct-senders-and-recipients-are-split-by-participant-type
+  (db/save-headers [{:mime-type "text/plain" :subject "s" :message-id "contact-msg" :date 0 :in-reply-to nil}])
+  (db/save-contacts [{:contact-key "sender-key" :name "Alice" :address "alice@example.com"}
+                      {:contact-key "recipient-key" :name "Bob" :address "bob@example.com"}])
+  (db/save-communications [{:message-id "contact-msg" :contact-key "sender-key" :type :sender}
+                            {:message-id "contact-msg" :contact-key "recipient-key" :type :receiver}])
+  (let [sender-keys (set (map :contact_key (db/distinct-senders)))
+        recipient-keys (set (map :contact_key (db/distinct-recipients)))]
+    (is (contains? sender-keys "sender-key"))
+    (is (not (contains? sender-keys "recipient-key")) "A receiver is not listed as a sender")
+    (is (contains? recipient-keys "recipient-key"))
+    (is (not (contains? recipient-keys "sender-key")) "A sender is not listed as a recipient")))
+

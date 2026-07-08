@@ -22,31 +22,40 @@
     (= filter "without-category") [:= :metadata.category nil]
     :else nil))
 
-(defn- subject->where
-  "A blank search-text adds no filter. Without this guard a nil text builds LIKE '%%',
-   which silently excludes e-mails whose subject is NULL."
-  [search-field search-text]
-  (when (and (= search-field "subject") (not (str/blank? search-text)))
-    (like-contains :headers.subject search-text)))
-
-(defn- from->where
-  "Build a where-clause matching e-mails whose sender's name or address contains search-text.
-   A blank/nil search-text adds no filter. A non-correlated IN subquery (not a correlated EXISTS):
-   the matching message-ids are resolved once instead of probing contacts for every header row —
-   the count query re-runs the whole clause, so a correlated probe would run twice per page load.
-   Legacy rows may store the participant type as \":sender\" (see the defensive strip in
-   core.email/construct-participants), so match both spellings."
+(defn- content->where
+  "Build a where-clause matching e-mails whose body content contains search-text. A blank/nil
+   search-text adds no filter. A non-correlated IN subquery (not a correlated EXISTS): the matching
+   message-ids are resolved once instead of probing bodies for every header row — the count query
+   re-runs the whole clause, so a correlated probe would run twice per page load."
   [search-text]
   (when-not (str/blank? search-text)
     [:in :headers.message-id
+     {:select [:bodies.message-id] :from [:bodies] :where (like-contains :bodies.content search-text)}]))
+
+(defn- contact-keys->where
+  "Build a where-clause matching e-mails with a participant of one of participant-types (e.g.
+   [\"sender\" \":sender\"] — legacy rows may store the type with a leading colon, see the defensive
+   strip in core.email/construct-participants) whose contact-key is in selected-keys. An empty
+   selection adds no filter, same as every other filter field's 'blank means unfiltered' convention."
+  [participant-types selected-keys]
+  (when (seq selected-keys)
+    [:in :headers.message-id
      {:select [:communications.message-id]
       :from [:communications]
-      :join [:contacts [:= :contacts.contact-key :communications.contact-key]]
       :where [:and
-              [:in :communications.type ["sender" ":sender"]]
-              [:or
-               (like-contains :contacts.name search-text)
-               (like-contains :contacts.address search-text)]]}]))
+              [:in :communications.type participant-types]
+              [:in :communications.contact-key selected-keys]]}]))
+
+(defn- sender-keys->where [selected-keys] (contact-keys->where ["sender" ":sender"] selected-keys))
+
+(defn- recipient-keys->where [selected-keys] (contact-keys->where ["receiver" ":receiver"] selected-keys))
+
+(defn- subject-values->where
+  "An empty selection adds no filter, same as every other filter field's 'blank means unfiltered'
+   convention (also how an Excel column filter behaves before you touch it)."
+  [selected-subjects]
+  (when (seq selected-subjects)
+    [:in :headers.subject selected-subjects]))
 
 (defn- date-string->epoch-seconds
   "Convert a 'YYYY-MM-DD' string to a UTC unix timestamp (seconds) at the start of that day,
@@ -144,29 +153,35 @@
     (catch Exception e (do (t/log! :error ["There was an error when trying to log in:" e])
                            (error-result e "There was an error when trying to log in.")))))
 
-(defn- annotate-checked
-  "Mark every category :checked? true when selected-tokens is empty (the default, unfiltered state —
-   nothing has been unchecked yet), otherwise only the categories whose id (or uncategorized-token for
-   the 'n/a' entry) appears in selected-tokens."
-  [cat-list selected-tokens]
+(defn- annotate-checked-by
+  "Mark every item :checked? true when selected-tokens is empty (the default, unfiltered state —
+   nothing has been unchecked yet), otherwise only the items whose (key-fn item) appears in
+   selected-tokens."
+  [items selected-tokens key-fn]
   (let [selected (set selected-tokens)]
-    (mapv (fn [category]
-            (assoc category :checked? (or (empty? selected)
-                                          (contains? selected (str (or (:id category) uncategorized-token))))))
-          cat-list)))
+    (mapv (fn [item] (assoc item :checked? (or (empty? selected) (contains? selected (str (key-fn item))))))
+          items)))
 
 (defn fetch-emails
   "Returns a list of emails. Customizable by parameters which can contain the following keys:
-   :size, :page, :filter (all, enrieched-only, or without-category), :search-field (subject), :search-text,
-   :from-search-text (matches the sender's name or address), :category-ids (a collection of category
-   ids and/or uncategorized-token), :date-from, :date-to"
+   :size, :page, :filter (all, enrieched-only, or without-category), :search-text (matches the
+   e-mail body content), :subject-values, :from-keys, :to-keys, :category-ids (collections of
+   selected checkbox values for the respective Excel-style column filters), :date-from, :date-to"
   [context parameters]
   (let [db (:db context)
         selected-category-tokens (remove str/blank? (:category-ids parameters))
-        cat-list (annotate-checked (categories db) selected-category-tokens)
+        selected-subject-values (remove str/blank? (:subject-values parameters))
+        selected-from-keys (remove str/blank? (:from-keys parameters))
+        selected-to-keys (remove str/blank? (:to-keys parameters))
+        cat-list (annotate-checked-by (categories db) selected-category-tokens #(or (:id %) uncategorized-token))
+        subject-list (annotate-checked-by (int/fetch-distinct-subjects db) selected-subject-values :subject)
+        sender-list (annotate-checked-by (int/fetch-distinct-senders db) selected-from-keys :contact_key)
+        recipient-list (annotate-checked-by (int/fetch-distinct-recipients db) selected-to-keys :contact_key)
         where (combine-wheres [(filter->where (:filter parameters))
-                               (subject->where (:search-field parameters) (:search-text parameters))
-                               (from->where (:from-search-text parameters))
+                               (content->where (:search-text parameters))
+                               (subject-values->where selected-subject-values)
+                               (sender-keys->where selected-from-keys)
+                               (recipient-keys->where selected-to-keys)
                                (category-ids->where selected-category-tokens)
                                (date->where (:date-from parameters) (:date-to parameters))])
         customization-clause (cond-> {:order-by [[:date :desc]]}
@@ -182,11 +197,13 @@
                   :page (:page result)
                   :total (:total result)
                   :search-text (:search-text parameters)
-                  :from-search-text (:from-search-text parameters)
+                  :subject-values selected-subject-values
+                  :from-keys selected-from-keys
+                  :to-keys selected-to-keys
                   :category-ids selected-category-tokens
                   :date-from (:date-from parameters)
                   :date-to (:date-to parameters)}
-     :optional {:categories cat-list}}))
+     :optional {:categories cat-list :subjects subject-list :senders sender-list :recipients recipient-list}}))
 
 (defn create-new-category! [context category destination-folder color]
   (let [db (:db context)

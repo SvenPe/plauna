@@ -269,9 +269,10 @@
 (def emails-template {:size {:default 20 :type-fn (int-or-default 20)}
                       :page {:default 1 :type-fn (int-or-default 1)}
                       :filter {:default "all" :type-fn identity}
-                      :search-field {:default "subject" :type-fn identity}
                       :search-text {:default nil :type-fn identity}
-                      :from-search-text {:default nil :type-fn identity}
+                      :subject-values {:default nil :type-fn vectorize}
+                      :from-keys {:default nil :type-fn vectorize}
+                      :to-keys {:default nil :type-fn vectorize}
                       :category-ids {:default nil :type-fn vectorize}
                       :date-from {:default nil :type-fn identity}
                       :date-to {:default nil :type-fn identity}})
@@ -583,7 +584,7 @@
    (comp/GET "/emails" {params :params}
      (let [parse-fn (template->request-parameters emails-template)
            result (app/fetch-emails context (parse-fn params))]
-       (success-html-with-body (result-with-messages (markup/list-emails (:data result) (:parameters result) (:categories (:optional result))) global-messages))))
+       (success-html-with-body (result-with-messages (markup/list-emails (:data result) (:parameters result) (:optional result)) global-messages))))
 
    (comp/GET "/emails/:id" [id]
      (let [decoded-id (new String ^"[B" (base64-decode id))

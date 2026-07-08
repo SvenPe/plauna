@@ -2,9 +2,16 @@
      parameter is added once instead of once per First/Back/Next/Last form.
      The form-specific "page" input stays in emails-pagination.html. -->
 <input type="hidden" name="size" value="{{page.size}}" />
-<input type="hidden" name="search-field" value="subject" />
 <input type="hidden" name="search-text" value="{{page.search-text}}" />
-<input type="hidden" name="from-search-text" value="{{page.from-search-text}}" />
+{% for subject in page.subject-values %}
+<input type="hidden" name="subject-values" value="{{subject}}" />
+{% endfor %}
+{% for from-key in page.from-keys %}
+<input type="hidden" name="from-keys" value="{{from-key}}" />
+{% endfor %}
+{% for to-key in page.to-keys %}
+<input type="hidden" name="to-keys" value="{{to-key}}" />
+{% endfor %}
 {% for category-id in page.category-ids %}
 <input type="hidden" name="category-ids" value="{{category-id}}" />
 {% endfor %}

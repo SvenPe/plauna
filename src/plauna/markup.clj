@@ -105,12 +105,14 @@
              (fn [color] (if (re-matches #"#[0-9a-fA-F]{6}" (str color)) color default-category-color)))
 
 (defn list-emails
-  ([emails page-info categories]
+  "filter-options supplies the Excel-style column filter dropdowns' possible values:
+   {:categories ... :subjects ... :senders ... :recipients ...}"
+  ([emails page-info filter-options]
    (let [emails-with-java-date (map #(update-in % [:header :date] timestamp->date) emails)]
-     (render "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :active-nav :emails})))
-  ([emails page-info categories messages]
+     (render "emails.html" (merge {:emails emails-with-java-date :page page-info :header "Emails" :active-nav :emails} filter-options))))
+  ([emails page-info filter-options messages]
    (let [emails-with-java-date (map #(update-in % [:header :date] timestamp->date) emails)]
-     (render "emails.html" {:emails emails-with-java-date :page page-info :header "Emails" :categories categories :messages (mapv type->toast-role messages) :active-nav :emails}))))
+     (render "emails.html" (merge {:emails emails-with-java-date :page page-info :header "Emails" :messages (mapv type->toast-role messages) :active-nav :emails} filter-options)))))
 
 (defn list-email-contents
   ([email-data categories]

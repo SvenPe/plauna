@@ -61,13 +61,21 @@
            (app/connect-to-client context "abc"))
         "auth-type 'oauth2' with auth provider and access token but no refresh token calls client login and returns ok")))
 
+(defn- stub-emails-db
+  "A reify int/DB with every method fetch-emails needs beyond fetch-emails itself: the three
+   distinct-value lookups (empty by default) plus fetch-categories. capture-fn receives the
+   customization clause passed to fetch-emails; result is what fetch-emails should return."
+  [capture-fn result]
+  (reify int/DB
+    (fetch-categories [_] [])
+    (fetch-distinct-subjects [_] [])
+    (fetch-distinct-senders [_] [])
+    (fetch-distinct-recipients [_] [])
+    (fetch-emails [_ _ customization] (capture-fn customization) result)))
+
 (deftest emails-query-filter-wo-search
   (let [query (atom "")
-        database (reify int/DB
-                   (fetch-categories [_] [])
-                   (fetch-emails [_ _ important-query]
-                     (swap! query (fn [_] important-query))
-                     {:total 10 :size 1 :page 1}))]
+        database (stub-emails-db #(reset! query %) {:total 10 :size 1 :page 1})]
     (app/fetch-emails {:db database} {:filter "enriched-only" :size 1})
     (is (= @query {:where [:and [:<> :metadata.category nil] [:<> :metadata.language nil]], :order-by [[:date :desc]]}))
     (app/fetch-emails {:db database} {:filter "without-category" :size 1})
@@ -77,23 +85,22 @@
 
 (deftest emails-query-search-wo-filter
   (let [query (atom "")
-        database (reify int/DB
-                   (fetch-categories [_] [])
-                   (fetch-emails [_ _ important-query]
-                     (swap! query (fn [_] important-query))
-                     {:total 10 :size 1 :page 1}))]
-    (app/fetch-emails {:db database} {:search-field "subject" :search-text "test text" :size 1})
-    (is (= {:where [:like :headers.subject [:escape "%test text%" "\\"]] :order-by [[:date :desc]]} @query))))
+        database (stub-emails-db #(reset! query %) {:total 10 :size 1 :page 1})]
+    (app/fetch-emails {:db database} {:search-text "test text" :size 1})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:bodies.message-id] :from [:bodies] :where [:like :bodies.content [:escape "%test text%" "\\"]]}]
+            :order-by [[:date :desc]]}
+           @query))))
 
 (deftest emails-query-search-filter
   (let [query (atom "")
-        database (reify int/DB
-                   (fetch-categories [_] [])
-                   (fetch-emails [_ _ important-query]
-                     (swap! query (fn [_] important-query))
-                     {:total 10 :size 1 :page 1}))]
-    (app/fetch-emails {:db database} {:filter "enriched-only" :search-field "subject" :search-text "test text" :size 1})
-    (is (= {:where [:and [:and [:<> :metadata.category nil] [:<> :metadata.language nil]] [:like :headers.subject [:escape "%test text%" "\\"]]] :order-by [[:date :desc]]} @query))))
+        database (stub-emails-db #(reset! query %) {:total 10 :size 1 :page 1})]
+    (app/fetch-emails {:db database} {:filter "enriched-only" :search-text "test text" :size 1})
+    (is (= {:where [:and [:and [:<> :metadata.category nil] [:<> :metadata.language nil]]
+                    [:in :headers.message-id
+                     {:select [:bodies.message-id] :from [:bodies] :where [:like :bodies.content [:escape "%test text%" "\\"]]}]]
+            :order-by [[:date :desc]]}
+           @query))))
 
 (deftest create-a-category
   (let [db-called (atom false)
@@ -306,10 +313,8 @@
 
 (deftest fetch-emails-applies-date-filter
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text nil
                                 :page 1 :size 20 :date-from "2026-06-01" :date-to "2026-06-30"})
     (let [where-flat (flatten (:where @captured))]
       (is (some #{:>=} where-flat) "Lower date bound is present")
@@ -317,71 +322,80 @@
       (is (some #{:date} where-flat) "Filters on the date column")))
   "Date-from/date-to are translated into a date-range filter on the email date")
 
-(deftest fetch-emails-applies-from-filter
+(deftest fetch-emails-applies-content-search
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :from-search-text "someone@example.com" :page 1 :size 20})
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text "someone@example.com" :page 1 :size 20})
     (is (= {:where [:in :headers.message-id
-                    {:select [:communications.message-id]
-                     :from [:communications]
-                     :join [:contacts [:= :contacts.contact-key :communications.contact-key]]
-                     ;; ":sender" too: legacy rows stored the printed keyword (see core.email/construct-participants)
-                     :where [:and
-                             [:in :communications.type ["sender" ":sender"]]
-                             [:or
-                              [:like :contacts.name [:escape "%someone@example.com%" "\\"]]
-                              [:like :contacts.address [:escape "%someone@example.com%" "\\"]]]]}]
+                    {:select [:bodies.message-id] :from [:bodies]
+                     :where [:like :bodies.content [:escape "%someone@example.com%" "\\"]]}]
             :order-by [[:date :desc]]}
            @captured)))
-  "A from-search-text value is translated into a message-id semi-join on the sender's name/address")
+  "The top Search Text field matches the e-mail body content, not the subject")
 
 (deftest fetch-emails-escapes-like-wildcards
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :from-search-text "a_b%c\\d" :page 1 :size 20})
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text "a_b%c\\d" :page 1 :size 20})
     (let [likes (filter #(and (vector? %) (= :like (first %))) (tree-seq coll? seq (:where @captured)))]
-      (is (seq likes) "The from filter produces LIKE clauses")
+      (is (seq likes) "The content search produces a LIKE clause")
       (doseq [[_ _ [_ pattern escape-char]] likes]
         (is (= "%a\\_b\\%c\\\\d%" pattern) "LIKE wildcards and the escape char itself are escaped")
         (is (= "\\" escape-char) "An explicit ESCAPE character is set (SQLite has no default)"))))
   "User input containing % _ or \\ matches literally instead of acting as LIKE wildcards")
 
-(deftest fetch-emails-applies-subject-filter
+(deftest fetch-emails-no-content-filter-when-blank
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text "invoice" :page 1 :size 20})
-    (is (= [:like :headers.subject [:escape "%invoice%" "\\"]] (:where @captured))))
-  "A subject search-text is translated into an escaped LIKE on the subject")
-
-(deftest fetch-emails-no-subject-filter-when-blank
-  (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil :page 1 :size 20})
-    (is (not (contains? @captured :where))
-        "No LIKE '%%' clause: it would silently exclude e-mails with a NULL subject"))
-  "A blank subject search adds no filter")
-
-(deftest fetch-emails-no-from-filter-when-blank
-  (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :from-search-text "" :page 1 :size 20})
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text nil :page 1 :size 20})
     (is (not (contains? @captured :where))))
-  "A blank from-search-text adds no filter")
+  "A blank Search Text adds no filter")
+
+(deftest fetch-emails-applies-subject-values-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :subject-values ["Invoice" "Newsletter"] :page 1 :size 20})
+    (is (= {:where [:in :headers.subject ["Invoice" "Newsletter"]] :order-by [[:date :desc]]} @captured)))
+  "Checked subjects are translated into an IN filter on the subject column")
+
+(deftest fetch-emails-no-subject-values-filter-when-empty
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :subject-values nil :page 1 :size 20})
+    (is (not (contains? @captured :where))))
+  "No subject checked (the default, before any checkbox is unchecked) adds no filter")
+
+(deftest fetch-emails-applies-from-keys-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :from-keys ["key-1" "key-2"] :page 1 :size 20})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:communications.message-id] :from [:communications]
+                     :where [:and [:in :communications.type ["sender" ":sender"]]
+                                  [:in :communications.contact-key ["key-1" "key-2"]]]}]
+            :order-by [[:date :desc]]}
+           @captured)))
+  "Checked senders are translated into a message-id semi-join by contact-key")
+
+(deftest fetch-emails-applies-to-keys-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :to-keys ["key-3"] :page 1 :size 20})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:communications.message-id] :from [:communications]
+                     :where [:and [:in :communications.type ["receiver" ":receiver"]]
+                                  [:in :communications.contact-key ["key-3"]]]}]
+            :order-by [[:date :desc]]}
+           @captured)))
+  "Checked recipients are translated into a message-id semi-join by contact-key, using the receiver type")
 
 (deftest fetch-emails-clamps-page-size
   (let [captured (atom nil)
         db (reify int/DB
              (fetch-categories [_] [])
+             (fetch-distinct-subjects [_] [])
+             (fetch-distinct-senders [_] [])
+             (fetch-distinct-recipients [_] [])
              (fetch-emails [_ entity-clause _] (reset! captured entity-clause) {:data [] :total 0}))]
     (app/fetch-emails {:db db} {:filter "all" :page 1 :size 0})
     (is (= 1 (:size (:page @captured))) "A size of 0 is clamped up to 1, never an invalid LIMIT")
@@ -391,36 +405,28 @@
 
 (deftest fetch-emails-applies-category-ids-filter
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :category-ids ["2" "3"] :page 1 :size 20})
     (is (= {:where [:in :metadata.category [2 3]] :order-by [[:date :desc]]} @captured)))
   "Selected numeric category ids are translated into an IN filter")
 
 (deftest fetch-emails-applies-uncategorized-filter
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :category-ids [app/uncategorized-token] :page 1 :size 20})
     (is (= {:where [:= :metadata.category nil] :order-by [[:date :desc]]} @captured)))
   "Selecting only the 'n/a' checkbox filters to e-mails with no category")
 
 (deftest fetch-emails-applies-mixed-category-filter
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :category-ids ["1" app/uncategorized-token] :page 1 :size 20})
     (is (= {:where [:or [:in :metadata.category [1]] [:= :metadata.category nil]] :order-by [[:date :desc]]} @captured)))
   "Selecting both real categories and 'n/a' ORs the two conditions together")
 
 (deftest fetch-emails-no-category-filter-when-empty
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :category-ids nil :page 1 :size 20})
     (is (not (contains? @captured :where))))
   "No category-ids selected (the default, before any checkbox is unchecked) adds no filter")
@@ -428,6 +434,9 @@
 (deftest fetch-emails-marks-selected-categories-checked
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-distinct-subjects [_] [])
+             (fetch-distinct-senders [_] [])
+             (fetch-distinct-recipients [_] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :category-ids ["1"] :page 1 :size 20})
         by-name (into {} (map (juxt :name :checked?)) (:categories (:optional result)))]
@@ -437,18 +446,53 @@
 (deftest fetch-emails-marks-every-category-checked-when-unfiltered
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-distinct-subjects [_] [])
+             (fetch-distinct-senders [_] [])
+             (fetch-distinct-recipients [_] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :page 1 :size 20})
         checked-flags (map :checked? (:categories (:optional result)))]
     (is (every? true? checked-flags)))
   "Before any checkbox is unchecked, every category (including n/a) shows as checked")
 
+(deftest fetch-emails-marks-selected-subjects-senders-and-recipients-checked
+  (let [db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_] [{:subject "Invoice"} {:subject "Newsletter"}])
+             (fetch-distinct-senders [_] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
+                                          {:contact_key "s2" :name "Bob" :address "bob@example.com"}])
+             (fetch-distinct-recipients [_] [{:contact_key "r1" :name "Me" :address "me@example.com"}])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :subject-values ["Invoice"] :from-keys ["s2"] :page 1 :size 20})
+        optional (:optional result)]
+    (is (= {"Invoice" true "Newsletter" false} (into {} (map (juxt :subject :checked?)) (:subjects optional))))
+    (is (= {"s1" false "s2" true} (into {} (map (juxt :contact_key :checked?)) (:senders optional))))
+    (is (every? true? (map :checked? (:recipients optional))) "Recipients are untouched, so all show as checked"))
+  "Each column filter's checked state is independent of the others")
+
 (deftest fetch-emails-no-date-filter-when-blank
   (let [captured (atom nil)
-        db (reify int/DB
-             (fetch-categories [_] [])
-             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
-    (app/fetch-emails {:db db} {:filter "all" :search-field "subject" :search-text nil
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text nil
                                 :page 1 :size 20 :date-from "" :date-to ""})
     (is (not (some #{:>=} (flatten (:where @captured)))) "No date bound is added when both dates are blank"))
   "Blank date inputs add no date filter")
+
+(deftest fetch-emails-combines-all-filters
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "enriched-only" :search-text "hello" :subject-values ["Invoice"]
+                                :from-keys ["s1"] :to-keys ["r1"] :category-ids ["1"]
+                                :date-from "2026-06-01" :date-to "2026-06-30" :page 1 :size 20})
+    (let [where (:where @captured)]
+      (is (= :and (first where)) "Every active filter is ANDed together")
+      ;; combine-wheres builds one flat [:and ...] of all 7 active clauses; just check each
+      ;; filter's signature is present somewhere in the tree rather than pinning the exact shape.
+      (let [flat (tree-seq coll? seq where)]
+        (is (some #{:metadata.category} flat) "Metadata filter present")
+        (is (some #{:bodies.content} flat) "Content search present")
+        (is (some #{:headers.subject} flat) "Subject filter present")
+        (is (some #{"sender" ":sender"} flat) "From filter present")
+        (is (some #{"receiver" ":receiver"} flat) "To filter present")
+        (is (some #{:date} flat) "Date filter present"))))
+  "All filters (metadata, content search, subject, from, to, category, date) combine with AND")
