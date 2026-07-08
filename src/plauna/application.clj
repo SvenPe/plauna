@@ -76,6 +76,30 @@
           (= 1 (count active)) (first active)
           :else (into [:and] active))))
 
+(def uncategorized-token
+  "Sentinel value for the 'n/a' checkbox in the category filter, distinguishing 'no category was
+   selected at all' (an absent/blank category-ids param) from 'the uncategorized bucket was selected'."
+  "n-a")
+
+(defn- category-ids->where
+  "Build a where-clause matching e-mails whose category is one of the selected ids. uncategorized-token
+   matches e-mails with no category (metadata.category IS NULL); other tokens are parsed as category
+   ids and non-numeric ones are dropped. An empty selection adds no filter, same as every other filter
+   field's 'blank means unfiltered' convention (also how an Excel column filter behaves before you
+   touch it: nothing unchecked yet, so nothing is excluded)."
+  [selected-tokens]
+  (let [include-uncategorized? (contains? (set selected-tokens) uncategorized-token)
+        numeric-ids (keep (fn [token]
+                            (when (not= uncategorized-token token)
+                              (try (Integer/parseInt token) (catch NumberFormatException _ nil))))
+                          selected-tokens)]
+    (cond
+      (empty? selected-tokens) nil
+      (and include-uncategorized? (seq numeric-ids)) [:or [:in :metadata.category numeric-ids] [:= :metadata.category nil]]
+      include-uncategorized? [:= :metadata.category nil]
+      (seq numeric-ids) [:in :metadata.category numeric-ids]
+      :else nil)))
+
 (defn- success-result [result-type data] (conj {:result result-type} data))
 
 (defn- error-result [exception alert-content] {:result :error :exception exception :message {:type :alert :content alert-content}})
@@ -120,16 +144,30 @@
     (catch Exception e (do (t/log! :error ["There was an error when trying to log in:" e])
                            (error-result e "There was an error when trying to log in.")))))
 
+(defn- annotate-checked
+  "Mark every category :checked? true when selected-tokens is empty (the default, unfiltered state —
+   nothing has been unchecked yet), otherwise only the categories whose id (or uncategorized-token for
+   the 'n/a' entry) appears in selected-tokens."
+  [cat-list selected-tokens]
+  (let [selected (set selected-tokens)]
+    (mapv (fn [category]
+            (assoc category :checked? (or (empty? selected)
+                                          (contains? selected (str (or (:id category) uncategorized-token))))))
+          cat-list)))
+
 (defn fetch-emails
   "Returns a list of emails. Customizable by parameters which can contain the following keys:
    :size, :page, :filter (all, enrieched-only, or without-category), :search-field (subject), :search-text,
-   :from-search-text (matches the sender's name or address), :date-from, :date-to"
+   :from-search-text (matches the sender's name or address), :category-ids (a collection of category
+   ids and/or uncategorized-token), :date-from, :date-to"
   [context parameters]
   (let [db (:db context)
-        cat-list (categories db)
+        selected-category-tokens (remove str/blank? (:category-ids parameters))
+        cat-list (annotate-checked (categories db) selected-category-tokens)
         where (combine-wheres [(filter->where (:filter parameters))
                                (subject->where (:search-field parameters) (:search-text parameters))
                                (from->where (:from-search-text parameters))
+                               (category-ids->where selected-category-tokens)
                                (date->where (:date-from parameters) (:date-to parameters))])
         customization-clause (cond-> {:order-by [[:date :desc]]}
                                where (assoc :where where))
@@ -145,6 +183,7 @@
                   :total (:total result)
                   :search-text (:search-text parameters)
                   :from-search-text (:from-search-text parameters)
+                  :category-ids selected-category-tokens
                   :date-from (:date-from parameters)
                   :date-to (:date-to parameters)}
      :optional {:categories cat-list}}))

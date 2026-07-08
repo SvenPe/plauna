@@ -217,7 +217,7 @@ Changing a destination folder does not move e-mails that were already filed; it 
 
 *** Category Colors
 
-Each category has a color, set with a color picker in "Admin" -> "Categories" (both on the "New Category" form and next to each existing category). The category dropdown on the e-mail list and on an e-mail's details page is color-coded with a left border matching the currently selected category, so you can tell categories apart at a glance. A category created before this feature, or one an invalid color was submitted for, falls back to a neutral gray.
+Each category has a color, set with a color picker in "Admin" -> "Categories" (both on the "New Category" form and next to each existing category). The category dropdown on the e-mail list and on an e-mail's details page is color-coded with a left border matching the currently selected category, and on the e-mail list the category's color also tints the whole row at low opacity, so you can tell categories apart at a glance without it overpowering the row's text. A category created before this feature, or one an invalid color was submitted for, falls back to a neutral gray.
 
 *** Categorize E-mails
 
@@ -243,6 +243,8 @@ The filter bar above the list lets you narrow the e-mails down by:
 - A date range: click the date field to open a calendar and pick a start and end date (either may be left empty, and the "Clear" button next to it resets the range). The end date is inclusive.
 
 A "Subject" filter box sits directly in the e-mail list's header row, above the Subject column, so you can narrow by subject without leaving the list. Press Enter in either the header's Subject box or the filter bar's From box to apply it, or use the "Apply" button.
+
+The "Category" column header has an Excel-style filter: click it to open a checklist of every category (plus "n/a" for uncategorized e-mails), pick one or several, and click "Apply". Every category is checked by default (nothing is filtered out); the "(Select All)" checkbox at the top toggles all of them at once.
 
 Click "Apply" to run the filter. Pagination controls appear both above and below the list, with "First", "Back", "Next" and "Last" buttons; the current filter (including the date range) is preserved as you page through the results. The number of e-mails shown per page can be set below the list (default 20).
 

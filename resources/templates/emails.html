@@ -74,7 +74,32 @@
         <th class="hidden lg:table-cell text-left"><strong>To</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
-        <th class="text-left"><strong>Category</strong></th>
+        <th class="text-left">
+          <div class="dropdown">
+            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+              <strong>Category</strong>
+              <span aria-hidden="true">▾</span>
+            </div>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-56 p-3">
+              <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
+                <input type="checkbox" class="checkbox checkbox-sm" id="category-filter-select-all"
+                       onclick="toggleAllCategoryFilters(this)" {% if page.category-ids|empty? %}checked{% endif %}>
+                <span class="font-semibold">(Select All)</span>
+              </label>
+              <div class="max-h-56 overflow-y-auto flex flex-col gap-1">
+                {% for category in categories %}
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" class="checkbox checkbox-sm category-filter-checkbox" name="category-ids"
+                         value="{{category.id|default:"n-a"}}" form="page-form" {% if category.checked? %}checked{% endif %}>
+                  <span class="inline-block w-3 h-3 rounded-full shrink-0" style="background-color: {{category.color|category-color}};"></span>
+                  <span>{{category.name}}</span>
+                </label>
+                {% endfor %}
+              </div>
+              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+            </div>
+          </div>
+        </th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
       </tr>
     </thead>
@@ -147,11 +172,25 @@
     });
   }
 
-  // Color-code a category dropdown with its selected category's configured color (left border, so
-  // it works regardless of how the browser renders the closed <select>'s own background).
+  // A category's configured color at low opacity, for tinting a whole row without overpowering
+  // its text. "#rrggbb" + alpha -> "rgba(r, g, b, alpha)".
+  function hexToRgba(hex, alpha) {
+    var r = parseInt(hex.substr(1, 2), 16);
+    var g = parseInt(hex.substr(3, 2), 16);
+    var b = parseInt(hex.substr(5, 2), 16);
+    return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
+  }
+  var ROW_TINT_ALPHA = 0.2;
+
+  // Color-code a category dropdown with its selected category's configured color: a left border on
+  // the dropdown itself (works regardless of how the browser renders the closed <select>'s own
+  // background), plus a subtle tint across the whole row so a category is visible at a glance.
   function applyCategoryColor(select) {
     var option = select.options[select.selectedIndex];
-    select.style.borderLeftColor = (option && option.dataset.color) || 'transparent';
+    var color = option && option.dataset.color;
+    select.style.borderLeftColor = color || 'transparent';
+    var row = select.closest('tr');
+    if (row) { row.style.backgroundColor = color ? hexToRgba(color, ROW_TINT_ALPHA) : ''; }
   }
   document.querySelectorAll('.category-select').forEach(applyCategoryColor);
 
@@ -164,6 +203,13 @@
   // Save an e-mail's language when its language field changes.
   function updateLanguage(input) {
     autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
+  }
+
+  // The Category column header's "(Select All)" checkbox in its Excel-style filter dropdown.
+  function toggleAllCategoryFilters(masterCheckbox) {
+    document.querySelectorAll('.category-filter-checkbox').forEach(function (checkbox) {
+      checkbox.checked = masterCheckbox.checked;
+    });
   }
 
   // Date range filter: a single flatpickr calendar drives the two hidden date-from/date-to fields

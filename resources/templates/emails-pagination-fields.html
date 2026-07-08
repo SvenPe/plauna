@@ -5,6 +5,9 @@
 <input type="hidden" name="search-field" value="subject" />
 <input type="hidden" name="search-text" value="{{page.search-text}}" />
 <input type="hidden" name="from-search-text" value="{{page.from-search-text}}" />
+{% for category-id in page.category-ids %}
+<input type="hidden" name="category-ids" value="{{category-id}}" />
+{% endfor %}
 <input type="hidden" name="filter" value="{{page.filter}}" />
 <input type="hidden" name="date-from" value="{{page.date-from}}" />
 <input type="hidden" name="date-to" value="{{page.date-to}}" />

@@ -64,7 +64,7 @@
 (deftest emails-query-filter-wo-search
   (let [query (atom "")
         database (reify int/DB
-                   (fetch-categories [_] {})
+                   (fetch-categories [_] [])
                    (fetch-emails [_ _ important-query]
                      (swap! query (fn [_] important-query))
                      {:total 10 :size 1 :page 1}))]
@@ -78,7 +78,7 @@
 (deftest emails-query-search-wo-filter
   (let [query (atom "")
         database (reify int/DB
-                   (fetch-categories [_] {})
+                   (fetch-categories [_] [])
                    (fetch-emails [_ _ important-query]
                      (swap! query (fn [_] important-query))
                      {:total 10 :size 1 :page 1}))]
@@ -88,7 +88,7 @@
 (deftest emails-query-search-filter
   (let [query (atom "")
         database (reify int/DB
-                   (fetch-categories [_] {})
+                   (fetch-categories [_] [])
                    (fetch-emails [_ _ important-query]
                      (swap! query (fn [_] important-query))
                      {:total 10 :size 1 :page 1}))]
@@ -388,6 +388,60 @@
     (app/fetch-emails {:db db} {:filter "all" :page 1 :size 100000})
     (is (= 500 (:size (:page @captured))) "An unbounded size is capped at 500"))
   "fetch-emails clamps a free-form page size into a safe range")
+
+(deftest fetch-emails-applies-category-ids-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids ["2" "3"] :page 1 :size 20})
+    (is (= {:where [:in :metadata.category [2 3]] :order-by [[:date :desc]]} @captured)))
+  "Selected numeric category ids are translated into an IN filter")
+
+(deftest fetch-emails-applies-uncategorized-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids [app/uncategorized-token] :page 1 :size 20})
+    (is (= {:where [:= :metadata.category nil] :order-by [[:date :desc]]} @captured)))
+  "Selecting only the 'n/a' checkbox filters to e-mails with no category")
+
+(deftest fetch-emails-applies-mixed-category-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids ["1" app/uncategorized-token] :page 1 :size 20})
+    (is (= {:where [:or [:in :metadata.category [1]] [:= :metadata.category nil]] :order-by [[:date :desc]]} @captured)))
+  "Selecting both real categories and 'n/a' ORs the two conditions together")
+
+(deftest fetch-emails-no-category-filter-when-empty
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids nil :page 1 :size 20})
+    (is (not (contains? @captured :where))))
+  "No category-ids selected (the default, before any checkbox is unchecked) adds no filter")
+
+(deftest fetch-emails-marks-selected-categories-checked
+  (let [db (reify int/DB
+             (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :category-ids ["1"] :page 1 :size 20})
+        by-name (into {} (map (juxt :name :checked?)) (:categories (:optional result)))]
+    (is (= {"Work" true "Personal" false "n/a" false} by-name)))
+  "Only the selected category (and not the others, including n/a) is marked checked")
+
+(deftest fetch-emails-marks-every-category-checked-when-unfiltered
+  (let [db (reify int/DB
+             (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :page 1 :size 20})
+        checked-flags (map :checked? (:categories (:optional result)))]
+    (is (every? true? checked-flags)))
+  "Before any checkbox is unchecked, every category (including n/a) shows as checked")
 
 (deftest fetch-emails-no-date-filter-when-blank
   (let [captured (atom nil)

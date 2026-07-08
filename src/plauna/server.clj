@@ -272,6 +272,7 @@
                       :search-field {:default "subject" :type-fn identity}
                       :search-text {:default nil :type-fn identity}
                       :from-search-text {:default nil :type-fn identity}
+                      :category-ids {:default nil :type-fn vectorize}
                       :date-from {:default nil :type-fn identity}
                       :date-to {:default nil :type-fn identity}})
 
