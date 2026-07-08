@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-08.2] - 2026-07-08
+
+### 🐛 Bug Fixes
+
+- Fix the "(Select All)" checkbox in a Subject/From/To/Category filter dropdown
+  immediately resetting the filter instead of letting you pick specific values:
+  it now only toggles the checkboxes and no longer submits by itself.
+- Fix HTTP 414 (URI Too Long) still occurring when actually narrowing a
+  Subject/From/To filter (e.g. unchecking a couple of senders out of hundreds
+  still left most of them checked). Each checklist now always submits
+  whichever side - checked or unchecked - is smaller, capping the query
+  string at roughly half the list regardless of which few values you're
+  including or excluding.
+
 ## [2026-07-08.1] - 2026-07-08
 
 ### 🐛 Bug Fixes
