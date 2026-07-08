@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-07.4] - 2026-07-07
+
+### 🚀 Features
+
+- Add an Excel-style filter to the e-mail list's "Category" column header: click it
+  to check one or more categories (plus "n/a" for uncategorized e-mails) and click
+  Apply. Every category is checked by default; a "(Select All)" toggle flips them
+  all at once, and the selection is preserved across pagination.
+- Extend category color-coding to the whole row: each e-mail list row is now tinted
+  with its category's color at 20% opacity, in addition to the dropdown's left
+  border added previously.
+
 ## [2026-07-07.3] - 2026-07-07
 
 ### 🚀 Features
