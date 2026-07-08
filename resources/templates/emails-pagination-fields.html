@@ -6,14 +6,26 @@
 {% for subject in page.subject-values %}
 <input type="hidden" name="subject-values" value="{{subject}}" />
 {% endfor %}
+{% for subject in page.subject-values-exclude %}
+<input type="hidden" name="subject-values-exclude" value="{{subject}}" />
+{% endfor %}
 {% for from-key in page.from-keys %}
 <input type="hidden" name="from-keys" value="{{from-key}}" />
+{% endfor %}
+{% for from-key in page.from-keys-exclude %}
+<input type="hidden" name="from-keys-exclude" value="{{from-key}}" />
 {% endfor %}
 {% for to-key in page.to-keys %}
 <input type="hidden" name="to-keys" value="{{to-key}}" />
 {% endfor %}
+{% for to-key in page.to-keys-exclude %}
+<input type="hidden" name="to-keys-exclude" value="{{to-key}}" />
+{% endfor %}
 {% for category-id in page.category-ids %}
 <input type="hidden" name="category-ids" value="{{category-id}}" />
+{% endfor %}
+{% for category-id in page.category-ids-exclude %}
+<input type="hidden" name="category-ids-exclude" value="{{category-id}}" />
 {% endfor %}
 <input type="hidden" name="filter" value="{{page.filter}}" />
 <input type="hidden" name="date-from" value="{{page.date-from}}" />

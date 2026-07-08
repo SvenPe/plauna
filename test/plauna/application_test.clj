@@ -365,6 +365,13 @@
     (is (not (contains? @captured :where))))
   "No subject checked (the default, before any checkbox is unchecked) adds no filter")
 
+(deftest fetch-emails-applies-subject-values-exclude-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :subject-values-exclude ["Spam"] :page 1 :size 20})
+    (is (= {:where [:not-in :headers.subject ["Spam"]] :order-by [[:date :desc]]} @captured)))
+  "Excluded subjects match every other subject")
+
 (deftest fetch-emails-applies-from-keys-filter
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
@@ -388,6 +395,40 @@
             :order-by [[:date :desc]]}
            @captured)))
   "Checked recipients are translated into a message-id semi-join by contact-key, using the receiver type")
+
+(deftest fetch-emails-applies-from-keys-exclude-filter
+  ;; Unchecking a couple of senders out of hundreds still leaves hundreds checked; the checklist UI
+  ;; submits the (few) unchecked ones under from-keys-exclude instead, so the query stays short.
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :from-keys-exclude ["key-1"] :page 1 :size 20})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:communications.message-id] :from [:communications]
+                     :where [:and [:in :communications.type ["sender" ":sender"]]
+                                  [:not-in :communications.contact-key ["key-1"]]]}]
+            :order-by [[:date :desc]]}
+           @captured)))
+  "Excluded senders are translated into a message-id semi-join matching every other sender")
+
+(deftest fetch-emails-applies-to-keys-exclude-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :to-keys-exclude ["key-3"] :page 1 :size 20})
+    (is (= {:where [:in :headers.message-id
+                    {:select [:communications.message-id] :from [:communications]
+                     :where [:and [:in :communications.type ["receiver" ":receiver"]]
+                                  [:not-in :communications.contact-key ["key-3"]]]}]
+            :order-by [[:date :desc]]}
+           @captured)))
+  "Excluded recipients are translated into a message-id semi-join matching every other recipient")
+
+(deftest fetch-emails-from-keys-include-wins-over-exclude
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :from-keys ["key-1"] :from-keys-exclude ["key-2"] :page 1 :size 20})
+    (let [where (:where @captured)]
+      (is (some #{[:in :communications.contact-key ["key-1"]]} (tree-seq coll? seq where)))))
+  "If both are somehow present, include takes precedence (the UI only ever sends one)")
 
 (deftest fetch-emails-clamps-page-size
   (let [captured (atom nil)
@@ -431,6 +472,36 @@
     (is (not (contains? @captured :where))))
   "No category-ids selected (the default, before any checkbox is unchecked) adds no filter")
 
+(deftest fetch-emails-applies-category-ids-exclude-filter
+  ;; The checklist UI submits an -exclude param instead of -ids once more than half the checkboxes
+  ;; are checked, so it never has to send hundreds of ids just to exclude a couple.
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude ["2" "3"] :page 1 :size 20})
+    (is (= {:where [:or [:not-in :metadata.category [2 3]] [:= :metadata.category nil]] :order-by [[:date :desc]]} @captured)))
+  "Excluded category ids match everything else, including uncategorized e-mails")
+
+(deftest fetch-emails-applies-category-ids-exclude-uncategorized-only
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude [app/uncategorized-token] :page 1 :size 20})
+    (is (= {:where [:<> :metadata.category nil] :order-by [[:date :desc]]} @captured)))
+  "Excluding only 'n/a' requires a real (non-null) category")
+
+(deftest fetch-emails-applies-mixed-category-exclude-filter
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude ["1" app/uncategorized-token] :page 1 :size 20})
+    (is (= {:where [:and [:<> :metadata.category nil] [:not-in :metadata.category [1]]] :order-by [[:date :desc]]} @captured)))
+  "Excluding both a real category and 'n/a' requires a non-null, non-excluded category")
+
+(deftest fetch-emails-category-include-wins-over-exclude
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids ["1"] :category-ids-exclude ["2"] :page 1 :size 20})
+    (is (= {:where [:in :metadata.category [1]] :order-by [[:date :desc]]} @captured)))
+  "If both are somehow present, include takes precedence (the UI only ever sends one)")
+
 (deftest fetch-emails-marks-selected-categories-checked
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
@@ -455,6 +526,18 @@
     (is (every? true? checked-flags)))
   "Before any checkbox is unchecked, every category (including n/a) shows as checked")
 
+(deftest fetch-emails-marks-categories-checked-in-exclude-mode
+  (let [db (reify int/DB
+             (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-distinct-subjects [_] [])
+             (fetch-distinct-senders [_] [])
+             (fetch-distinct-recipients [_] [])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude ["1"] :page 1 :size 20})
+        by-name (into {} (map (juxt :name :checked?)) (:categories (:optional result)))]
+    (is (= {"Work" false "Personal" true "n/a" true} by-name)))
+  "In exclude mode, every category is checked except the excluded one")
+
 (deftest fetch-emails-marks-selected-subjects-senders-and-recipients-checked
   (let [db (reify int/DB
              (fetch-categories [_] [])
@@ -469,6 +552,19 @@
     (is (= {"s1" false "s2" true} (into {} (map (juxt :contact_key :checked?)) (:senders optional))))
     (is (every? true? (map :checked? (:recipients optional))) "Recipients are untouched, so all show as checked"))
   "Each column filter's checked state is independent of the others")
+
+(deftest fetch-emails-marks-senders-checked-in-exclude-mode
+  (let [db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_] [])
+             (fetch-distinct-senders [_] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
+                                          {:contact_key "s2" :name "Bob" :address "bob@example.com"}])
+             (fetch-distinct-recipients [_] [])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :from-keys-exclude ["s1"] :page 1 :size 20})
+        by-key (into {} (map (juxt :contact_key :checked?)) (:senders (:optional result)))]
+    (is (= {"s1" false "s2" true} by-key)))
+  "In exclude mode, every sender is checked except the excluded one")
 
 (deftest fetch-emails-no-date-filter-when-blank
   (let [captured (atom nil)

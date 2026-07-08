@@ -33,29 +33,45 @@
      {:select [:bodies.message-id] :from [:bodies] :where (like-contains :bodies.content search-text)}]))
 
 (defn- contact-keys->where
-  "Build a where-clause matching e-mails with a participant of one of participant-types (e.g.
+  "Build a where-clause for e-mails with a participant of one of participant-types (e.g.
    [\"sender\" \":sender\"] — legacy rows may store the type with a leading colon, see the defensive
-   strip in core.email/construct-participants) whose contact-key is in selected-keys. An empty
-   selection adds no filter, same as every other filter field's 'blank means unfiltered' convention."
-  [participant-types selected-keys]
-  (when (seq selected-keys)
+   strip in core.email/construct-participants). selection is {:include [...]} to match only those
+   contact-keys, or {:exclude [...]} to match everything EXCEPT those contact-keys (the checklist UI
+   submits whichever list is shorter — see emails.html's submitFilterForm — so a mailbox with
+   hundreds of senders never has to send hundreds of query parameters just to exclude a few).
+   Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention."
+  [participant-types {:keys [include exclude]}]
+  (cond
+    (seq include)
     [:in :headers.message-id
      {:select [:communications.message-id]
       :from [:communications]
       :where [:and
               [:in :communications.type participant-types]
-              [:in :communications.contact-key selected-keys]]}]))
+              [:in :communications.contact-key include]]}]
 
-(defn- sender-keys->where [selected-keys] (contact-keys->where ["sender" ":sender"] selected-keys))
+    (seq exclude)
+    [:in :headers.message-id
+     {:select [:communications.message-id]
+      :from [:communications]
+      :where [:and
+              [:in :communications.type participant-types]
+              [:not-in :communications.contact-key exclude]]}]
 
-(defn- recipient-keys->where [selected-keys] (contact-keys->where ["receiver" ":receiver"] selected-keys))
+    :else nil))
+
+(defn- sender-keys->where [selection] (contact-keys->where ["sender" ":sender"] selection))
+
+(defn- recipient-keys->where [selection] (contact-keys->where ["receiver" ":receiver"] selection))
 
 (defn- subject-values->where
-  "An empty selection adds no filter, same as every other filter field's 'blank means unfiltered'
-   convention (also how an Excel column filter behaves before you touch it)."
-  [selected-subjects]
-  (when (seq selected-subjects)
-    [:in :headers.subject selected-subjects]))
+  "selection is {:include [...]} to match only those subjects, or {:exclude [...]} to match every
+   subject EXCEPT those (see contact-keys->where for why). Both empty adds no filter."
+  [{:keys [include exclude]}]
+  (cond
+    (seq include) [:in :headers.subject include]
+    (seq exclude) [:not-in :headers.subject exclude]
+    :else nil))
 
 (defn- date-string->epoch-seconds
   "Convert a 'YYYY-MM-DD' string to a UTC unix timestamp (seconds) at the start of that day,
@@ -90,23 +106,41 @@
    selected at all' (an absent/blank category-ids param) from 'the uncategorized bucket was selected'."
   "n-a")
 
+(defn- category-tokens->numeric-ids
+  "Parse every token except uncategorized-token as a category id; non-numeric tokens are dropped."
+  [tokens]
+  (keep (fn [token] (when (not= uncategorized-token token) (try (Integer/parseInt token) (catch NumberFormatException _ nil))))
+        tokens))
+
 (defn- category-ids->where
-  "Build a where-clause matching e-mails whose category is one of the selected ids. uncategorized-token
-   matches e-mails with no category (metadata.category IS NULL); other tokens are parsed as category
-   ids and non-numeric ones are dropped. An empty selection adds no filter, same as every other filter
-   field's 'blank means unfiltered' convention (also how an Excel column filter behaves before you
-   touch it: nothing unchecked yet, so nothing is excluded)."
-  [selected-tokens]
-  (let [include-uncategorized? (contains? (set selected-tokens) uncategorized-token)
-        numeric-ids (keep (fn [token]
-                            (when (not= uncategorized-token token)
-                              (try (Integer/parseInt token) (catch NumberFormatException _ nil))))
-                          selected-tokens)]
+  "Build a where-clause for the category checklist. uncategorized-token stands for 'no category'
+   (metadata.category IS NULL).
+   - selection's :include matches only those categories.
+   - selection's :exclude matches every category EXCEPT those (the checklist UI submits whichever
+     list is shorter — see emails.html's submitFilterForm — so this only kicks in once more than
+     half the checkboxes are checked, keeping the query string short either way).
+   Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention
+   (also how an Excel column filter behaves before you touch it: nothing unchecked yet)."
+  [{:keys [include exclude]}]
+  (let [include-uncategorized? (contains? (set include) uncategorized-token)
+        include-ids (category-tokens->numeric-ids include)
+        exclude-uncategorized? (contains? (set exclude) uncategorized-token)
+        exclude-ids (category-tokens->numeric-ids exclude)]
     (cond
-      (empty? selected-tokens) nil
-      (and include-uncategorized? (seq numeric-ids)) [:or [:in :metadata.category numeric-ids] [:= :metadata.category nil]]
-      include-uncategorized? [:= :metadata.category nil]
-      (seq numeric-ids) [:in :metadata.category numeric-ids]
+      (seq include)
+      (cond
+        (and include-uncategorized? (seq include-ids)) [:or [:in :metadata.category include-ids] [:= :metadata.category nil]]
+        include-uncategorized? [:= :metadata.category nil]
+        :else [:in :metadata.category include-ids])
+
+      (seq exclude)
+      (cond
+        ;; Excluding "n/a" too: a real, non-excluded category is required.
+        (and exclude-uncategorized? (seq exclude-ids)) [:and [:<> :metadata.category nil] [:not-in :metadata.category exclude-ids]]
+        exclude-uncategorized? [:<> :metadata.category nil]
+        ;; "n/a" is not excluded, so an uncategorized e-mail still passes alongside any non-excluded category.
+        :else [:or [:not-in :metadata.category exclude-ids] [:= :metadata.category nil]])
+
       :else nil)))
 
 (defn- success-result [result-type data] (conj {:result result-type} data))
@@ -153,36 +187,55 @@
     (catch Exception e (do (t/log! :error ["There was an error when trying to log in:" e])
                            (error-result e "There was an error when trying to log in.")))))
 
+(defn- checklist-selection
+  "Normalize a checklist filter's raw request parameters into {:include [...] :exclude [...]}.
+   Exactly one side is ever populated by the UI (see emails.html's submitFilterForm), but both are
+   defensively blank-filtered here."
+  [parameters include-key exclude-key]
+  {:include (remove str/blank? (get parameters include-key))
+   :exclude (remove str/blank? (get parameters exclude-key))})
+
 (defn- annotate-checked-by
-  "Mark every item :checked? true when selected-tokens is empty (the default, unfiltered state —
-   nothing has been unchecked yet), otherwise only the items whose (key-fn item) appears in
-   selected-tokens."
-  [items selected-tokens key-fn]
-  (let [selected (set selected-tokens)]
-    (mapv (fn [item] (assoc item :checked? (or (empty? selected) (contains? selected (str (key-fn item))))))
-          items)))
+  "Mark each item's :checked? state to match selection {:include [...] :exclude [...]}:
+   - Both empty (the default, unfiltered state — nothing has been unchecked yet): every item checked.
+   - :include non-empty: only items whose (key-fn item) appears in it are checked.
+   - :exclude non-empty: every item is checked EXCEPT those whose (key-fn item) appears in it."
+  [items {:keys [include exclude]} key-fn]
+  (cond
+    (seq include)
+    (let [selected (set include)]
+      (mapv (fn [item] (assoc item :checked? (contains? selected (str (key-fn item))))) items))
+
+    (seq exclude)
+    (let [excluded (set exclude)]
+      (mapv (fn [item] (assoc item :checked? (not (contains? excluded (str (key-fn item)))))) items))
+
+    :else
+    (mapv (fn [item] (assoc item :checked? true)) items)))
 
 (defn fetch-emails
   "Returns a list of emails. Customizable by parameters which can contain the following keys:
    :size, :page, :filter (all, enrieched-only, or without-category), :search-text (matches the
-   e-mail body content), :subject-values, :from-keys, :to-keys, :category-ids (collections of
-   selected checkbox values for the respective Excel-style column filters), :date-from, :date-to"
+   e-mail body content), :date-from, :date-to, and for each Excel-style column filter (subject,
+   from, to, category) an :xxx-values/:xxx-values-exclude (or :xxx-keys/:xxx-keys-exclude, or
+   :category-ids/:category-ids-exclude) pair of collections — the checklist UI submits whichever
+   one is shorter, so only one side is ever populated for a given filter."
   [context parameters]
   (let [db (:db context)
-        selected-category-tokens (remove str/blank? (:category-ids parameters))
-        selected-subject-values (remove str/blank? (:subject-values parameters))
-        selected-from-keys (remove str/blank? (:from-keys parameters))
-        selected-to-keys (remove str/blank? (:to-keys parameters))
-        cat-list (annotate-checked-by (categories db) selected-category-tokens #(or (:id %) uncategorized-token))
-        subject-list (annotate-checked-by (int/fetch-distinct-subjects db) selected-subject-values :subject)
-        sender-list (annotate-checked-by (int/fetch-distinct-senders db) selected-from-keys :contact_key)
-        recipient-list (annotate-checked-by (int/fetch-distinct-recipients db) selected-to-keys :contact_key)
+        category-selection (checklist-selection parameters :category-ids :category-ids-exclude)
+        subject-selection (checklist-selection parameters :subject-values :subject-values-exclude)
+        from-selection (checklist-selection parameters :from-keys :from-keys-exclude)
+        to-selection (checklist-selection parameters :to-keys :to-keys-exclude)
+        cat-list (annotate-checked-by (categories db) category-selection #(or (:id %) uncategorized-token))
+        subject-list (annotate-checked-by (int/fetch-distinct-subjects db) subject-selection :subject)
+        sender-list (annotate-checked-by (int/fetch-distinct-senders db) from-selection :contact_key)
+        recipient-list (annotate-checked-by (int/fetch-distinct-recipients db) to-selection :contact_key)
         where (combine-wheres [(filter->where (:filter parameters))
                                (content->where (:search-text parameters))
-                               (subject-values->where selected-subject-values)
-                               (sender-keys->where selected-from-keys)
-                               (recipient-keys->where selected-to-keys)
-                               (category-ids->where selected-category-tokens)
+                               (subject-values->where subject-selection)
+                               (sender-keys->where from-selection)
+                               (recipient-keys->where to-selection)
+                               (category-ids->where category-selection)
                                (date->where (:date-from parameters) (:date-to parameters))])
         customization-clause (cond-> {:order-by [[:date :desc]]}
                                where (assoc :where where))
@@ -197,10 +250,14 @@
                   :page (:page result)
                   :total (:total result)
                   :search-text (:search-text parameters)
-                  :subject-values selected-subject-values
-                  :from-keys selected-from-keys
-                  :to-keys selected-to-keys
-                  :category-ids selected-category-tokens
+                  :subject-values (:include subject-selection)
+                  :subject-values-exclude (:exclude subject-selection)
+                  :from-keys (:include from-selection)
+                  :from-keys-exclude (:exclude from-selection)
+                  :to-keys (:include to-selection)
+                  :to-keys-exclude (:exclude to-selection)
+                  :category-ids (:include category-selection)
+                  :category-ids-exclude (:exclude category-selection)
                   :date-from (:date-from parameters)
                   :date-to (:date-to parameters)}
      :optional {:categories cat-list :subjects subject-list :senders sender-list :recipients recipient-list}}))

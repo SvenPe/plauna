@@ -282,24 +282,38 @@
     document.getElementById('page-form').requestSubmit();
   }
 
-  // Each column header's "(Select All)" checkbox in its Excel-style filter dropdown.
+  // Each column header's "(Select All)" checkbox in its Excel-style filter dropdown: only toggles
+  // the individual boxes. It does NOT submit - if it did, unchecking it would immediately submit an
+  // empty selection (which means "unfiltered", not "everything excluded") before you ever get a
+  // chance to check the one or two boxes you actually wanted.
   function toggleAllInChecklist(masterCheckbox, checkboxClass) {
     document.querySelectorAll('.' + checkboxClass).forEach(function (checkbox) {
       checkbox.checked = masterCheckbox.checked;
     });
-    submitFilterForm();
   }
 
-  // A fully-checked checklist means "no filter" (every value would otherwise show as checked by
-  // default - see annotate-checked-by), so submitting it should send nothing rather than every
-  // single value: Subject/From/To can have hundreds of distinct values, and submitting them all as
-  // query parameters can exceed the server's maximum URI length (HTTP 414). A disabled checkbox is
-  // excluded from form submission entirely without changing its checked (visual) state.
+  // Subject/From/To/Category can have hundreds of distinct values, so submitting every checked box
+  // as its own query parameter can produce a URL past the server's maximum URI length (HTTP 414) -
+  // and that isn't limited to the "everything checked" case: unchecking just a couple of boxes out
+  // of hundreds still leaves hundreds checked. Whichever side is smaller carries the same
+  // information, so right before submitting, each checklist sends the checked boxes normally under
+  // its usual name (e.g. "from-keys") if checked is the smaller side, or flips to sending the
+  // UNCHECKED boxes under an "-exclude" name (e.g. "from-keys-exclude", meaning "everyone except
+  // these") when checked is the larger side - capping what's ever sent at half the list either way.
+  // Disabling a checkbox excludes it from submission entirely without changing its checked state.
   document.getElementById('page-form').addEventListener('submit', function () {
-    ['category-filter-checkbox', 'subject-filter-checkbox', 'from-filter-checkbox', 'to-filter-checkbox'].forEach(function (checkboxClass) {
-      var boxes = document.querySelectorAll('.' + checkboxClass);
-      if (boxes.length && Array.prototype.every.call(boxes, function (box) { return box.checked; })) {
-        boxes.forEach(function (box) { box.disabled = true; });
+    [['category-filter-checkbox', 'category-ids-exclude'],
+     ['subject-filter-checkbox', 'subject-values-exclude'],
+     ['from-filter-checkbox', 'from-keys-exclude'],
+     ['to-filter-checkbox', 'to-keys-exclude']].forEach(function (pair) {
+      var checkboxClass = pair[0], excludeName = pair[1];
+      var boxes = Array.prototype.slice.call(document.querySelectorAll('.' + checkboxClass));
+      if (!boxes.length) return;
+      var checked = boxes.filter(function (box) { return box.checked; });
+      var unchecked = boxes.filter(function (box) { return !box.checked; });
+      if (checked.length > unchecked.length) {
+        checked.forEach(function (box) { box.disabled = true; });
+        unchecked.forEach(function (box) { box.checked = true; box.name = excludeName; });
       }
     });
   });

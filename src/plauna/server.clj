@@ -271,9 +271,13 @@
                       :filter {:default "all" :type-fn identity}
                       :search-text {:default nil :type-fn identity}
                       :subject-values {:default nil :type-fn vectorize}
+                      :subject-values-exclude {:default nil :type-fn vectorize}
                       :from-keys {:default nil :type-fn vectorize}
+                      :from-keys-exclude {:default nil :type-fn vectorize}
                       :to-keys {:default nil :type-fn vectorize}
+                      :to-keys-exclude {:default nil :type-fn vectorize}
                       :category-ids {:default nil :type-fn vectorize}
+                      :category-ids-exclude {:default nil :type-fn vectorize}
                       :date-from {:default nil :type-fn identity}
                       :date-to {:default nil :type-fn identity}})
 
