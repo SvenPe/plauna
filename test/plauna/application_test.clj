@@ -63,14 +63,16 @@
 
 (defn- stub-emails-db
   "A reify int/DB with every method fetch-emails needs beyond fetch-emails itself: the three
-   distinct-value lookups (empty by default) plus fetch-categories. capture-fn receives the
+   distinct-value lookups and fetch-header-categories (all empty by default, ignoring whatever
+   other-filters-where they're called with) plus fetch-categories. capture-fn receives the
    customization clause passed to fetch-emails; result is what fetch-emails should return."
   [capture-fn result]
   (reify int/DB
     (fetch-categories [_] [])
-    (fetch-distinct-subjects [_] [])
-    (fetch-distinct-senders [_] [])
-    (fetch-distinct-recipients [_] [])
+    (fetch-distinct-subjects [_ _] [])
+    (fetch-distinct-senders [_ _] [])
+    (fetch-distinct-recipients [_ _] [])
+    (fetch-header-categories [_ _] [])
     (fetch-emails [_ _ customization] (capture-fn customization) result)))
 
 (deftest emails-query-filter-wo-search
@@ -319,7 +321,7 @@
     (let [where-flat (flatten (:where @captured))]
       (is (some #{:>=} where-flat) "Lower date bound is present")
       (is (some #{:<} where-flat) "Upper date bound is present")
-      (is (some #{:date} where-flat) "Filters on the date column")))
+      (is (some #{:headers.date} where-flat) "Filters on the date column")))
   "Date-from/date-to are translated into a date-range filter on the email date")
 
 (deftest fetch-emails-applies-content-search
@@ -434,9 +436,10 @@
   (let [captured (atom nil)
         db (reify int/DB
              (fetch-categories [_] [])
-             (fetch-distinct-subjects [_] [])
-             (fetch-distinct-senders [_] [])
-             (fetch-distinct-recipients [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ entity-clause _] (reset! captured entity-clause) {:data [] :total 0}))]
     (app/fetch-emails {:db db} {:filter "all" :page 1 :size 0})
     (is (= 1 (:size (:page @captured))) "A size of 0 is clamped up to 1, never an invalid LIMIT")
@@ -505,9 +508,10 @@
 (deftest fetch-emails-marks-selected-categories-checked
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
-             (fetch-distinct-subjects [_] [])
-             (fetch-distinct-senders [_] [])
-             (fetch-distinct-recipients [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :category-ids ["1"] :page 1 :size 20})
         by-name (into {} (map (juxt :name :checked?)) (:categories (:optional result)))]
@@ -517,9 +521,10 @@
 (deftest fetch-emails-marks-every-category-checked-when-unfiltered
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
-             (fetch-distinct-subjects [_] [])
-             (fetch-distinct-senders [_] [])
-             (fetch-distinct-recipients [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :page 1 :size 20})
         checked-flags (map :checked? (:categories (:optional result)))]
@@ -529,9 +534,10 @@
 (deftest fetch-emails-marks-categories-checked-in-exclude-mode
   (let [db (reify int/DB
              (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
-             (fetch-distinct-subjects [_] [])
-             (fetch-distinct-senders [_] [])
-             (fetch-distinct-recipients [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude ["1"] :page 1 :size 20})
         by-name (into {} (map (juxt :name :checked?)) (:categories (:optional result)))]
@@ -541,10 +547,11 @@
 (deftest fetch-emails-marks-selected-subjects-senders-and-recipients-checked
   (let [db (reify int/DB
              (fetch-categories [_] [])
-             (fetch-distinct-subjects [_] [{:subject "Invoice"} {:subject "Newsletter"}])
-             (fetch-distinct-senders [_] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
+             (fetch-distinct-subjects [_ _] [{:subject "Invoice"} {:subject "Newsletter"}])
+             (fetch-distinct-senders [_ _] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
                                           {:contact_key "s2" :name "Bob" :address "bob@example.com"}])
-             (fetch-distinct-recipients [_] [{:contact_key "r1" :name "Me" :address "me@example.com"}])
+             (fetch-distinct-recipients [_ _] [{:contact_key "r1" :name "Me" :address "me@example.com"}])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :subject-values ["Invoice"] :from-keys ["s2"] :page 1 :size 20})
         optional (:optional result)]
@@ -556,15 +563,69 @@
 (deftest fetch-emails-marks-senders-checked-in-exclude-mode
   (let [db (reify int/DB
              (fetch-categories [_] [])
-             (fetch-distinct-subjects [_] [])
-             (fetch-distinct-senders [_] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [{:contact_key "s1" :name "Alice" :address "alice@example.com"}
                                           {:contact_key "s2" :name "Bob" :address "bob@example.com"}])
-             (fetch-distinct-recipients [_] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
              (fetch-emails [_ _ _] {:data [] :total 0}))
         result (app/fetch-emails {:db db} {:filter "all" :from-keys-exclude ["s1"] :page 1 :size 20})
         by-key (into {} (map (juxt :contact_key :checked?)) (:senders (:optional result)))]
     (is (= {"s1" false "s2" true} by-key)))
   "In exclude mode, every sender is checked except the excluded one")
+
+(deftest fetch-emails-scopes-from-checklist-to-other-active-filters
+  ;; The From checklist's possible values must reflect every OTHER active filter (here, category),
+  ;; but never the From filter's own selection - otherwise picking a sender would immediately narrow
+  ;; the From dropdown down to just that one sender.
+  (let [captured-where (atom :not-called)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ where] (reset! captured-where where) [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
+             (fetch-emails [_ _ _] {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids ["1"] :from-keys ["some-key"] :page 1 :size 20})
+    (is (= [:in :metadata.category [1]] @captured-where)
+        "Scoped to the category filter only; the From filter itself is not applied to its own checklist"))
+  "Each checklist's possible-values query excludes its own filter but keeps every other active one")
+
+(deftest fetch-emails-scopes-subject-checklist-to-other-active-filters
+  (let [captured-where (atom :not-called)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_ where] (reset! captured-where where) [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
+             (fetch-emails [_ _ _] {:data [] :total 0}))]
+    (app/fetch-emails {:db db} {:filter "all" :from-keys ["some-key"] :subject-values ["Invoice"] :page 1 :size 20})
+    (let [flat (tree-seq coll? seq @captured-where)]
+      (is (some #{"some-key"} flat) "The From filter is applied")
+      (is (not (some #{"Invoice"} flat)) "The Subject filter's own selection is not applied to its own checklist")))
+  "The Subject checklist is scoped by From but not by its own selection")
+
+(deftest fetch-emails-scopes-category-checklist-to-other-active-filters
+  (let [captured-where (atom :not-called)
+        db (reify int/DB
+             (fetch-categories [_] [{:id 1 :name "Work"} {:id 2 :name "Personal"}])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ where] (reset! captured-where where) [{:category 1}])
+             (fetch-emails [_ _ _] {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:filter "all" :from-keys ["alice-key"] :page 1 :size 20})]
+    (is (= [:in :headers.message-id
+            {:select [:communications.message-id] :from [:communications]
+             :where [:and [:in :communications.type ["sender" ":sender"]] [:in :communications.contact-key ["alice-key"]]]}]
+           @captured-where)
+        "The category checklist's reachable set is scoped by the From filter")
+    (is (= ["Work"] (mapv :name (:category-filter-options (:optional result))))
+        "Only categories fetch-header-categories reports as reachable appear in the checklist")
+    (is (= #{"Work" "Personal" "n/a"} (into #{} (map :name) (:categories (:optional result))))
+        "The per-row reassignment dropdown (:categories) is never narrowed"))
+  "The Category checklist narrows to reachable categories; the per-row assignment dropdown does not")
 
 (deftest fetch-emails-no-date-filter-when-blank
   (let [captured (atom nil)
@@ -590,5 +651,5 @@
         (is (some #{:headers.subject} flat) "Subject filter present")
         (is (some #{"sender" ":sender"} flat) "From filter present")
         (is (some #{"receiver" ":receiver"} flat) "To filter present")
-        (is (some #{:date} flat) "Date filter present"))))
+        (is (some #{:headers.date} flat) "Date filter present"))))
   "All filters (metadata, content search, subject, from, to, category, date) combine with AND")

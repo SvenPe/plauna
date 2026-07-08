@@ -83,14 +83,17 @@
 
 (defn- date->where
   "Build a where-clause filtering headers.date (stored as unix seconds) between the given dates.
-   Either bound may be blank/nil. The upper bound is inclusive of the whole 'to' day."
+   Either bound may be blank/nil. The upper bound is inclusive of the whole 'to' day. Uses the fully
+   qualified column (rather than relying on database.clj's key-lookup postwalk, which only runs for
+   the main e-mail-list query) so this fragment can also be reused directly in the checklist filters'
+   scoped distinct-value queries — see other-filters-where."
   [date-from date-to]
   (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false))
         to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true))]
     (cond
-      (and from to) [:and [:>= :date from] [:< :date to]]
-      from [:>= :date from]
-      to [:< :date to]
+      (and from to) [:and [:>= :headers.date from] [:< :headers.date to]]
+      from [:>= :headers.date from]
+      to [:< :headers.date to]
       :else nil)))
 
 (defn- combine-wheres
@@ -213,23 +216,53 @@
     :else
     (mapv (fn [item] (assoc item :checked? true)) items)))
 
+(defn- other-filters-where
+  "Combine every active filter's where-clause EXCEPT the one named by excluding (one of :category
+   :subject :from :to). This scopes a column filter's checklist to values that are still reachable
+   given every OTHER active filter — e.g. once a category is picked, the From checklist only offers
+   senders who actually have mail in that category — the same way Excel's own AutoFilter narrows a
+   column's dropdown as other filters are applied."
+  [parameters excluding category-selection subject-selection from-selection to-selection]
+  (combine-wheres
+   [(filter->where (:filter parameters))
+    (content->where (:search-text parameters))
+    (when-not (= excluding :subject) (subject-values->where subject-selection))
+    (when-not (= excluding :from) (sender-keys->where from-selection))
+    (when-not (= excluding :to) (recipient-keys->where to-selection))
+    (when-not (= excluding :category) (category-ids->where category-selection))
+    (date->where (:date-from parameters) (:date-to parameters))]))
+
+(defn- reachable-category-tokens
+  "The set of category tokens (a numeric id, stringified, or uncategorized-token) that occur among
+   headers matching other-filters-where."
+  [db other-filters-where]
+  (into #{} (map (fn [row] (str (or (:category row) uncategorized-token))))
+        (int/fetch-header-categories db other-filters-where)))
+
 (defn fetch-emails
   "Returns a list of emails. Customizable by parameters which can contain the following keys:
    :size, :page, :filter (all, enrieched-only, or without-category), :search-text (matches the
    e-mail body content), :date-from, :date-to, and for each Excel-style column filter (subject,
    from, to, category) an :xxx-values/:xxx-values-exclude (or :xxx-keys/:xxx-keys-exclude, or
    :category-ids/:category-ids-exclude) pair of collections — the checklist UI submits whichever
-   one is shorter, so only one side is ever populated for a given filter."
+   one is shorter, so only one side is ever populated for a given filter.
+
+   Each column filter's checklist of possible values is scoped to what's still reachable given every
+   OTHER active filter (see other-filters-where), except the per-row category reassignment dropdown
+   (:categories in the result), which always offers every category regardless of the list's filter."
   [context parameters]
   (let [db (:db context)
         category-selection (checklist-selection parameters :category-ids :category-ids-exclude)
         subject-selection (checklist-selection parameters :subject-values :subject-values-exclude)
         from-selection (checklist-selection parameters :from-keys :from-keys-exclude)
         to-selection (checklist-selection parameters :to-keys :to-keys-exclude)
+        other-where (partial other-filters-where parameters)
         cat-list (annotate-checked-by (categories db) category-selection #(or (:id %) uncategorized-token))
-        subject-list (annotate-checked-by (int/fetch-distinct-subjects db) subject-selection :subject)
-        sender-list (annotate-checked-by (int/fetch-distinct-senders db) from-selection :contact_key)
-        recipient-list (annotate-checked-by (int/fetch-distinct-recipients db) to-selection :contact_key)
+        reachable-categories (reachable-category-tokens db (other-where :category category-selection subject-selection from-selection to-selection))
+        category-filter-options (filterv #(contains? reachable-categories (str (or (:id %) uncategorized-token))) cat-list)
+        subject-list (annotate-checked-by (int/fetch-distinct-subjects db (other-where :subject category-selection subject-selection from-selection to-selection)) subject-selection :subject)
+        sender-list (annotate-checked-by (int/fetch-distinct-senders db (other-where :from category-selection subject-selection from-selection to-selection)) from-selection :contact_key)
+        recipient-list (annotate-checked-by (int/fetch-distinct-recipients db (other-where :to category-selection subject-selection from-selection to-selection)) to-selection :contact_key)
         where (combine-wheres [(filter->where (:filter parameters))
                                (content->where (:search-text parameters))
                                (subject-values->where subject-selection)
@@ -260,7 +293,8 @@
                   :category-ids-exclude (:exclude category-selection)
                   :date-from (:date-from parameters)
                   :date-to (:date-to parameters)}
-     :optional {:categories cat-list :subjects subject-list :senders sender-list :recipients recipient-list}}))
+     :optional {:categories cat-list :category-filter-options category-filter-options
+                :subjects subject-list :senders sender-list :recipients recipient-list}}))
 
 (defn create-new-category! [context category destination-folder color]
   (let [db (:db context)

@@ -89,3 +89,43 @@
     (is (contains? recipient-keys "recipient-key"))
     (is (not (contains? recipient-keys "sender-key")) "A sender is not listed as a recipient")))
 
+(deftest distinct-subjects-scoped-by-other-filters-where
+  ;; Faceted filtering: once another column filter (here, category) is active, the Subject
+  ;; checklist should only offer subjects that actually occur under that filter.
+  (db/save-headers [{:mime-type "text/plain" :subject "Facet Subject In Category" :message-id "facet-subj-1" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "Facet Subject Elsewhere" :message-id "facet-subj-2" :date 0 :in-reply-to nil}])
+  (db/update-metadata-category "facet-subj-1" 999 1.0)
+  (db/update-metadata-category "facet-subj-2" nil 1.0)
+  (let [scoped (set (map :subject (db/distinct-subjects [:= :metadata.category 999])))]
+    (is (contains? scoped "Facet Subject In Category"))
+    (is (not (contains? scoped "Facet Subject Elsewhere")) "A subject outside the scoping filter is excluded")))
+
+(deftest distinct-senders-scoped-by-other-filters-where
+  (db/save-headers [{:mime-type "text/plain" :subject "s" :message-id "facet-sender-1" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "s" :message-id "facet-sender-2" :date 0 :in-reply-to nil}])
+  (db/save-contacts [{:contact-key "facet-sender-key-a" :name "A" :address "a@example.com"}
+                      {:contact-key "facet-sender-key-b" :name "B" :address "b@example.com"}])
+  (db/save-communications [{:message-id "facet-sender-1" :contact-key "facet-sender-key-a" :type :sender}
+                            {:message-id "facet-sender-2" :contact-key "facet-sender-key-b" :type :sender}])
+  (db/update-metadata-category "facet-sender-1" 998 1.0)
+  (db/update-metadata-category "facet-sender-2" nil 1.0)
+  (let [scoped (set (map :contact_key (db/distinct-senders [:= :metadata.category 998])))]
+    (is (contains? scoped "facet-sender-key-a"))
+    (is (not (contains? scoped "facet-sender-key-b")) "A sender outside the scoping filter is excluded")))
+
+(deftest distinct-header-categories-returns-reachable-categories
+  (db/save-headers [{:mime-type "text/plain" :subject "s" :message-id "facet-cat-1" :date 0 :in-reply-to nil}
+                     {:mime-type "text/plain" :subject "s" :message-id "facet-cat-2" :date 0 :in-reply-to nil}])
+  (db/save-contacts [{:contact-key "facet-cat-sender" :name "A" :address "a@example.com"}])
+  (db/save-communications [{:message-id "facet-cat-1" :contact-key "facet-cat-sender" :type :sender}])
+  (db/update-metadata-category "facet-cat-1" 997 1.0)
+  (db/update-metadata-category "facet-cat-2" 996 1.0)
+  (let [scoping-where [:in :headers.message-id
+                       {:select [:communications.message-id] :from [:communications]
+                        :where [:= :communications.contact-key "facet-cat-sender"]}]
+        reachable (set (map :category (db/distinct-header-categories scoping-where)))
+        unscoped (set (map :category (db/distinct-header-categories nil)))]
+    (is (= #{997} reachable) "Only the category reachable through the sender-scoped where-clause is returned")
+    (is (contains? unscoped 997))
+    (is (contains? unscoped 996) "Without a scoping where-clause, every category is reachable")))
+

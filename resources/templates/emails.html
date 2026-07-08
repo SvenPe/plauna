@@ -70,19 +70,19 @@
               <strong>Subject</strong>
               <span aria-hidden="true">▾</span>
             </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
-              <input type="text" class="input input-sm mb-2" placeholder="Search subjects..." oninput="filterChecklist(this, 'subject-checklist')">
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search subjects..." oninput="filterChecklist(this, 'subject-checklist')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
-                <input type="checkbox" class="checkbox checkbox-sm" id="subject-filter-select-all"
+                <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="subject-filter-select-all"
                        onclick="toggleAllInChecklist(this, 'subject-filter-checkbox')" {% if page.subject-values|empty? %}checked{% endif %}>
                 <span class="font-semibold">(Select All)</span>
               </label>
-              <div id="subject-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+              <div id="subject-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
                 {% for subject-row in subjects %}
-                <label class="flex items-center gap-2" title="{{subject-row.subject}}">
-                  <input type="checkbox" class="checkbox checkbox-sm subject-filter-checkbox" name="subject-values"
+                <label class="flex items-center gap-2 min-w-0" title="{{subject-row.subject}}">
+                  <input type="checkbox" class="checkbox checkbox-sm subject-filter-checkbox shrink-0" name="subject-values"
                          value="{{subject-row.subject}}" form="page-form" onchange="submitFilterForm()" {% if subject-row.checked? %}checked{% endif %}>
-                  <span>{{subject-row.subject|abbreviate:40}}</span>
+                  <span class="truncate">{{subject-row.subject}}</span>
                 </label>
                 {% endfor %}
               </div>
@@ -96,19 +96,19 @@
               <strong>From</strong>
               <span aria-hidden="true">▾</span>
             </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
-              <input type="text" class="input input-sm mb-2" placeholder="Search senders..." oninput="filterChecklist(this, 'from-checklist')">
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search senders..." oninput="filterChecklist(this, 'from-checklist')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
-                <input type="checkbox" class="checkbox checkbox-sm" id="from-filter-select-all"
+                <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="from-filter-select-all"
                        onclick="toggleAllInChecklist(this, 'from-filter-checkbox')" {% if page.from-keys|empty? %}checked{% endif %}>
                 <span class="font-semibold">(Select All)</span>
               </label>
-              <div id="from-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+              <div id="from-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
                 {% for sender in senders %}
-                <label class="flex items-center gap-2" title="{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}">
-                  <input type="checkbox" class="checkbox checkbox-sm from-filter-checkbox" name="from-keys"
+                <label class="flex items-center gap-2 min-w-0" title="{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}">
+                  <input type="checkbox" class="checkbox checkbox-sm from-filter-checkbox shrink-0" name="from-keys"
                          value="{{sender.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if sender.checked? %}checked{% endif %}>
-                  <span>{% if sender.name %}{{sender.name}} - {{sender.address|abbreviate:30}}{% else %}{{sender.address|abbreviate:30}}{% endif %}</span>
+                  <span class="truncate">{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}</span>
                 </label>
                 {% endfor %}
               </div>
@@ -122,19 +122,19 @@
               <strong>To</strong>
               <span aria-hidden="true">▾</span>
             </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-64 p-3">
-              <input type="text" class="input input-sm mb-2" placeholder="Search recipients..." oninput="filterChecklist(this, 'to-checklist')">
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search recipients..." oninput="filterChecklist(this, 'to-checklist')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
-                <input type="checkbox" class="checkbox checkbox-sm" id="to-filter-select-all"
+                <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="to-filter-select-all"
                        onclick="toggleAllInChecklist(this, 'to-filter-checkbox')" {% if page.to-keys|empty? %}checked{% endif %}>
                 <span class="font-semibold">(Select All)</span>
               </label>
-              <div id="to-checklist" class="max-h-56 overflow-y-auto flex flex-col gap-1">
+              <div id="to-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
                 {% for recipient in recipients %}
-                <label class="flex items-center gap-2" title="{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}">
-                  <input type="checkbox" class="checkbox checkbox-sm to-filter-checkbox" name="to-keys"
+                <label class="flex items-center gap-2 min-w-0" title="{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}">
+                  <input type="checkbox" class="checkbox checkbox-sm to-filter-checkbox shrink-0" name="to-keys"
                          value="{{recipient.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if recipient.checked? %}checked{% endif %}>
-                  <span>{% if recipient.name %}{{recipient.name}} - {{recipient.address|abbreviate:30}}{% else %}{{recipient.address|abbreviate:30}}{% endif %}</span>
+                  <span class="truncate">{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}</span>
                 </label>
                 {% endfor %}
               </div>
@@ -150,19 +150,19 @@
               <strong>Category</strong>
               <span aria-hidden="true">▾</span>
             </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-56 p-3">
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-72 max-w-[90vw] p-3">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
-                <input type="checkbox" class="checkbox checkbox-sm" id="category-filter-select-all"
+                <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="category-filter-select-all"
                        onclick="toggleAllInChecklist(this, 'category-filter-checkbox')" {% if page.category-ids|empty? %}checked{% endif %}>
                 <span class="font-semibold">(Select All)</span>
               </label>
-              <div class="max-h-56 overflow-y-auto flex flex-col gap-1">
-                {% for category in categories %}
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" class="checkbox checkbox-sm category-filter-checkbox" name="category-ids"
+              <div class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
+                {% for category in category-filter-options %}
+                <label class="flex items-center gap-2 min-w-0" title="{{category.name}}">
+                  <input type="checkbox" class="checkbox checkbox-sm category-filter-checkbox shrink-0" name="category-ids"
                          value="{{category.id|default:"n-a"}}" form="page-form" onchange="submitFilterForm()" {% if category.checked? %}checked{% endif %}>
                   <span class="inline-block w-3 h-3 rounded-full shrink-0" style="background-color: {{category.color|category-color}};"></span>
-                  <span>{{category.name}}</span>
+                  <span class="truncate">{{category.name}}</span>
                 </label>
                 {% endfor %}
               </div>

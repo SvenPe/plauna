@@ -345,36 +345,67 @@
    could mean tens of thousands of DOM nodes on a large mailbox."
   500)
 
-(defn distinct-subjects []
-  (let [result (jdbc/execute! (ds) (honey/format {:select-distinct [:subject]
-                                                   :from [:headers]
-                                                   :where [:and [:is-not :subject nil] [:<> :subject ""]]
-                                                   :order-by [[:subject :asc]]
-                                                   :limit distinct-value-limit})
-                              builder-function)]
-    (when (= distinct-value-limit (count result))
-      (t/log! :info ["Subject filter: more than" distinct-value-limit "distinct subjects exist; showing only the first" distinct-value-limit]))
-    result))
+(defn distinct-subjects
+  "Distinct, non-blank subjects. other-filters-where (a honeysql where-clause built from the OTHER
+   active column filters, or nil) scopes the list to subjects that are still reachable given those
+   filters — e.g. once a category is picked, only subjects that occur in that category are offered —
+   the same way Excel's own AutoFilter narrows a column's dropdown as other filters are applied.
+   The join to metadata exists only so other-filters-where can reference metadata columns."
+  ([] (distinct-subjects nil))
+  ([other-filters-where]
+   (let [base-cond [:and [:is-not :headers.subject nil] [:<> :headers.subject ""]]
+         result (jdbc/execute! (ds) (honey/format {:select-distinct [:headers.subject]
+                                                    :from [:headers]
+                                                    :left-join [:metadata [:= :headers.message-id :metadata.message-id]]
+                                                    :where (if other-filters-where [:and base-cond other-filters-where] base-cond)
+                                                    :order-by [[:headers.subject :asc]]
+                                                    :limit distinct-value-limit})
+                                builder-function)]
+     (when (= distinct-value-limit (count result))
+       (t/log! :info ["Subject filter: more than" distinct-value-limit "distinct subjects exist; showing only the first" distinct-value-limit]))
+     result)))
 
 (defn- distinct-contacts-by-type
   "Distinct (contact-key, name, address) contacts that appear with any of participant-types
    (e.g. [\"sender\" \":sender\"] — legacy rows may store the type with a leading colon, see the
-   defensive strip in core.email/construct-participants)."
-  [participant-types]
-  (let [result (jdbc/execute! (ds) (honey/format {:select-distinct [:contacts.contact-key :contacts.name :contacts.address]
-                                                   :from [:contacts]
-                                                   :join [:communications [:= :communications.contact-key :contacts.contact-key]]
-                                                   :where [:in :communications.type participant-types]
-                                                   :order-by [[:contacts.address :asc]]
-                                                   :limit distinct-value-limit})
-                              builder-function)]
-    (when (= distinct-value-limit (count result))
-      (t/log! :info ["Contact filter: more than" distinct-value-limit "distinct contacts exist for types" participant-types "; showing only the first" distinct-value-limit]))
-    result))
+   defensive strip in core.email/construct-participants). other-filters-where scopes the list to
+   contacts still reachable given the OTHER active column filters — see distinct-subjects."
+  ([participant-types] (distinct-contacts-by-type participant-types nil))
+  ([participant-types other-filters-where]
+   (let [type-cond [:in :communications.type participant-types]
+         result (jdbc/execute! (ds) (honey/format {:select-distinct [:contacts.contact-key :contacts.name :contacts.address]
+                                                    :from [:contacts]
+                                                    :join [:communications [:= :communications.contact-key :contacts.contact-key]
+                                                           :headers [:= :headers.message-id :communications.message-id]]
+                                                    :left-join [:metadata [:= :headers.message-id :metadata.message-id]]
+                                                    :where (if other-filters-where [:and type-cond other-filters-where] type-cond)
+                                                    :order-by [[:contacts.address :asc]]
+                                                    :limit distinct-value-limit})
+                                builder-function)]
+     (when (= distinct-value-limit (count result))
+       (t/log! :info ["Contact filter: more than" distinct-value-limit "distinct contacts exist for types" participant-types "; showing only the first" distinct-value-limit]))
+     result)))
 
-(defn distinct-senders [] (distinct-contacts-by-type ["sender" ":sender"]))
+(defn distinct-senders
+  ([] (distinct-contacts-by-type ["sender" ":sender"]))
+  ([other-filters-where] (distinct-contacts-by-type ["sender" ":sender"] other-filters-where)))
 
-(defn distinct-recipients [] (distinct-contacts-by-type ["receiver" ":receiver"]))
+(defn distinct-recipients
+  ([] (distinct-contacts-by-type ["receiver" ":receiver"]))
+  ([other-filters-where] (distinct-contacts-by-type ["receiver" ":receiver"] other-filters-where)))
+
+(defn distinct-header-categories
+  "Distinct metadata.category values (a real category id, or nil for uncategorized) among headers
+   matching other-filters-where (or every header, if nil). Used to scope the Category filter's
+   checklist to categories still reachable given the OTHER active column filters — see
+   distinct-subjects — since categories themselves come from a small, separate table rather than
+   being read off the headers/metadata rows directly."
+  [other-filters-where]
+  (jdbc/execute! (ds) (honey/format (cond-> {:select-distinct [:metadata.category]
+                                             :from [:headers]
+                                             :left-join [:metadata [:= :headers.message-id :metadata.message-id]]}
+                                     other-filters-where (assoc :where other-filters-where)))
+                 builder-function))
 
 (defn get-languages []
   (jdbc/execute! (ds) ["select language from metadata group by language"] builder-function))
@@ -666,9 +697,10 @@
   (fetch-oauth-token-data [_ connection-id] (get-oauth-tokens connection-id))
   (fetch-auth-provider [_ id] (get-auth-provider id))
   (fetch-categories [_] (get-categories))
-  (fetch-distinct-subjects [_] (distinct-subjects))
-  (fetch-distinct-senders [_] (distinct-senders))
-  (fetch-distinct-recipients [_] (distinct-recipients))
+  (fetch-distinct-subjects [_ other-filters-where] (distinct-subjects other-filters-where))
+  (fetch-distinct-senders [_ other-filters-where] (distinct-senders other-filters-where))
+  (fetch-distinct-recipients [_ other-filters-where] (distinct-recipients other-filters-where))
+  (fetch-header-categories [_ other-filters-where] (distinct-header-categories other-filters-where))
   (fetch-emails [_ entity customization] (fetch-data entity customization))
   (save-category [_ category-name destination-folder color] (create-category category-name destination-folder color))
   (update-category [_ id destination-folder color] (update-category id destination-folder color))
