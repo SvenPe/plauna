@@ -81,7 +81,7 @@
                 {% for subject-row in subjects %}
                 <label class="flex items-center gap-2" title="{{subject-row.subject}}">
                   <input type="checkbox" class="checkbox checkbox-sm subject-filter-checkbox" name="subject-values"
-                         value="{{subject-row.subject}}" form="page-form" {% if subject-row.checked? %}checked{% endif %}>
+                         value="{{subject-row.subject}}" form="page-form" onchange="submitFilterForm()" {% if subject-row.checked? %}checked{% endif %}>
                   <span>{{subject-row.subject|abbreviate:40}}</span>
                 </label>
                 {% endfor %}
@@ -107,7 +107,7 @@
                 {% for sender in senders %}
                 <label class="flex items-center gap-2" title="{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}">
                   <input type="checkbox" class="checkbox checkbox-sm from-filter-checkbox" name="from-keys"
-                         value="{{sender.contact_key}}" form="page-form" {% if sender.checked? %}checked{% endif %}>
+                         value="{{sender.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if sender.checked? %}checked{% endif %}>
                   <span>{% if sender.name %}{{sender.name}} - {{sender.address|abbreviate:30}}{% else %}{{sender.address|abbreviate:30}}{% endif %}</span>
                 </label>
                 {% endfor %}
@@ -133,7 +133,7 @@
                 {% for recipient in recipients %}
                 <label class="flex items-center gap-2" title="{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}">
                   <input type="checkbox" class="checkbox checkbox-sm to-filter-checkbox" name="to-keys"
-                         value="{{recipient.contact_key}}" form="page-form" {% if recipient.checked? %}checked{% endif %}>
+                         value="{{recipient.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if recipient.checked? %}checked{% endif %}>
                   <span>{% if recipient.name %}{{recipient.name}} - {{recipient.address|abbreviate:30}}{% else %}{{recipient.address|abbreviate:30}}{% endif %}</span>
                 </label>
                 {% endfor %}
@@ -160,7 +160,7 @@
                 {% for category in categories %}
                 <label class="flex items-center gap-2">
                   <input type="checkbox" class="checkbox checkbox-sm category-filter-checkbox" name="category-ids"
-                         value="{{category.id|default:"n-a"}}" form="page-form" {% if category.checked? %}checked{% endif %}>
+                         value="{{category.id|default:"n-a"}}" form="page-form" onchange="submitFilterForm()" {% if category.checked? %}checked{% endif %}>
                   <span class="inline-block w-3 h-3 rounded-full shrink-0" style="background-color: {{category.color|category-color}};"></span>
                   <span>{{category.name}}</span>
                 </label>
@@ -275,12 +275,34 @@
     autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
   }
 
+  // Checking or unchecking a box in a Subject/From/To/Category filter dropdown applies the filter
+  // immediately - no separate "Apply" click needed. The Apply button stays as a fallback for
+  // keyboard use or if JavaScript fails to load.
+  function submitFilterForm() {
+    document.getElementById('page-form').requestSubmit();
+  }
+
   // Each column header's "(Select All)" checkbox in its Excel-style filter dropdown.
   function toggleAllInChecklist(masterCheckbox, checkboxClass) {
     document.querySelectorAll('.' + checkboxClass).forEach(function (checkbox) {
       checkbox.checked = masterCheckbox.checked;
     });
+    submitFilterForm();
   }
+
+  // A fully-checked checklist means "no filter" (every value would otherwise show as checked by
+  // default - see annotate-checked-by), so submitting it should send nothing rather than every
+  // single value: Subject/From/To can have hundreds of distinct values, and submitting them all as
+  // query parameters can exceed the server's maximum URI length (HTTP 414). A disabled checkbox is
+  // excluded from form submission entirely without changing its checked (visual) state.
+  document.getElementById('page-form').addEventListener('submit', function () {
+    ['category-filter-checkbox', 'subject-filter-checkbox', 'from-filter-checkbox', 'to-filter-checkbox'].forEach(function (checkboxClass) {
+      var boxes = document.querySelectorAll('.' + checkboxClass);
+      if (boxes.length && Array.prototype.every.call(boxes, function (box) { return box.checked; })) {
+        boxes.forEach(function (box) { box.disabled = true; });
+      }
+    });
+  });
 
   // The search box at the top of a Subject/From/To filter dropdown: narrows the (possibly long)
   // checklist to matching entries, purely client-side - the underlying filter is still whichever
