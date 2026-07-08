@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-08.1] - 2026-07-08
+
+### 🐛 Bug Fixes
+
+- Fix HTTP 414 (URI Too Long) when using the Subject/From/To filter checklists on
+  a mailbox with many distinct senders or recipients: a fully-checked checklist
+  (the default, unfiltered state) no longer submits every individual value.
+- Checking or unchecking a box in the Subject/From/To/Category filter dropdowns
+  now applies the filter immediately, instead of requiring a scroll down to the
+  Apply button.
+
 ## [2026-07-08.0] - 2026-07-08
 
 ### 🚀 Features
