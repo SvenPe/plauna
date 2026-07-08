@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-08.0] - 2026-07-08
+
+### 🚀 Features
+
+- Add Excel-style checklist filters to the e-mail list's "Subject", "From", and
+  "To" column headers, matching the existing "Category" filter: check one or
+  more distinct values and click Apply. Each dropdown includes a search box to
+  narrow a long list of values, since unlike categories these can number in
+  the hundreds.
+- The "Search Text" field now matches e-mail body content instead of the
+  subject, since Subject filtering moved to its own column header filter.
+
 ## [2026-07-07.4] - 2026-07-07
 
 ### 🚀 Features
