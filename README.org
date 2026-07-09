@@ -36,6 +36,8 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Re-fetch an individual e-mail from the IMAP server to fill in content that was missed when it was first read.
 
+- Automatic catch-up on reconnect: because live monitoring relies on IMAP IDLE (which only pushes mail that arrives while connected), every time a connection is (re)established - at startup, after a manual reconnect, or after the health check restores a dropped connection - Plauna re-reads the most recent messages in the monitored folder to save and categorize anything that arrived while it was offline. Already-stored e-mails are skipped, so nothing is duplicated. For a gap larger than that window, use the manual folder Parse.
+
 
 * What Plauna is NOT
 

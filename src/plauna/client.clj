@@ -426,7 +426,7 @@
                     (db/update-email-folder message-id target-folder-name)
                     true
                     (finally
-                      (schedule-health-checks (start-monitoring connection-data context)))))
+                      (schedule-health-checks (start-monitoring connection-data context) context))))
                 (do
                   (set-messages-as-peek found-messages)
                   (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
@@ -481,6 +481,31 @@
     (add-to-connections connection-data)
     connection-data))
 
+(def backfill-message-limit
+  "On every (re)connect, re-read at most this many of the most recent messages from the monitored
+   folder so mail delivered while the IDLE monitor was down — a dropped connection the health check
+   later restores, or the container being restarted — is still saved and categorized. IMAP IDLE only
+   pushes messages that arrive while it is connected, so without this a gap is lost until a manual
+   folder parse. Bounded because it runs on every connect: already-saved messages are skipped (see
+   plauna.application/incoming-email-workflow), so only the genuinely-missed messages do real work.
+   A gap larger than this window is still recoverable with the manual folder Parse control."
+  200)
+
+(defn backfill-monitored-folder!
+  "Catch up on mail missed while the monitor was disconnected by re-reading the most recent messages
+   of the monitored folder over a dedicated bulk-read connection (so the live IDLE monitor is left
+   undisturbed). Safe to call on every (re)connect: messages already in the database are skipped, so
+   this only saves and moves the ones that were actually missed. Processing happens asynchronously."
+  [^ConnectionData connection-data context]
+  (let [folder-name (monitor-folder-name (-> connection-data :config :folder))]
+    (try
+      (t/log! :info ["Backfilling up to" backfill-message-limit "recent messages from" folder-name "to catch up on any mail missed while disconnected."])
+      (app/read-emails-from-folder connection-data folder-name
+                                   {:move? true :limit backfill-message-limit}
+                                   context)
+      (catch Exception e
+        (t/log! {:level :error :error e} ["Could not back-fill missed messages from" folder-name])))))
+
 (defn disconnect [^AutoCloseable connection-data] (.close connection-data))
 
 (defn disconnect-all [] (doseq [connection (vals @connections)] (disconnect connection)))
@@ -530,7 +555,7 @@
     (t/log! :info "Could not create directories on the IMAP server: The store is not connected."))
   connection-data)
 
-(defn schedule-health-checks [^ConnectionData connection-data]
+(defn schedule-health-checks [^ConnectionData connection-data context]
   (let [^Store store (:store connection-data)
         ^Folder folder (:folder connection-data)
         config (:config connection-data)
@@ -542,7 +567,12 @@
                                                       (t/log! :debug "Store is still connected.")
                                                       (do
                                                         (t/log! :warn "Connection lost. Reconnecting to email server...")
-                                                        (reconnect connection-data)))
+                                                        (reconnect connection-data)
+                                                        ;; The monitor was down for at least one interval, so mail may have
+                                                        ;; arrived without an IDLE push. Back-fill it now that we're back
+                                                        ;; (only if the reconnect actually restored the store).
+                                                        (when (.isConnected store)
+                                                          (backfill-monitored-folder! connection-data context))))
                                                     (t/log! :debug ["Checking if the folder " (:folder config) "is open"])
                                                     (if (.isOpen folder)
                                                       (t/log! :debug "Folder is still open.")
@@ -620,15 +650,19 @@
 
 (defmethod connect "oauth2" [connection-config context]
   (refresh-access-token connection-config)
-  (try (-> (construct-connection-data connection-config context)
-           (start-monitoring context)
-           schedule-health-checks)
+  (try (let [connection-data (-> (construct-connection-data connection-config context)
+                                 (start-monitoring context)
+                                 (schedule-health-checks context))]
+         (backfill-monitored-folder! connection-data context)
+         connection-data)
        (catch AuthenticationFailedException e (t/log! :error e))))
 
 (defmethod connect :default [connection-config context]
-  (-> (construct-connection-data connection-config context)
-      (start-monitoring context)
-      schedule-health-checks))
+  (let [connection-data (-> (construct-connection-data connection-config context)
+                            (start-monitoring context)
+                            (schedule-health-checks context))]
+    (backfill-monitored-folder! connection-data context)
+    connection-data))
 
 (defn connection-id-for-email
   "Tries to find out the id of the connection the email belongs to. Returns nil if no active connection is found."

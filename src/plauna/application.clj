@@ -400,16 +400,27 @@
       (error-result e "Error encountered when reading email from folder"))))
 
 (defn read-emails-from-folder
-  "Read all emails from a folder and process them. Returns the number of messages in the folder.
+  "Read emails from a folder and process them. Returns the number of messages in the folder.
    Emails are read over a DEDICATED IMAP connection (separate from the IDLE monitor, so the two never
-   contend for the same folder/connection) and processed on another thread."
+   contend for the same folder/connection) and processed on another thread.
+
+   options may include :limit N to process only the N most recent messages (the highest sequence
+   numbers) instead of the whole folder. The reconnect back-fill uses this so a large mailbox isn't
+   fully re-scanned every time; already-saved messages are skipped either way (see
+   incoming-email-workflow), so a bounded scan still catches up every genuinely-missed message within
+   the window."
   [connection-data folder-name options {:keys [client] :as context}]
   (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
         folder (:folder bulk)
-        message-count (:message-count bulk)]
+        message-count (:message-count bulk)
+        limit (:limit options)
+        ;; Lowest sequence number to process. With :limit, take only the top N (most recent) messages;
+        ;; without it, everything down to 1. (Sequence numbers are 1-based; higher = more recent.)
+        lowest (if limit (max 1 (- (inc message-count) limit)) 1)
+        to-process (inc (- message-count lowest))]
     (if (> message-count 0)
       (do
-        (t/log! :info ["There are" message-count "emails in" folder-name "The messages will get processed asynchronously"])
+        (t/log! :info ["There are" message-count "emails in" folder-name "-" to-process "will get processed asynchronously"])
         ;; Use async/thread (a real thread), not async/go: each email does blocking JDBC and IMAP work,
         ;; and a long blocking loop inside a go block would tie up a shared core.async dispatch thread.
         (async/thread
@@ -418,7 +429,7 @@
             ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
             ;; Going downward means the numbers we have not processed yet are never affected, so no
             ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
-            (doseq [n (range message-count 0 -1)]
+            (doseq [n (range message-count (dec lowest) -1)]
               (process-nth-email-from-folder client n folder-name folder options context bulk))
             (finally
               (int/close-folder-for-bulk-read client bulk)))))

@@ -313,6 +313,36 @@
     (is (= [3 2 1] @read-attempts))
     (is (= ["email-3" "email-1"] @saved-subjects))))
 
+(deftest read-emails-from-folder-limit-reads-only-most-recent
+  (let [read-attempts (atom [])
+        saved-subjects (atom [])
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _]
+                   {:message-count 10 :connection-id "test-connection" :folder :test-folder})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (current-folder-name [_ folder] (str folder))
+                 (nth-email-from-folder [_ n _]
+                   (swap! read-attempts conj n)
+                   {:email {:header {:subject (str "email-" n)}} :message n}))
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ email] (swap! saved-subjects conj (-> email :header :subject)))
+             (update-email-folder [_ _ _] nil))]
+    (is (= 10 (app/read-emails-from-folder {} "INBOX" {:move? false :limit 3} {:client client :analyzer analyzer :db db})))
+    (let [deadline (+ (System/currentTimeMillis) 1000)]
+      (loop []
+        (when (and (< (count @saved-subjects) 3)
+                   (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)
+          (recur))))
+    ;; Only the 3 most recent (highest) sequence numbers are read, still high -> low, and everything
+    ;; below the window (7..1) is left untouched.
+    (is (= [10 9 8] @read-attempts))
+    (is (= ["email-10" "email-9" "email-8"] @saved-subjects)))
+  "With :limit N, only the N most recent messages (highest sequence numbers) are processed — the reconnect back-fill's bounded catch-up.")
+
 (deftest fetch-emails-applies-date-filter
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]

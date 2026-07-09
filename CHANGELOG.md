@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-09.0] - 2026-07-09
+
+### 🚀 Features
+
+- Automatically catch up on mail missed while a connection was offline. Live
+  monitoring uses IMAP IDLE, which only delivers messages that arrive while
+  connected, so a dropped connection or a container restart previously left a
+  permanent gap (mail that arrived during the outage never appeared, even after
+  reconnecting) until a manual folder parse. Now, whenever a connection is
+  (re)established - at startup, on a manual reconnect, or when the periodic
+  health check restores a dropped connection - Plauna re-reads the most recent
+  messages in the monitored folder and saves/categorizes anything that was
+  missed. Already-stored e-mails are skipped, so nothing is duplicated. The
+  scan is bounded to the most recent messages; a larger gap is still
+  recoverable with the manual folder Parse control.
+
 ## [2026-07-08.3] - 2026-07-08
 
 ### 🚀 Features
