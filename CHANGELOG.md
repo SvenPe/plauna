@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-07-10.0] - 2026-07-10
+
+### 🐛 Bug Fixes
+
+- Save each e-mail (and each batch) in a single database transaction. A failure
+  mid-save could previously leave a header without its bodies, participants, or
+  metadata — and because "already saved" checks only look at the header, such a
+  partial e-mail was permanently skipped by every later backfill.
+- Actually enforce SQLite foreign keys. The PRAGMA was only applied to one
+  temporary connection, so cascades and reference validation never ran for
+  normal queries; it is now part of the JDBC URL and applies to every
+  connection. Deleting a connection now also removes its OAuth tokens, as the
+  schema always intended.
+- Deleting a category now clears it from all affected e-mails in the same
+  transaction (previously it failed outright under MariaDB and left dangling
+  category references under SQLite). Deleting an OAuth provider likewise
+  detaches it from connections that referenced it.
+- Store one OAuth token row per connection (upsert) instead of appending a new
+  row on every authorization and then reading back an arbitrary — often the
+  oldest — token. A re-authorization that omits a refresh token keeps the
+  stored one.
+- Creating a connection with OAuth 2 selected now saves the authentication type
+  and provider; previously both were silently dropped and the connection was
+  created as basic/unconfigured.
+- Deleting a connection now closes its active monitor first. Previously the
+  monitor kept running (and accessing the mailbox) while the connection
+  vanished from the UI, leaving no way to disconnect it.
+- Categories with spaces in their names now train and predict correctly: models
+  are trained on category ids instead of names (a name like "Work Projects" was
+  silently trained as "Work" and never matched again). Old models keep working
+  until the next re-training.
+- A failed IMAP login is now reported as an error on the Connections page
+  instead of pretending the connection succeeded.
+- Fixed the e-mail detail page throwing when updating an uncategorized e-mail
+  or selecting "n/a".
+- Unchecking a subject in the Subject filter no longer also hides every e-mail
+  that has no subject at all.
+- The saved OAuth provider is selected again when reopening a connection page;
+  previously it rendered unselected and an unrelated edit could wipe it.
+- Fixed the provider "Update" button doing nothing in browsers without the
+  non-standard global `event` object (e.g. Firefox).
+- Success and error toasts redirected to the admin page are shown again instead
+  of being silently discarded.
+- Preferences are now validated before saving: thresholds must be between 0 and
+  1, the health-check interval must be a positive number (a saved 0 used to
+  break all new connections), and only known settings and log levels are
+  accepted. Invalid input saves nothing.
+- E-mails without a detected language no longer break the language
+  administration page under MariaDB.
+- Fixed a slow leak where every mbox upload or bulk language-detection run left
+  behind a permanent internal event subscriber.
+
 ## [2026-07-09.0] - 2026-07-09
 
 ### 🚀 Features
