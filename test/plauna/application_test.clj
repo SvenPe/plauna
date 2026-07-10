@@ -8,22 +8,31 @@
 
 (deftest basic-auth
   (let [database (reify int/DB (fetch-connection [_ id] {:id id :auth-type "basic"}))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= {:result :ok} (app/connect-to-client context "abc"))  "Basic authentication calls email-client's login method and returns ok")))
 
 (deftest basic-auth-2
   (let [database (reify int/DB (fetch-connection [_ id] {:id id}))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= {:result :ok} (app/connect-to-client context "abc"))  "If no auth-type is defined, fall back on basic auth and return ok")))
+
+(deftest failed-login-returns-error
+  (let [database (reify int/DB (fetch-connection [_ id] {:id id :auth-type "basic"}))
+        ;; The client returns nil when authentication fails (it catches
+        ;; AuthenticationFailedException internally); that must not be reported as :ok.
+        client (reify int/EmailClient (start-monitor [_ config context] nil))
+        context {:db database :client client}]
+    (is (= :error (:result (app/connect-to-client context "abc")))
+        "A nil start-monitor result (failed login) is reported as an error, not :ok")))
 
 (deftest oauth2-auth
   (let [database (reify int/DB
                    (fetch-connection [_ id] {:id id :auth-type "oauth2" :auth-provider 2})
                    (fetch-oauth-token-data [_ id] nil)
                    (fetch-auth-provider [_ id] {:id id}))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= {:result :redirect, :provider {:id 2}}
            (app/connect-to-client context "abc"))
@@ -34,7 +43,7 @@
                    (fetch-connection [_ id] {:id id :auth-type "oauth2" :auth-provider 2})
                    (fetch-oauth-token-data [_ id] {:access-token "not empty" :refresh-token "not empty"})
                    (fetch-auth-provider [_ id] {:id id}))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= {:result :ok}
            (app/connect-to-client context "abc"))
@@ -45,7 +54,7 @@
                    (fetch-connection [_ id] {:id id :auth-type "oauth2" :auth-provider 2})
                    (fetch-oauth-token-data [_ id] nil)
                    (fetch-auth-provider [_ id] nil))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= :error (:result (app/connect-to-client context "abc"))))
     "auth-type 'oauth2' with no auth provider returns an errorq"))
@@ -55,7 +64,7 @@
                    (fetch-connection [_ id] {:id id :auth-type "oauth2" :auth-provider 2})
                    (fetch-oauth-token-data [_ id] {:access-token "not empty"})
                    (fetch-auth-provider [_ id] {:id id}))
-        client (reify int/EmailClient (start-monitor [_ config context]))
+        client (reify int/EmailClient (start-monitor [_ config context] {:connected true}))
         context {:db database :client client}]
     (is (= {:result :redirect, :provider {:id 2}}
            (app/connect-to-client context "abc"))
@@ -401,8 +410,8 @@
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :subject-values-exclude ["Spam"] :page 1 :size 20})
-    (is (= {:where [:not-in :headers.subject ["Spam"]] :order-by [[:date :desc]]} @captured)))
-  "Excluded subjects match every other subject")
+    (is (= {:where [:or [:not-in :headers.subject ["Spam"]] [:is :headers.subject nil]] :order-by [[:date :desc]]} @captured)))
+  "Excluded subjects match every other subject, including emails without a subject (NOT IN is UNKNOWN for NULL)")
 
 (deftest fetch-emails-applies-from-keys-filter
   (let [captured (atom nil)

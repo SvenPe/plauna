@@ -66,11 +66,14 @@
 
 (defn- subject-values->where
   "selection is {:include [...]} to match only those subjects, or {:exclude [...]} to match every
-   subject EXCEPT those (see contact-keys->where for why). Both empty adds no filter."
+   subject EXCEPT those (see contact-keys->where for why). Both empty adds no filter.
+   Exclusion must keep NULL-subject rows explicitly: NOT IN is UNKNOWN for NULL, so unchecking one
+   named subject would otherwise also hide every email with a missing subject, even though missing
+   subjects never appear in the checklist."
   [{:keys [include exclude]}]
   (cond
     (seq include) [:in :headers.subject include]
-    (seq exclude) [:not-in :headers.subject exclude]
+    (seq exclude) [:or [:not-in :headers.subject exclude] [:is :headers.subject nil]]
     :else nil))
 
 (defn- date-string->epoch-seconds
@@ -172,10 +175,17 @@
   [db] (conj (int/fetch-categories db) {:id nil :name "n/a" :color default-category-color}))
 
 (defn connect-to-client
-  "Returns {:result :ok} or {:result :redirect :provider provider} in case of oauth2"
+  "Returns {:result :ok}, {:result :redirect :provider provider} in case of oauth2, or
+   {:result :error ...} when the connection could not be established."
   [{:keys [db client] :as context} id]
   (try
-    (let [connection (int/fetch-connection db id)]
+    ;; start-monitor returns nil when the login fails (the client catches
+    ;; AuthenticationFailedException); treat that as an error instead of reporting :ok for a
+    ;; connection that never came up.
+    (let [connection (int/fetch-connection db id)
+          monitor-result (fn [] (if (some? (int/start-monitor client connection context))
+                                  (success-result :ok nil)
+                                  (error-result nil "Could not connect. Please see the logs for the details.")))]
       (if (= "oauth2" (:auth-type connection))
         (let [auth-provider (int/fetch-auth-provider db (:auth-provider connection))
               oauth-data (int/fetch-oauth-token-data db id)]
@@ -185,8 +195,8 @@
             (do
               (t/log! :warn ["Connection" (:user connection) (:host connection) "is set to use oauth2 but has no tokens in the db. You need to login manually from the 'Connections' page first."])
               (success-result :redirect {:provider (int/fetch-auth-provider db (:auth-provider connection))}))
-            :else (do (int/start-monitor client connection context) (success-result :ok nil))))
-        (do (int/start-monitor client connection context) {:result :ok})))
+            :else (monitor-result)))
+        (monitor-result)))
     (catch Exception e (do (t/log! :error ["There was an error when trying to log in:" e])
                            (error-result e "There was an error when trying to log in.")))))
 

@@ -26,8 +26,10 @@
 (defonce ^:private mariadb-pool (atom nil))
 
 (defn sqlite-url []
+  ;; foreign_keys is a connection-scoped pragma, and every jdbc/execute! may open a fresh
+  ;; connection — putting it in the URL is the only way it reliably applies everywhere.
   (str "jdbc:sqlite:" (files/path-to-db-file)
-       "?busy_timeout=30000&journal_mode=WAL&synchronous=NORMAL"))
+       "?busy_timeout=30000&journal_mode=WAL&synchronous=NORMAL&foreign_keys=true"))
 
 (defn setup-db!
   "Initialise the datasource for the given db-config map.
@@ -72,11 +74,9 @@
 (def my-addresses (atom #{}))
 
 (defn create-db []
-  (.migrate ^Flyway (flyway))
-  (when (= :sqlite @active-db-type)
-    (jdbc/execute! (ds) ["PRAGMA foreign_keys = ON;"])
-    (jdbc/execute! (ds) ["PRAGMA journal_mode = WAL;"])
-    (jdbc/execute! (ds) ["PRAGMA foreign_keys=on;"])))
+  ;; SQLite pragmas (foreign_keys, WAL, busy_timeout) are set in the JDBC URL — see sqlite-url —
+  ;; because they are connection-scoped and would not carry over to later connections if set here.
+  (.migrate ^Flyway (flyway)))
 
 (def builder-function {:builder-fn as-unqualified-lower-maps})
 
@@ -126,25 +126,29 @@
            (honey/format {:select [1] :from :headers :where [:= :message_id message-id]})
            builder-function)))
 
-(defn save-headers [headers]
-  (jdbc/execute! (ds)
-                 (->>
-                  (builder/for-insert-multi
-                   :headers
-                   [:mime_type :subject :message_id :date :in_reply_to]
-                   (mapv (juxt :mime-type :subject :message-id :date :in-reply-to) headers) {})
-                  (insert->insert-ignore))
-                 {:batch true}))
+(defn save-headers
+  ([headers] (save-headers (ds) headers))
+  ([conn headers]
+   (jdbc/execute! conn
+                  (->>
+                   (builder/for-insert-multi
+                    :headers
+                    [:mime_type :subject :message_id :date :in_reply_to]
+                    (mapv (juxt :mime-type :subject :message-id :date :in-reply-to) headers) {})
+                   (insert->insert-ignore))
+                  {:batch true})))
 
-(defn save-bodies [bodies]
-  (jdbc/execute! (ds)
-                 (->>
-                  (builder/for-insert-multi
-                   :bodies
-                   [:content :mime_type :charset :transfer_encoding :message_id :filename :content_disposition]
-                   (mapv (juxt :content :mime-type :charset :transfer-encoding :message-id :filename :content-disposition) bodies) {})
-                  (insert->insert-ignore))
-                 {:batch true}))
+(defn save-bodies
+  ([bodies] (save-bodies (ds) bodies))
+  ([conn bodies]
+   (jdbc/execute! conn
+                  (->>
+                   (builder/for-insert-multi
+                    :bodies
+                    [:content :mime_type :charset :transfer_encoding :message_id :filename :content_disposition]
+                    (mapv (juxt :content :mime-type :charset :transfer-encoding :message-id :filename :content-disposition) bodies) {})
+                   (insert->insert-ignore))
+                  {:batch true})))
 
 (defn delete-bodies-by-ids
   "Delete the body rows with the given primary-key ids. Used by refetch to drop a specific stale (empty)
@@ -156,39 +160,45 @@
                    (into [(str "DELETE FROM bodies WHERE id IN (" (string/join ", " (repeat (count ids) "?")) ")")]
                          ids))))
 
-(defn save-contacts [contacts]
-  (jdbc/execute! (ds)
-                 (->>
-                  (builder/for-insert-multi
-                   :contacts
-                   [:contact_key :name :address]
-                   (mapv (juxt :contact-key :name :address) contacts) {})
-                  (insert->insert-ignore))
-                 {:batch true}))
+(defn save-contacts
+  ([contacts] (save-contacts (ds) contacts))
+  ([conn contacts]
+   (jdbc/execute! conn
+                  (->>
+                   (builder/for-insert-multi
+                    :contacts
+                    [:contact_key :name :address]
+                    (mapv (juxt :contact-key :name :address) contacts) {})
+                   (insert->insert-ignore))
+                  {:batch true})))
 
-(defn save-communications [contacts]
-  (jdbc/execute! (ds)
-                 (->> (builder/for-insert-multi
-                       :communications
-                       [:message_id :contact_key :type]
-                       (mapv (juxt :message-id :contact-key (comp name :type)) contacts) {})
-                      (insert->insert-ignore))
-                 {:batch true}))
+(defn save-communications
+  ([contacts] (save-communications (ds) contacts))
+  ([conn contacts]
+   (jdbc/execute! conn
+                  (->> (builder/for-insert-multi
+                        :communications
+                        [:message_id :contact_key :type]
+                        (mapv (juxt :message-id :contact-key (comp name :type)) contacts) {})
+                       (insert->insert-ignore))
+                  {:batch true})))
 
-(defn update-metadata-batch [metadata]
-  (when (seq metadata)
-    (if (mariadb?)
-      (doseq [m metadata]
-        (jdbc/execute! (ds)
-          ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence)"
-           (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m)]))
-      (jdbc/execute! (ds)
-                     (->> (builder/for-insert-multi
-                           :metadata
-                           [:message_id :language :language_confidence :category :category_confidence]
-                           (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
-                          (insert->metadata-upsert))
-                     {:batch true}))))
+(defn update-metadata-batch
+  ([metadata] (update-metadata-batch (ds) metadata))
+  ([conn metadata]
+   (when (seq metadata)
+     (if (mariadb?)
+       (doseq [m metadata]
+         (jdbc/execute! conn
+           ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence)"
+            (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m)]))
+       (jdbc/execute! conn
+                      (->> (builder/for-insert-multi
+                            :metadata
+                            [:message_id :language :language_confidence :category :category_confidence]
+                            (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
+                           (insert->metadata-upsert))
+                      {:batch true})))))
 
 (def batch-size 500)
 
@@ -207,18 +217,33 @@
   (let [covered (set (map :message-id bodies))]
     (vec (remove covered (map :message-id headers)))))
 
-(defn save-emails-in-buffer [buffer]
-  (try
-    (save-headers (:headers buffer))
+(defn save-emails-in-buffer
+  "Persist everything in the buffer in ONE transaction: either the whole batch commits or nothing
+   does. Without this, a failure after save-headers would leave partial emails whose headers make
+   email-exists? true, so backfills would permanently skip re-saving their missing bodies/metadata.
+   A failure propagates to the caller; the rollback leaves no header behind, so the same messages
+   are picked up again by a later backfill or re-parse."
+  [buffer]
+  (jdbc/with-transaction [tx (ds)]
+    (save-headers tx (:headers buffer))
     (let [missing (bodyless-message-ids (:headers buffer) (:bodies buffer))]
       (when (seq missing)
         (t/log! :warn ["No body parts parsed for message ID(s):" missing])))
-    (when (seq (:bodies buffer)) (save-bodies (:bodies buffer)))
+    (when (seq (:bodies buffer)) (save-bodies tx (:bodies buffer)))
     (when (seq (:participants buffer))
-      (save-contacts (:participants buffer))
-      (save-communications (:participants buffer)))
-    (when (seq (:metadata buffer)) (update-metadata-batch (:metadata buffer)))
-    (catch Exception e (t/log! {:level :error :error e} (.getMessage e)))))
+      (save-contacts tx (:participants buffer))
+      (save-communications tx (:participants buffer)))
+    (when (seq (:metadata buffer)) (update-metadata-batch tx (:metadata buffer)))))
+
+(defn- save-buffer-logging-errors!
+  "Keep the database event loop alive when a batch save fails: the transaction has already rolled
+   back, so nothing partial was written and the messages remain recoverable."
+  [buffer]
+  (try
+    (save-emails-in-buffer buffer)
+    (catch Exception e
+      (t/log! {:level :error :error e}
+              ["Saving an email batch failed and was rolled back. The messages were not written and will be picked up by a later backfill or re-parse:" (.getMessage e)]))))
 
 (defn database-event-loop [publisher]
   (let [parsed-chan (async/chan)
@@ -232,13 +257,13 @@
         (cond
           (= :timed-out event)
           (do (t/log! :debug ["Received timeout. Saving everything in the buffer."])
-              (save-emails-in-buffer buffer)
+              (save-buffer-logging-errors! buffer)
               (recur (async/<! local-chan) (empty-buffer)))
 
           (> (count (:headers buffer)) batch-size)
           (do (t/log! :debug ["DB buffer full. Emptying"])
               (let [updated-buffer (add-to-buffer (:payload event) buffer)]
-                (save-emails-in-buffer updated-buffer))
+                (save-buffer-logging-errors! updated-buffer))
               (recur (async/<! local-chan) (empty-buffer)))
 
           :else
@@ -318,8 +343,14 @@
   ([category destination-folder color]
    (jdbc/execute! (ds) (honey/format {:insert-into :categories :columns [:name :destination_folder :color] :values [[category destination-folder color]]}))))
 
-(defn delete-category-by-id [id]
-  (jdbc/execute! (ds) (honey/format {:delete-from :categories :where [:= :id id]})))
+(defn delete-category-by-id
+  "Delete a category and, in the same transaction, clear it from every metadata row that still
+   references it. metadata.category is a non-cascading foreign key, so deleting first would fail
+   under MariaDB (and now under SQLite too) — and skipping the cleanup would leave dangling ids."
+  [id]
+  (jdbc/with-transaction [tx (ds)]
+    (jdbc/execute! tx ["UPDATE metadata SET category = NULL, category_confidence = NULL WHERE category = ?" id])
+    (jdbc/execute! tx ["DELETE FROM categories WHERE id = ?" id])))
 
 (defn update-category [id destination-folder color]
   (jdbc/execute! (ds) (honey/format {:update :categories
@@ -327,11 +358,8 @@
                                      :where  [:= :id id]})))
 
 (defn delete-email-by-message-id [message-id]
-  (if (mariadb?)
-    (jdbc/execute! (ds) ["DELETE FROM headers WHERE message_id = ?" message-id])
-    (with-open [conn (jdbc/get-connection (ds))]
-      (jdbc/execute! conn ["PRAGMA foreign_keys = ON"])
-      (jdbc/execute! conn ["DELETE FROM headers WHERE message_id = ?" message-id]))))
+  ;; Cascades to bodies/communications/metadata; SQLite enforces this via foreign_keys=true in the URL.
+  (jdbc/execute! (ds) ["DELETE FROM headers WHERE message_id = ?" message-id]))
 
 (defn category-by-name [category-name]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from :categories :where [:= :name category-name]}) builder-function))
@@ -621,12 +649,18 @@
 
 (defn get-oauth-tokens [connection-id] (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:oauth-tokens] :where [:= :connection-id connection-id]}) builder-function-kebab))
 
-(defn save-oauth-token [token-response]
-  (jdbc/execute! (ds)
-                 (-> {:insert-into [:oauth_tokens]
-                      :columns     [:access_token :connection-id :expires_in :refresh_token :scope :token_type]
-                      :values      [[(:access_token token-response) (:connection-id token-response) (:expires_in token-response) (:refresh_token token-response) (:scope token-response) (:token_type token-response)]]}
-                     (honey/format))))
+(defn save-oauth-token
+  "Upsert the token row for a connection (connection_id is unique, see migration V12). COALESCE
+   keeps the stored refresh token when the provider omits one on re-authorization — Google and
+   others only return a refresh token on the first consent."
+  [token-response]
+  (let [params [(:connection-id token-response) (:access_token token-response) (:expires_in token-response)
+                (:refresh_token token-response) (:scope token-response) (:token_type token-response)]]
+    (if (mariadb?)
+      (jdbc/execute! (ds)
+        (into ["INSERT INTO oauth_tokens (connection_id, access_token, expires_in, refresh_token, scope, token_type) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE access_token = VALUES(access_token), expires_in = VALUES(expires_in), refresh_token = COALESCE(VALUES(refresh_token), refresh_token), scope = VALUES(scope), token_type = VALUES(token_type)"] params))
+      (jdbc/execute! (ds)
+        (into ["INSERT INTO oauth_tokens (connection_id, access_token, expires_in, refresh_token, scope, token_type) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(connection_id) DO UPDATE SET access_token = excluded.access_token, expires_in = excluded.expires_in, refresh_token = COALESCE(excluded.refresh_token, oauth_tokens.refresh_token), scope = excluded.scope, token_type = excluded.token_type"] params)))))
 
 (defn update-access-token [connection-id token-response]
   (if (nil? (:refresh_token token-response))
@@ -646,9 +680,10 @@
 (defn add-connection [connection]
   (jdbc/execute! (ds)
                  (honey/format {:insert-into [:connections]
-                                :columns [:id :host :user :secret :folder :debug :security :port :check-ssl-certs]
+                                :columns [:id :host :user :secret :folder :debug :security :port :check-ssl-certs :auth_type :auth_provider]
                                 :values [[(:id connection) (:host connection) (:user connection)
-                                          (:secret connection) (:folder connection) (:debug connection) (:security connection) (:port connection) (:check-ssl-certs connection)]]})
+                                          (:secret connection) (:folder connection) (:debug connection) (:security connection) (:port connection) (:check-ssl-certs connection)
+                                          (:auth-type connection) (:auth-provider connection)]]})
                  builder-function))
 
 (defn update-connection [connection]
@@ -673,8 +708,13 @@
 (defn get-auth-provider [id]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:auth_providers] :where [:= :id id]}) builder-function-kebab))
 
-(defn delete-auth-provider [id] (jdbc/execute! (ds) (honey/format {:delete-from [:auth_providers]
-                                                                   :where [:= :id id]}) builder-function-kebab))
+(defn delete-auth-provider
+  "Delete a provider after detaching it from any connection that references it —
+   connections.auth_provider is a non-cascading foreign key."
+  [id]
+  (jdbc/with-transaction [tx (ds)]
+    (jdbc/execute! tx ["UPDATE connections SET auth_provider = NULL WHERE auth_provider = ?" id])
+    (jdbc/execute! tx ["DELETE FROM auth_providers WHERE id = ?" id])))
 
 (defn update-auth-provider [provider]
   (let [wo-id (dissoc provider :id)]
@@ -707,11 +747,14 @@
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (email-exists? [_ message-id] (email-exists? message-id))
   (save-email [_ email]
-    (save-headers [(:header email)])
-    (if (seq (:body email))
-      (save-bodies (:body email))
-      (t/log! :warn ["No body parts parsed for message ID:" (-> email :header :message-id)]))
-    (when (seq (:participants email))
-      (save-contacts (:participants email))
-      (save-communications (:participants email)))
-    (when (seq (:metadata email)) (update-metadata-batch [(:metadata email)]))))
+    ;; One transaction per email, and failures propagate: a partially-saved email whose header
+    ;; already exists would otherwise be skipped by every future backfill (see save-emails-in-buffer).
+    (jdbc/with-transaction [tx (ds)]
+      (save-headers tx [(:header email)])
+      (if (seq (:body email))
+        (save-bodies tx (:body email))
+        (t/log! :warn ["No body parts parsed for message ID:" (-> email :header :message-id)]))
+      (when (seq (:participants email))
+        (save-contacts tx (:participants email))
+        (save-communications tx (:participants email)))
+      (when (seq (:metadata email)) (update-metadata-batch tx [(:metadata email)])))))

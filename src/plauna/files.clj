@@ -107,16 +107,18 @@
   (t/log! :info ["Starting to read from mbox"])
   (with-open [rdr (clojure.java.io/reader mbox-is)]
     (let [limiter (messaging/channel-limiter :parsed-enrichable-email)]
-      (read-mail-lines
-       (fn [email-string]
-         (async/>!! limiter :token)
-         (async/>!! channel
-                    ((comp
-                      (fn [mail-string] (events/create-event :received-email  mail-string {:enrich true}))
-                      #(.getBytes ^String %)
-                      #(apply str %)) email-string)))
-       (line-seq rdr)
-       [])))
+      (try
+        (read-mail-lines
+         (fn [email-string]
+           (async/>!! (:bucket limiter) :token)
+           (async/>!! channel
+                      ((comp
+                        (fn [mail-string] (events/create-event :received-email  mail-string {:enrich true}))
+                        #(.getBytes ^String %)
+                        #(apply str %)) email-string)))
+         (line-seq rdr)
+         [])
+        (finally (messaging/close-limiter! limiter)))))
   (t/log! :info ["Finished reading mbox."]))
 
 (defn file-exists? [path] (.exists ^File (io/file path)))

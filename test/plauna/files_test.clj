@@ -44,13 +44,13 @@
   (let [config-file (files/parse-config-from-cli-arguments [])]
     (is (and (= 8080 (-> config-file :server :port)) (= "/var/lib/plauna/" (:data-folder config-file))))))
 
-(deftest env-variables
+(deftest env-variables-override-defaults
   "Environment variablles override defaults."
   (binding [plauna.files/system-env (fn [key] (get {"SERVER_PORT" "3000" "DATA_FOLDER" "/var/test"} key))]
     (let [config-file (files/parse-config-from-cli-arguments [])]
       (is (and (= 3000 (-> config-file :server :port)) (= "/var/test" (:data-folder config-file)))))))
 
-(deftest env-variables
+(deftest cli-arguments-override-env-variables
   "Cli arguments override environment variablles."
   (binding [plauna.files/system-env (fn [key] (get {"SERVER_PORT" "3000" "DATA_FOLDER" "/var/test"} key))]
     (let [config-file (files/parse-config-from-cli-arguments ["--server-port" "4000" "--data-folder" "/var/test2"])]

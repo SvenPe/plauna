@@ -130,7 +130,11 @@
 
 (defn language-preferences []
   (let [preferences (db/get-language-preferences)
-        languages (filterv #(not (= "n/a" %)) (mapv :language (db/get-languages)))]
+        ;; Drop nil/blank languages as well as "n/a": metadata rows without a detected language would
+        ;; otherwise be treated as a preference to insert, violating the NOT NULL constraint (which
+        ;; MariaDB propagates as a 500, unlike SQLite's INSERT OR IGNORE).
+        languages (filterv (fn [lang] (and (not (st/blank? lang)) (not= "n/a" lang)))
+                           (mapv :language (db/get-languages)))]
     (if (empty? languages)
       []
       (normalize-prefs
@@ -165,9 +169,10 @@
     {:type :alert :content "There are no selected languages to train in. Cannot proceed."}))
 
 (defn categorize-content [content language] ;; FIXME This kills the process if content is nil
-  (let [category (analysis/categorize content (files/model-file language))]
-    {:id         (:id (db/category-by-name (:name category)))
-     :name       (:name category)
+  (let [category (analysis/categorize content (files/model-file language))
+        matched  (analysis/label->category (:name category))]
+    {:id         (:id matched)
+     :name       (:name matched)
      :confidence (:confidence category)}))
 
 (defn categorize-uncategorized-n-emails [n]
@@ -264,6 +269,26 @@
    Integer/parseInt would reject the whole request over a fixable value."
   [default]
   (fn [value] (try (Integer/parseInt value) (catch NumberFormatException _ default))))
+
+(def ^:private valid-log-levels
+  ;; The values telemere's set-min-level! accepts; the preferences page offers a subset.
+  #{"trace" "debug" "info" "warn" "error" "fatal" "report"})
+
+(defn- valid-preference?
+  "Allowlist + range validation for POST /admin/preferences: only known keys with usable values
+   may be persisted. The select submits log levels as ':error'-style keyword strings."
+  [key value]
+  (case key
+    (:language-detection-threshold :categorization-threshold)
+    (try (<= 0.0 (Double/parseDouble value) 1.0) (catch Exception _ false))
+
+    :client-health-check-interval
+    (try (pos? (Long/parseLong value)) (catch Exception _ false))
+
+    :log-level
+    (contains? valid-log-levels (st/replace (str value) #"^:" ""))
+
+    false))
 
 ;; TODO change name template
 (def emails-template {:size {:default 20 :type-fn (int-or-default 20)}
@@ -459,7 +484,7 @@
      (if (seq @global-messages)
        (let [messages @global-messages]
          (swap! global-messages (fn [_] []))
-         (success-html-with-body (markup/administration messages)))
+         (success-html-with-body (markup/administration {:repl (get-status-repl-server)} messages)))
        (success-html-with-body (markup/administration {:repl (get-status-repl-server)}))))
 
    (comp/POST "/emails/parse" request
@@ -487,10 +512,17 @@
                                  :client-health-check-interval client-health-check-interval}))))
 
    (comp/POST "/admin/preferences" request
-     (doseq [param (dissoc (:params request) :redirect-url)]
-       (p/update-preference (first param) (second param)))
-     (t/set-min-level! (p/log-level))
-     (redirect-request request))
+     (let [prefs (dissoc (:params request) :redirect-url)
+           invalid (remove (fn [[k v]] (valid-preference? k v)) prefs)]
+       (if (seq invalid)
+         ;; Save nothing when any value is invalid: a zero/negative health-check interval breaks
+         ;; scheduleAtFixedRate for new connections, out-of-range thresholds break categorization,
+         ;; and an unknown log level breaks logging.
+         (redirect-request request {:type :alert :content (str "Invalid value(s) for: " (st/join ", " (map (comp name first) invalid)) ". Nothing was saved.")})
+         (do (doseq [[k v] prefs]
+               (p/update-preference k v))
+             (t/set-min-level! (p/log-level))
+             (redirect-request request)))))
 
    (comp/POST "/admin/languages" {params :params}
      (let [langs-to-use (if (vector? (:use params)) (:use params) [(:use params)])]
@@ -515,7 +547,7 @@
       :body    (markup/administration {:repl (get-status-repl-server)})})
 
    (comp/DELETE "/admin/categories/:id" {route-params :route-params}
-     (db/delete-category-by-id (:id route-params))
+     (db/delete-category-by-id (Integer/parseInt (:id route-params)))
      {:status  301
       :headers {"Location" "/admin/categories"}
       :body    (markup/administration {:repl (get-status-repl-server)})})
@@ -563,7 +595,9 @@
        {:status 204}))
 
    (comp/POST "/metadata" request
-     (if (some? (:move (:params request)))
+     ;; The n/a category is submitted as a blank string; only enter the move branch for a real
+     ;; category, otherwise just save (clearing the category never moves the email).
+     (if (and (some? (:move (:params request))) (seq (:category (:params request))))
        (let [message-id (:message-id (:params request))
              email-before-update (enriched-email-by-message-id message-id)
              new-category-id (Integer/parseInt (:category (:params request)))
@@ -613,14 +647,18 @@
 
    (comp/POST "/admin/connections" request
      (let [params (:params request)
-           config {:host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs))}
+           config {:host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs))
+                   :auth-type (get params :auth-type) :auth-provider (when (seq (get params :auth-provider)) (Integer/parseInt (get params :auth-provider)))}
            id (client/id-from-config config)]
        (db/add-connection (merge config {:id id}))
        (redirect-request request)))
 
    (comp/DELETE "/admin/connections/:id" request
-     (let [params (:params request)]
-       (db/delete-connection (get params :id))
+     (let [id (get (:params request) :id)]
+       ;; Close and deregister the live connection first: deleting only the DB row would leave an
+       ;; active monitor running with no way to reach it from the UI anymore.
+       (client/remove-connection! id)
+       (db/delete-connection id)
        {:status 200}))
 
    (comp/GET "/admin/new-connection" []
@@ -660,7 +698,7 @@
 
    (comp/PUT "/admin/connections/:id" request
      (let [params (:params request)]
-       (db/update-connection {:id (get params :id) :host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs)) :auth-type (get params :auth-type) :auth-provider (get params :auth-provider)})
+       (db/update-connection {:id (get params :id) :host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs)) :auth-type (get params :auth-type) :auth-provider (when (seq (get params :auth-provider)) (Integer/parseInt (get params :auth-provider)))})
        {:status 200}))
 
    (comp/POST "/admin/connections/:id/controls" request
@@ -682,9 +720,11 @@
      (let [limiter (messaging/channel-limiter :enriched-email)
            process-fn (fn [enriched-emails]
                         (doseq [enriched-email enriched-emails]
-                          (async/>!! limiter :token)
+                          (async/>!! (:bucket limiter) :token)
                           (async/>!! @messaging/main-chan {:type :language-detection-request :options {} :payload enriched-email})))]
-       (core-email/iterate-over-all-pages db/fetch-data process-fn {:entity :enriched-email :strict false :page {:page 1 :size 500}} {:where [:= :language nil]} true))
+       (try
+         (core-email/iterate-over-all-pages db/fetch-data process-fn {:entity :enriched-email :strict false :page {:page 1 :size 500}} {:where [:= :language nil]} true)
+         (finally (messaging/close-limiter! limiter))))
      (redirect-request request))
 
    (comp/POST "/repl" request

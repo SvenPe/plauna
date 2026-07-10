@@ -90,8 +90,11 @@
 (defn training-body-part [email] (core-email/body-part-for-mime-type "text/html" email))
 
 (defn format-training-data [data]
+  ;; The model label is the category ID, not its name: DocumentSampleStream treats the first
+  ;; whitespace-delimited token as the label, so a name like "Work Projects" would be trained
+  ;; as "Work" and never resolve back to a category. IDs are single tokens by construction.
   (transduce
-   (comp (map (fn [email] [(get-in email [:metadata :category]) (training-body-part email)]))
+   (comp (map (fn [email] [(get-in email [:metadata :category-id]) (training-body-part email)]))
          (filter (fn [[_ body-part]] (some? body-part)))
          (map (fn [[category body-part]] [category
                                           (if (some? (:subject body-part)) (st/trim (:subject body-part)) "")
@@ -138,6 +141,15 @@
   (when (some? body-part)
     (normalize (tt/clean-text-content (:content body-part) (core-email/text-content-type body-part)))))
 
+(defn label->category
+  "Resolve a model label to its category row. Labels are category ids (see format-training-data);
+   fall back to a name lookup so models trained before ids were used as labels keep working until
+   the next re-training. Returns nil when the label matches no existing category."
+  [label]
+  (when (some? label)
+    (or (when-let [id (parse-long (str label))] (db/category-by-id id))
+        (db/category-by-name label))))
+
 (defn category-for-text [text language-code]
   (when (and (some? text) (some? language-code))
     (let [allowed-languages (mapv :language (db/get-activated-language-preferences))]
@@ -149,16 +161,16 @@
         training-content (normalize-body-part body-part-to-train-on)
         language-result (detect-language training-content)
         category-result (category-for-text training-content (:code language-result))
-        category-id (if (nil? (:name category-result)) nil (:id (db/category-by-name (:name category-result))))]
-    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category-result) :category-confidence (:confidence category-result) :category-id category-id})))
+        category (label->category (:name category-result))]
+    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category) :category-confidence (:confidence category-result) :category-id (:id category)})))
 
 (defn detect-language-and-categorize-email [email]
   (let [body-part-to-train-on (core-email/body-part-for-mime-type "text/html" email)
         training-content (normalize-body-part body-part-to-train-on)
         language-result (detect-language training-content)
         category-result (category-for-text training-content (:code language-result))
-        category-id (if (nil? (:name category-result)) nil (:id (db/category-by-name (:name category-result))))]
-    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category-result) :category-confidence (:confidence category-result) :category-id category-id})))
+        category (label->category (:name category-result))]
+    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category) :category-confidence (:confidence category-result) :category-id (:id category)})))
 
 (defn detect-language-event [event]
   (let [email (:payload event)

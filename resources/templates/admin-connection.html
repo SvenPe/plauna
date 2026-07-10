@@ -22,7 +22,7 @@
           <select class="select" name="auth-provider">
             <option value="" disabled {% if auth-provider = null %}selected{% endif %}>Please Select One</option>
             {% for provider in auth-providers %}
-            <option value="{{provider.id}}" {% if auth-provider = id %}selected{% endif %}>{{provider.name}}</option>
+            <option value="{{provider.id}}" {% if auth-provider = provider.id %}selected{% endif %}>{{provider.name}}</option>
             {% endfor %}
           </select>
         </div>

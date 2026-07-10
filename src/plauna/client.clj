@@ -508,6 +508,18 @@
 
 (defn disconnect [^AutoCloseable connection-data] (.close connection-data))
 
+(defn remove-connection!
+  "Close a connection's live resources (monitor, folder, store) and drop it from the runtime
+   registry. Used when a connection's configuration is deleted: without this the ConnectionData
+   keeps monitoring the mailbox while no longer appearing anywhere in the UI."
+  [id]
+  (when-let [connection-data (connection-data-from-id id)]
+    (try
+      (disconnect connection-data)
+      (catch Exception e
+        (t/log! {:level :warn :error e} ["Error while closing connection" id "before removing it from the registry."])))
+    (swap! connections dissoc id)))
+
 (defn disconnect-all [] (doseq [connection (vals @connections)] (disconnect connection)))
 
 (defn reconnect [^ConnectionData connection-data]

@@ -12,20 +12,33 @@
                                    (alter main-publisher (fn [_] (pub @main-chan :type)))))
 (def limiter-limit (ref 300))
 
-(defn channel-limiter [target-type]
+(defn channel-limiter
+  "Backpressure for a producing operation: the producer puts a token on :bucket before each event it
+   sends, and a go-loop drains one token per published target-type event, so the producer can never
+   run more than the bucket size ahead of the consumers.
+   Returns a handle {:bucket ... :target ... :type ...}. The producer MUST call close-limiter! when
+   it finishes (try/finally): the subscription and its go-loop otherwise leak, and every future event
+   of this type keeps being delivered to the abandoned subscriber."
+  [target-type]
   (let [bucket-channel (chan @limiter-limit)
         target-channel (chan)]
     (sub @main-publisher target-type target-channel)
     (go-loop []
       (when-some [_ (<! target-channel)]
-        ;; Consume a token without blocking. A limiter is never unsubscribed, so a blocking take on an
-        ;; abandoned limiter's empty bucket would park this loop while its target-channel still receives
-        ;; every event — and since pub/mult only deliver the next event once ALL subscribers accepted,
-        ;; one stale limiter would freeze the whole topic (e.g. on the second mbox upload). The producer
-        ;; puts its token before its event, so for a live limiter the token is always already here.
+        ;; Consume a token without blocking: pub/mult only deliver the next event once ALL
+        ;; subscribers accepted, so a blocking take on an empty bucket could park the whole topic.
+        ;; The producer puts its token before its event, so the token is normally already here.
         (async/poll! bucket-channel)
         (recur)))
-    bucket-channel))
+    {:bucket bucket-channel :target target-channel :type target-type}))
+
+(defn close-limiter!
+  "Unsubscribe and close a limiter created by channel-limiter, ending its go-loop. Events published
+   after this simply skip the limiter; any in-flight ones no longer need tokens."
+  [{:keys [bucket target type]}]
+  (async/unsub @main-publisher type target)
+  (close! target)
+  (close! bucket))
 
 (comment
   (restart-main-chan))

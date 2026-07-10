@@ -59,7 +59,7 @@
                             .then(response => window.location.replace(response.url))});
 
                     document.getElementById('update-button-{{provider.id}}').addEventListener('click', (e) => {
-                        event.stopPropagation();
+                        e.stopPropagation();
                         const form = document.getElementById('provider-{{provider.id}}'); 
                         const body = new FormData();
                         for (let element of form.elements) {
