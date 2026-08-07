@@ -86,6 +86,21 @@
 
 (defn- mariadb? [] (= :mariadb @active-db-type))
 
+(defn fulltext-min-token-length
+  "Read MariaDB's effective InnoDB FULLTEXT token length. The value is server-configurable, so the
+   query planner must not assume the default of three characters. Returns nil for SQLite."
+  []
+  (when (mariadb?)
+    (try
+      (some-> (jdbc/execute-one! (ds) ["SELECT @@innodb_ft_min_token_size AS min_token_length"]
+                                 builder-function-kebab)
+              :min-token-length
+              long)
+      (catch Exception e
+        (t/log! {:level :warn :error e}
+                "Could not read innodb_ft_min_token_size; using MariaDB's default value 3.")
+        3))))
+
 (defn- sql-now
   "Current time as a Unix epoch integer, dialect-appropriate."
   []

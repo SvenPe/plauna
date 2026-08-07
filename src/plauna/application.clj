@@ -16,10 +16,15 @@
 (defn- like-contains [column text]
   [:like column [:escape (str "%" (escape-like text) "%") "\\"]])
 
-(def ^:private fulltext-min-token-length
-  "MariaDB/InnoDB's default innodb_ft_min_token_size. Shorter terms use LIKE so searches such as
-   'AI' keep working even though they are absent from the FULLTEXT index."
-  3)
+(def ^:private default-fulltext-min-token-length 3)
+
+(def ^:private innodb-default-stopwords
+  "The built-in InnoDB stopword list. Falling back to LIKE for these words preserves the literal
+   search semantics even though MATCH cannot return them. A server with stopwords disabled may do
+   a little extra work for these uncommon searches, but never returns an incorrect empty result."
+  #{"a" "about" "an" "are" "as" "at" "be" "by" "com" "de" "en" "for" "from"
+    "how" "i" "in" "is" "it" "la" "of" "on" "or" "that" "the" "this" "to" "was"
+    "what" "when" "where" "who" "will" "with" "und" "www"})
 
 (defn- search-units
   "Parse a user query into quoted phrases and unquoted word tokens. Boolean-mode operators are not
@@ -37,9 +42,11 @@
   "Translate plain user input into a safe MariaDB boolean query plus LIKE fallbacks. Unquoted words
    are required prefix matches; quoted text is a required phrase. Phrases containing a short token
    and individual short words use LIKE because InnoDB does not index them by default."
-  [search-text]
+  [search-text min-token-length]
   (reduce (fn [{:keys [boolean-parts] :as plan} {:keys [type text words]}]
-            (if (every? #(>= (count %) fulltext-min-token-length) words)
+            (if (every? #(and (>= (count %) min-token-length)
+                              (not (contains? innodb-default-stopwords (str/lower-case %))))
+                        words)
               (update plan :boolean-parts conj
                       (if (= :phrase type) (str "+\"" text "\"") (str "+" text "*")))
               (update plan :like-terms conj text)))
@@ -47,8 +54,8 @@
           (search-units search-text)))
 
 (defn- maria-fulltext-condition
-  [search-text]
-  (let [{:keys [boolean-parts like-terms]} (fulltext-search-plan search-text)
+  [search-text min-token-length]
+  (let [{:keys [boolean-parts like-terms]} (fulltext-search-plan search-text min-token-length)
         conditions (concat
                     (when (seq boolean-parts)
                       [[:raw ["MATCH(bodies.content) AGAINST ("
@@ -90,11 +97,11 @@
    search-text adds no filter. When a date filter is active, correlated? selects a date-first EXISTS
    plan; otherwise the matching message ids are resolved once with a non-correlated IN subquery.
    MariaDB uses its FULLTEXT index; SQLite retains the literal substring search."
-  [search-text correlated? fulltext?]
+  [search-text correlated? fulltext-min-token-length]
   (when-not (str/blank? search-text)
     (related-message->where :bodies :bodies.message-id
-                            (if fulltext?
-                              (maria-fulltext-condition search-text)
+                            (if fulltext-min-token-length
+                              (maria-fulltext-condition search-text fulltext-min-token-length)
                               (like-contains :bodies.content search-text))
                             correlated?)))
 
@@ -327,12 +334,12 @@
    given every OTHER active filter — e.g. once a category is picked, the From checklist only offers
    senders who actually have mail in that category — the same way Excel's own AutoFilter narrows a
    column's dropdown as other filters are applied."
-  [parameters date-filter fulltext? excluding category-selection subject-selection from-selection to-selection]
+  [parameters date-filter fulltext-min-token-length excluding category-selection subject-selection from-selection to-selection]
   (let [date-filter-active? (some? date-filter)]
     (combine-wheres
      [date-filter
       (filter->where (:filter parameters))
-      (content->where (:search-text parameters) date-filter-active? fulltext?)
+      (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
       (when-not (= excluding :subject) (subject-values->where subject-selection))
       (when-not (= excluding :from) (sender-keys->where from-selection date-filter-active?))
       (when-not (= excluding :to) (recipient-keys->where to-selection date-filter-active?))
@@ -364,8 +371,10 @@
         to-selection (checklist-selection parameters :to-keys :to-keys-exclude :to-keys-none)
         date-filter (date->where (:date-from parameters) (:date-to parameters))
         date-filter-active? (some? date-filter)
-        fulltext? (= :mariadb (:db-type context))
-        other-where (partial other-filters-where parameters date-filter fulltext?)
+        fulltext-min-token-length (when (= :mariadb (:db-type context))
+                                    (long (or (:fulltext-min-token-length context)
+                                              default-fulltext-min-token-length)))
+        other-where (partial other-filters-where parameters date-filter fulltext-min-token-length)
         cat-list (annotate-checked-by (categories db) category-selection #(or (:id %) uncategorized-token))
         reachable-categories (reachable-category-tokens db (other-where :category category-selection subject-selection from-selection to-selection))
         category-filter-options (filterv #(contains? reachable-categories (str (or (:id %) uncategorized-token))) cat-list)
@@ -374,7 +383,7 @@
         recipient-list (annotate-checked-by (int/fetch-distinct-recipients db (other-where :to category-selection subject-selection from-selection to-selection)) to-selection :contact_key)
         where (combine-wheres [date-filter
                                (filter->where (:filter parameters))
-                               (content->where (:search-text parameters) date-filter-active? fulltext?)
+                               (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
                                (subject-values->where subject-selection)
                                (sender-keys->where from-selection date-filter-active?)
                                (recipient-keys->where to-selection date-filter-active?)

@@ -126,6 +126,18 @@
       (is (some #{"%AI%"} params) "Terms below InnoDB's default token length retain a LIKE fallback")))
   "MariaDB body searches use FULLTEXT without silently breaking short search terms")
 
+(deftest emails-query-falls-back-for-stopwords-and-the-configured-token-length
+  (let [query (atom nil)
+        database (stub-emails-db #(reset! query %) {:total 0 :data []})]
+    (app/fetch-emails {:db database :db-type :mariadb :fulltext-min-token-length 4}
+                      {:search-text "annual the www abc" :size 20})
+    (let [[sql & params] (honey/format (:where @query))]
+      (is (re-find #"MATCH\(bodies\.content\)" sql))
+      (is (some #{"+annual*"} params))
+      (is (every? (set params) ["%the%" "%www%" "%abc%"])
+          "Default stopwords and tokens below the server's configured minimum retain LIKE fallbacks")))
+  "FULLTEXT search honours both InnoDB stopwords and innodb_ft_min_token_size")
+
 (deftest emails-query-keeps-punctuation-only-search-literal-on-mariadb
   (let [query (atom nil)
         database (stub-emails-db #(reset! query %) {:total 0 :data []})]

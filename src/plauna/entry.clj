@@ -82,7 +82,9 @@
     (when (= :sqlite (db/db-type))
       (files/check-and-create-database-file))
     (let [context {:config application-config :client (ImapClient.) :db (SqliteDB.)
-                   :db-type (db/db-type) :analyzer (BasicAnalyzer.)}]
+                   :db-type (db/db-type)
+                   :fulltext-min-token-length (db/fulltext-min-token-length)
+                   :analyzer (BasicAnalyzer.)}]
       (db/create-db)
       (let [db-vals (into {} (map #(vector % (db/fetch-preference %))
                                   [:log-level :language-detection-threshold
