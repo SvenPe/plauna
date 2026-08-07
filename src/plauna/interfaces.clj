@@ -23,7 +23,10 @@
   (connections [this] "Get a list of connections")
   (create-category-directories! [this connection-data category-names])
   (connection-id-for-email [this connections email])
-  (move-email-between-categories [this connection-id message-id old-category new-category context])
+  (move-email-between-categories [this connection-id message-id old-category new-category context]
+    "Move a stored message between category folders. Return true on success, :not-found when the
+     source folder was searched successfully but contains no matching message, and false for other
+     failures such as a disconnected store.")
   (move-email-to-category [this connection-id original-message original-folder category])
   (nth-email-from-folder [this n folder])
   (current-folder-name [this folder] "Return the full IMAP name of a folder object.")

@@ -16,21 +16,87 @@
 (defn- like-contains [column text]
   [:like column [:escape (str "%" (escape-like text) "%") "\\"]])
 
+(def ^:private fulltext-min-token-length
+  "MariaDB/InnoDB's default innodb_ft_min_token_size. Shorter terms use LIKE so searches such as
+   'AI' keep working even though they are absent from the FULLTEXT index."
+  3)
+
+(defn- search-units
+  "Parse a user query into quoted phrases and unquoted word tokens. Boolean-mode operators are not
+   passed through: search input is always treated as text, never as MariaDB query syntax."
+  [search-text]
+  (mapcat (fn [[_ phrase unquoted]]
+            (let [text (or phrase unquoted)
+                  words (re-seq #"[\p{L}\p{N}_]+" text)]
+              (if phrase
+                (when (seq words) [{:type :phrase :text (str/join " " words) :words words}])
+                (map (fn [word] {:type :word :text word :words [word]}) words))))
+          (re-seq #"\"([^\"]+)\"|(\S+)" search-text)))
+
+(defn- fulltext-search-plan
+  "Translate plain user input into a safe MariaDB boolean query plus LIKE fallbacks. Unquoted words
+   are required prefix matches; quoted text is a required phrase. Phrases containing a short token
+   and individual short words use LIKE because InnoDB does not index them by default."
+  [search-text]
+  (reduce (fn [{:keys [boolean-parts] :as plan} {:keys [type text words]}]
+            (if (every? #(>= (count %) fulltext-min-token-length) words)
+              (update plan :boolean-parts conj
+                      (if (= :phrase type) (str "+\"" text "\"") (str "+" text "*")))
+              (update plan :like-terms conj text)))
+          {:boolean-parts [] :like-terms []}
+          (search-units search-text)))
+
+(defn- maria-fulltext-condition
+  [search-text]
+  (let [{:keys [boolean-parts like-terms]} (fulltext-search-plan search-text)
+        conditions (concat
+                    (when (seq boolean-parts)
+                      [[:raw ["MATCH(bodies.content) AGAINST ("
+                               [:lift (str/join " " boolean-parts)]
+                               " IN BOOLEAN MODE)"]]])
+                    (map #(like-contains :bodies.content %) like-terms))]
+    (cond
+      ;; Input containing only punctuation has no FULLTEXT token. Keep literal substring semantics
+      ;; for that edge case instead of accidentally turning a non-blank search into no condition.
+      (empty? conditions) (like-contains :bodies.content search-text)
+      (= 1 (count conditions)) (first conditions)
+      :else (into [:and] conditions))))
+
 (defn- filter->where [filter]
   (cond
     (= filter "enriched-only") [:and [:<> :metadata.category nil] [:<> :metadata.language nil]]
     (= filter "without-category") [:= :metadata.category nil]
     :else nil))
 
+(defn- related-message->where
+  "Build a semi-join from headers to a related table. With an active date filter, use a correlated
+   EXISTS so the optimizer can start with the indexed headers.date range and only probe related rows
+   for those headers. Without a date filter, retain the non-correlated IN form, which resolves the
+   related message ids once instead of probing the related table for every header in the mailbox."
+  [table message-id-column related-condition date-filter-active?]
+  (if date-filter-active?
+    [:exists {:select [message-id-column]
+              :from [table]
+              :where [:and
+                      [:= message-id-column :headers.message-id]
+                      related-condition]}]
+    [:in :headers.message-id
+     {:select [message-id-column]
+      :from [table]
+      :where related-condition}]))
+
 (defn- content->where
   "Build a where-clause matching e-mails whose body content contains search-text. A blank/nil
-   search-text adds no filter. A non-correlated IN subquery (not a correlated EXISTS): the matching
-   message-ids are resolved once instead of probing bodies for every header row — the count query
-   re-runs the whole clause, so a correlated probe would run twice per page load."
-  [search-text]
+   search-text adds no filter. When a date filter is active, correlated? selects a date-first EXISTS
+   plan; otherwise the matching message ids are resolved once with a non-correlated IN subquery.
+   MariaDB uses its FULLTEXT index; SQLite retains the literal substring search."
+  [search-text correlated? fulltext?]
   (when-not (str/blank? search-text)
-    [:in :headers.message-id
-     {:select [:bodies.message-id] :from [:bodies] :where (like-contains :bodies.content search-text)}]))
+    (related-message->where :bodies :bodies.message-id
+                            (if fulltext?
+                              (maria-fulltext-condition search-text)
+                              (like-contains :bodies.content search-text))
+                            correlated?)))
 
 (defn- contact-keys->where
   "Build a where-clause for e-mails with a participant of one of participant-types (e.g.
@@ -39,30 +105,33 @@
    contact-keys, or {:exclude [...]} to match everything EXCEPT those contact-keys (the checklist UI
    submits whichever list is shorter — see emails.html's submitFilterForm — so a mailbox with
    hundreds of senders never has to send hundreds of query parameters just to exclude a few).
-   Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention."
-  [participant-types {:keys [include exclude]}]
+   Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention.
+   :none? is the explicit empty selection and therefore matches no rows."
+  [participant-types {:keys [include exclude none?]} correlated?]
   (cond
+    none? [:= 1 0]
+
     (seq include)
-    [:in :headers.message-id
-     {:select [:communications.message-id]
-      :from [:communications]
-      :where [:and
-              [:in :communications.type participant-types]
-              [:in :communications.contact-key include]]}]
+    (related-message->where :communications :communications.message-id
+                            [:and
+                             [:in :communications.type participant-types]
+                             [:in :communications.contact-key include]]
+                            correlated?)
 
     (seq exclude)
-    [:in :headers.message-id
-     {:select [:communications.message-id]
-      :from [:communications]
-      :where [:and
-              [:in :communications.type participant-types]
-              [:not-in :communications.contact-key exclude]]}]
+    (related-message->where :communications :communications.message-id
+                            [:and
+                             [:in :communications.type participant-types]
+                             [:not-in :communications.contact-key exclude]]
+                            correlated?)
 
     :else nil))
 
-(defn- sender-keys->where [selection] (contact-keys->where ["sender" ":sender"] selection))
+(defn- sender-keys->where [selection correlated?]
+  (contact-keys->where ["sender" ":sender"] selection correlated?))
 
-(defn- recipient-keys->where [selection] (contact-keys->where ["receiver" ":receiver"] selection))
+(defn- recipient-keys->where [selection correlated?]
+  (contact-keys->where ["receiver" ":receiver"] selection correlated?))
 
 (defn- subject-values->where
   "selection is {:include [...]} to match only those subjects, or {:exclude [...]} to match every
@@ -70,8 +139,9 @@
    Exclusion must keep NULL-subject rows explicitly: NOT IN is UNKNOWN for NULL, so unchecking one
    named subject would otherwise also hide every email with a missing subject, even though missing
    subjects never appear in the checklist."
-  [{:keys [include exclude]}]
+  [{:keys [include exclude none?]}]
   (cond
+    none? [:= 1 0]
     (seq include) [:in :headers.subject include]
     (seq exclude) [:or [:not-in :headers.subject exclude] [:is :headers.subject nil]]
     :else nil))
@@ -126,13 +196,16 @@
      list is shorter — see emails.html's submitFilterForm — so this only kicks in once more than
      half the checkboxes are checked, keeping the query string short either way).
    Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention
-   (also how an Excel column filter behaves before you touch it: nothing unchecked yet)."
-  [{:keys [include exclude]}]
+   (also how an Excel column filter behaves before you touch it: nothing unchecked yet). :none? is
+   the explicit empty selection and therefore matches no rows."
+  [{:keys [include exclude none?]}]
   (let [include-uncategorized? (contains? (set include) uncategorized-token)
         include-ids (category-tokens->numeric-ids include)
         exclude-uncategorized? (contains? (set exclude) uncategorized-token)
         exclude-ids (category-tokens->numeric-ids exclude)]
     (cond
+      none? [:= 1 0]
+
       (seq include)
       (cond
         (and include-uncategorized? (seq include-ids)) [:or [:in :metadata.category include-ids] [:= :metadata.category nil]]
@@ -201,20 +274,42 @@
                            (error-result e "There was an error when trying to log in.")))))
 
 (defn- checklist-selection
-  "Normalize a checklist filter's raw request parameters into {:include [...] :exclude [...]}.
+  "Normalize a checklist filter's raw request parameters into
+   {:include [...] :exclude [...] :none? boolean}.
    Exactly one side is ever populated by the UI (see emails.html's submitFilterForm), but both are
    defensively blank-filtered here."
-  [parameters include-key exclude-key]
+  [parameters include-key exclude-key none-key]
   {:include (remove str/blank? (get parameters include-key))
-   :exclude (remove str/blank? (get parameters exclude-key))})
+   :exclude (remove str/blank? (get parameters exclude-key))
+   :none? (= "true" (get parameters none-key))})
+
+(defn- selection-filter-active? [{:keys [include exclude none?]}]
+  (boolean (or none? (seq include) (seq exclude))))
+
+(defn- selection-filter-label [label {:keys [include exclude none?]}]
+  (cond
+    none? (str label ": none")
+    (seq include) (str label ": " (count include) " selected")
+    (seq exclude) (str label ": all except " (count exclude))
+    :else nil))
+
+(defn- selection-filter-badge [{:keys [include exclude none?]}]
+  (cond none? "0"
+        (seq include) (str (count include))
+        (seq exclude) (str "−" (count exclude))
+        :else nil))
 
 (defn- annotate-checked-by
   "Mark each item's :checked? state to match selection {:include [...] :exclude [...]}:
    - Both empty (the default, unfiltered state — nothing has been unchecked yet): every item checked.
    - :include non-empty: only items whose (key-fn item) appears in it are checked.
-   - :exclude non-empty: every item is checked EXCEPT those whose (key-fn item) appears in it."
-  [items {:keys [include exclude]} key-fn]
+   - :exclude non-empty: every item is checked EXCEPT those whose (key-fn item) appears in it.
+   - :none? true: every item is unchecked."
+  [items {:keys [include exclude none?]} key-fn]
   (cond
+    none?
+    (mapv (fn [item] (assoc item :checked? false)) items)
+
     (seq include)
     (let [selected (set include)]
       (mapv (fn [item] (assoc item :checked? (contains? selected (str (key-fn item))))) items))
@@ -232,15 +327,16 @@
    given every OTHER active filter — e.g. once a category is picked, the From checklist only offers
    senders who actually have mail in that category — the same way Excel's own AutoFilter narrows a
    column's dropdown as other filters are applied."
-  [parameters excluding category-selection subject-selection from-selection to-selection]
-  (combine-wheres
-   [(filter->where (:filter parameters))
-    (content->where (:search-text parameters))
-    (when-not (= excluding :subject) (subject-values->where subject-selection))
-    (when-not (= excluding :from) (sender-keys->where from-selection))
-    (when-not (= excluding :to) (recipient-keys->where to-selection))
-    (when-not (= excluding :category) (category-ids->where category-selection))
-    (date->where (:date-from parameters) (:date-to parameters))]))
+  [parameters date-filter fulltext? excluding category-selection subject-selection from-selection to-selection]
+  (let [date-filter-active? (some? date-filter)]
+    (combine-wheres
+     [date-filter
+      (filter->where (:filter parameters))
+      (content->where (:search-text parameters) date-filter-active? fulltext?)
+      (when-not (= excluding :subject) (subject-values->where subject-selection))
+      (when-not (= excluding :from) (sender-keys->where from-selection date-filter-active?))
+      (when-not (= excluding :to) (recipient-keys->where to-selection date-filter-active?))
+      (when-not (= excluding :category) (category-ids->where category-selection))])))
 
 (defn- reachable-category-tokens
   "The set of category tokens (a numeric id, stringified, or uncategorized-token) that occur among
@@ -262,32 +358,42 @@
    (:categories in the result), which always offers every category regardless of the list's filter."
   [context parameters]
   (let [db (:db context)
-        category-selection (checklist-selection parameters :category-ids :category-ids-exclude)
-        subject-selection (checklist-selection parameters :subject-values :subject-values-exclude)
-        from-selection (checklist-selection parameters :from-keys :from-keys-exclude)
-        to-selection (checklist-selection parameters :to-keys :to-keys-exclude)
-        other-where (partial other-filters-where parameters)
+        category-selection (checklist-selection parameters :category-ids :category-ids-exclude :category-ids-none)
+        subject-selection (checklist-selection parameters :subject-values :subject-values-exclude :subject-values-none)
+        from-selection (checklist-selection parameters :from-keys :from-keys-exclude :from-keys-none)
+        to-selection (checklist-selection parameters :to-keys :to-keys-exclude :to-keys-none)
+        date-filter (date->where (:date-from parameters) (:date-to parameters))
+        date-filter-active? (some? date-filter)
+        fulltext? (= :mariadb (:db-type context))
+        other-where (partial other-filters-where parameters date-filter fulltext?)
         cat-list (annotate-checked-by (categories db) category-selection #(or (:id %) uncategorized-token))
         reachable-categories (reachable-category-tokens db (other-where :category category-selection subject-selection from-selection to-selection))
         category-filter-options (filterv #(contains? reachable-categories (str (or (:id %) uncategorized-token))) cat-list)
         subject-list (annotate-checked-by (int/fetch-distinct-subjects db (other-where :subject category-selection subject-selection from-selection to-selection)) subject-selection :subject)
         sender-list (annotate-checked-by (int/fetch-distinct-senders db (other-where :from category-selection subject-selection from-selection to-selection)) from-selection :contact_key)
         recipient-list (annotate-checked-by (int/fetch-distinct-recipients db (other-where :to category-selection subject-selection from-selection to-selection)) to-selection :contact_key)
-        where (combine-wheres [(filter->where (:filter parameters))
-                               (content->where (:search-text parameters))
+        where (combine-wheres [date-filter
+                               (filter->where (:filter parameters))
+                               (content->where (:search-text parameters) date-filter-active? fulltext?)
                                (subject-values->where subject-selection)
-                               (sender-keys->where from-selection)
-                               (recipient-keys->where to-selection)
-                               (category-ids->where category-selection)
-                               (date->where (:date-from parameters) (:date-to parameters))])
+                               (sender-keys->where from-selection date-filter-active?)
+                               (recipient-keys->where to-selection date-filter-active?)
+                               (category-ids->where category-selection)])
         customization-clause (cond-> {:order-by [[:date :desc]]}
                                where (assoc :where where))
         page-req (page/page-request (:page parameters) (:size parameters))
         ;; :with-bodies false — the list renders no body content, so don't materialize
         ;; up to 500 e-mails' full MIME bodies per page.
         result (int/fetch-emails db {:entity :enriched-email :strict false :page page-req :with-bodies false} customization-clause)]
-    {:data (:data result)
-     :parameters {:filter (:filter parameters)
+    (let [subject-active? (selection-filter-active? subject-selection)
+          from-active? (selection-filter-active? from-selection)
+          to-active? (selection-filter-active? to-selection)
+          category-active? (selection-filter-active? category-selection)
+          search-active? (not (str/blank? (:search-text parameters)))
+          date-active? (some? date-filter)
+          metadata-active? (contains? #{"enriched-only" "without-category"} (:filter parameters))]
+      {:data (:data result)
+       :parameters {:filter (:filter parameters)
                   :total-pages (page/calculate-pages-total (:total result) (:size page-req))
                   :size (:size page-req)
                   :page (:page result)
@@ -295,16 +401,37 @@
                   :search-text (:search-text parameters)
                   :subject-values (:include subject-selection)
                   :subject-values-exclude (:exclude subject-selection)
+                  :subject-values-none (when (:none? subject-selection) "true")
+                  :subject-filter-active? subject-active?
+                  :subject-filter-label (selection-filter-label "Subject" subject-selection)
+                  :subject-filter-badge (selection-filter-badge subject-selection)
                   :from-keys (:include from-selection)
                   :from-keys-exclude (:exclude from-selection)
+                  :from-keys-none (when (:none? from-selection) "true")
+                  :from-filter-active? from-active?
+                  :from-filter-label (selection-filter-label "From" from-selection)
+                  :from-filter-badge (selection-filter-badge from-selection)
                   :to-keys (:include to-selection)
                   :to-keys-exclude (:exclude to-selection)
+                  :to-keys-none (when (:none? to-selection) "true")
+                  :to-filter-active? to-active?
+                  :to-filter-label (selection-filter-label "To" to-selection)
+                  :to-filter-badge (selection-filter-badge to-selection)
                   :category-ids (:include category-selection)
                   :category-ids-exclude (:exclude category-selection)
+                  :category-ids-none (when (:none? category-selection) "true")
+                  :category-filter-active? category-active?
+                  :category-filter-label (selection-filter-label "Category" category-selection)
+                  :category-filter-badge (selection-filter-badge category-selection)
                   :date-from (:date-from parameters)
-                  :date-to (:date-to parameters)}
-     :optional {:categories cat-list :category-filter-options category-filter-options
-                :subjects subject-list :senders sender-list :recipients recipient-list}}))
+                  :date-to (:date-to parameters)
+                  :search-active? search-active?
+                  :date-active? date-active?
+                  :metadata-active? metadata-active?
+                  :any-filter-active? (boolean (or search-active? date-active? metadata-active?
+                                                   subject-active? from-active? to-active? category-active?))}
+       :optional {:categories cat-list :category-filter-options category-filter-options
+                  :subjects subject-list :senders sender-list :recipients recipient-list}})))
 
 (defn create-new-category! [context category destination-folder color]
   (let [db (:db context)
@@ -340,18 +467,21 @@
             (some? connection-id-guess)
             (do
               (t/log! :debug ["Email seems to belong to the connection with the id" connection-id-guess])
-              (if (true? (int/move-email-between-categories client connection-id-guess message-id old-category category context))
-                (success-result :ok nil)
-                (error-result nil "Moving email failed. Please check the logs.")))
+              (let [move-result (int/move-email-between-categories client connection-id-guess message-id old-category category context)]
+                (cond
+                  (true? move-result) (success-result :ok nil)
+                  (= :not-found move-result) (success-result :not-found nil)
+                  :else (error-result nil "Moving email failed. Please check the logs."))))
 
             :else
             (let [results (for [conn connections
                                 :let [id (get-in conn [:config :id])]]
                             (do (t/log! :debug ["Move message-id" message-id])
                                 (int/move-email-between-categories client id message-id old-category category context)))]
-              (if (some true? results)
-                (success-result :ok nil)
-                (error-result nil "Moving email failed. Please check the logs."))))
+              (cond
+                (some true? results) (success-result :ok nil)
+                (every? #(= :not-found %) results) (success-result :not-found nil)
+                :else (error-result nil "Moving email failed. Please check the logs."))))
 
       (catch Exception e (t/log! :error e) (error-result e "Moving email failed. Please check the logs.")))))
 

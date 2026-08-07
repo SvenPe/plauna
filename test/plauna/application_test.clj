@@ -1,5 +1,6 @@
 (ns plauna.application-test
   (:require [clojure.test :refer :all]
+            [honey.sql :as honey]
             [plauna.interfaces :as int]
             [taoensso.telemere :as t]
             [plauna.application :as app]))
@@ -113,6 +114,29 @@
             :order-by [[:date :desc]]}
            @query))))
 
+(deftest emails-query-uses-mariadb-fulltext-with-short-term-fallback
+  (let [query (atom nil)
+        database (stub-emails-db #(reset! query %) {:total 0 :data []})]
+    (app/fetch-emails {:db database :db-type :mariadb}
+                      {:search-text "annual invo \"exact phrase\" AI" :size 20})
+    (let [[sql & params] (honey/format (:where @query))]
+      (is (re-find #"MATCH\(bodies\.content\) AGAINST \(\? IN BOOLEAN MODE\)" sql))
+      (is (some #{"+annual* +invo* +\"exact phrase\""} params)
+          "Words are required prefix matches and quoted text remains a phrase")
+      (is (some #{"%AI%"} params) "Terms below InnoDB's default token length retain a LIKE fallback")))
+  "MariaDB body searches use FULLTEXT without silently breaking short search terms")
+
+(deftest emails-query-keeps-punctuation-only-search-literal-on-mariadb
+  (let [query (atom nil)
+        database (stub-emails-db #(reset! query %) {:total 0 :data []})]
+    (app/fetch-emails {:db database :db-type :mariadb}
+                      {:search-text "---" :size 20})
+    (let [[sql & params] (honey/format (:where @query))]
+      (is (not (re-find #"MATCH" sql)))
+      (is (re-find #"bodies\.content LIKE" sql))
+      (is (some #{"%---%"} params))))
+  "A non-blank query that has no indexable token must not silently become an unfiltered search")
+
 (deftest create-a-category
   (let [db-called (atom false)
         client-called (atom false)
@@ -183,6 +207,15 @@
     (is (= :error (:result test-result))))
   "Unsuccessfully moving an email with a guessed connection id returns result :error")
 
+(deftest move-email-with-guessed-connection-id-not-found
+  (let [client (reify int/EmailClient
+                 (connections [_] {"test" {}})
+                 (connection-id-for-email [_ _ _] "test")
+                 (move-email-between-categories [_ _ _ _ _ _] :not-found))
+        test-result (app/move-email-to-category {} "test-cat" {:client client})]
+    (is (= :not-found (:result test-result))))
+  "A successfully searched source folder without the message remains distinguishable from a general move error")
+
 (deftest move-email-without-guessed-connection-id-success
   (let [client (reify int/EmailClient
                  (connections [_] {"test1" {:config {:id "test1"}} "test2" {:config {:id "test2"}}})
@@ -200,6 +233,24 @@
         test-result (app/move-email-to-category {} "test-cat" {:client client})]
     (is (= :error (:result test-result))))
   "Unsuccessfully moving an email without guessed connection id returns result :error")
+
+(deftest move-email-without-guessed-connection-id-not-found
+  (let [client (reify int/EmailClient
+                 (connections [_] {"test1" {:config {:id "test1"}} "test2" {:config {:id "test2"}}})
+                 (connection-id-for-email [_ _ _] nil)
+                 (move-email-between-categories [_ _ _ _ _ _] :not-found))
+        test-result (app/move-email-to-category {} "test-cat" {:client client})]
+    (is (= :not-found (:result test-result))))
+  "When every connected account was searched without a match, the result is :not-found")
+
+(deftest move-email-does-not-mask-a-general-error-as-not-found
+  (let [client (reify int/EmailClient
+                 (connections [_] {"test1" {:config {:id "test1"}} "test2" {:config {:id "test2"}}})
+                 (connection-id-for-email [_ _ _] nil)
+                 (move-email-between-categories [_ id _ _ _ _] (if (= id "test1") :not-found false)))
+        test-result (app/move-email-to-category {} "test-cat" {:client client})]
+    (is (= :error (:result test-result))))
+  "A disconnected or otherwise failed account keeps the aggregate result generic even if another account reports :not-found")
 
 (deftest handle-incoming-email-analyzer-exception
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] (throw (ex-info "test exception" {}))))
@@ -363,6 +414,22 @@
       (is (some #{:headers.date} where-flat) "Filters on the date column")))
   "Date-from/date-to are translated into a date-range filter on the email date")
 
+(deftest fetch-emails-uses-date-first-related-filter-strategy
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :search-text "invoice"
+                                :from-keys ["sender-key"] :to-keys ["recipient-key"]
+                                :page 1 :size 20 :date-from "2026-06-01" :date-to "2026-06-30"})
+    (let [where (:where @captured)
+          nodes (tree-seq coll? seq where)
+          exists-clauses (filter #(and (vector? %) (= :exists (first %))) nodes)]
+      (is (= :and (first where)))
+      (is (= :and (first (second where))) "The indexed date range is the first outer condition")
+      (is (= 3 (count exists-clauses)) "Body, sender and recipient use correlated EXISTS")
+      (is (some #{[:= :bodies.message-id :headers.message-id]} nodes))
+      (is (some #{[:= :communications.message-id :headers.message-id]} nodes))))
+  "An active date range drives related-table filters from the reduced header set")
+
 (deftest fetch-emails-applies-content-search
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
@@ -404,7 +471,7 @@
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :subject-values nil :page 1 :size 20})
     (is (not (contains? @captured :where))))
-  "No subject checked (the default, before any checkbox is unchecked) adds no filter")
+  "An absent subject selection (the default, where all boxes render checked) adds no filter")
 
 (deftest fetch-emails-applies-subject-values-exclude-filter
   (let [captured (atom nil)
@@ -412,6 +479,17 @@
     (app/fetch-emails {:db db} {:filter "all" :subject-values-exclude ["Spam"] :page 1 :size 20})
     (is (= {:where [:or [:not-in :headers.subject ["Spam"]] [:is :headers.subject nil]] :order-by [[:date :desc]]} @captured)))
   "Excluded subjects match every other subject, including emails without a subject (NOT IN is UNKNOWN for NULL)")
+
+(deftest fetch-emails-distinguishes-no-subjects-from-an-unfiltered-subject-list
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})
+        result (app/fetch-emails {:db db} {:filter "all" :subject-values-none "true" :page 1 :size 20})]
+    (is (= {:where [:= 1 0] :order-by [[:date :desc]]} @captured)
+        "An explicitly empty selection matches no rows instead of resetting the filter")
+    (is (true? (get-in result [:parameters :subject-filter-active?])))
+    (is (= "0" (get-in result [:parameters :subject-filter-badge])))
+    (is (= "true" (get-in result [:parameters :subject-values-none]))))
+  "The UI can represent the intuitive all-unchecked state independently from Reset")
 
 (deftest fetch-emails-applies-from-keys-filter
   (let [captured (atom nil)

@@ -76,25 +76,26 @@
   (setup-logging)
   (register-shutdown-hook!)
   (let [application-config (files/parse-config-from-cli-arguments args)
-        context {:config application-config :client (ImapClient.) :db (SqliteDB.) :analyzer (BasicAnalyzer.)}]
-    (let [db-config (db-cfg/load-config)]
-      (db/setup-db! db-config)
-      (when (= :sqlite (:type db-config))
-        (files/check-and-create-database-file)))
-    (db/create-db)
-    (let [db-vals (into {} (map #(vector % (db/fetch-preference %))
-                               [:log-level :language-detection-threshold
-                                :categorization-threshold :client-health-check-interval
-                                :categorization-algorithm]))]
-      (when (settings/migrate-from-db-values! db-vals)
-        (t/log! :info "Preferences migrated to settings.json.")))
-    (auth/initialize!)
-    (t/log! :info "Setting log level according to preferences.")
-    (t/set-min-level! (preferences/log-level))
-    (diagnostics/start-watchdog! 60)
-    (start-imap-client context)
-    (events/start-event-loops event-register)
-    (server/start-server context)))
+        db-config (db-cfg/load-config)]
+    (db/setup-db! db-config)
+    (when (= :sqlite (db/db-type))
+      (files/check-and-create-database-file))
+    (let [context {:config application-config :client (ImapClient.) :db (SqliteDB.)
+                   :db-type (db/db-type) :analyzer (BasicAnalyzer.)}]
+      (db/create-db)
+      (let [db-vals (into {} (map #(vector % (db/fetch-preference %))
+                                  [:log-level :language-detection-threshold
+                                   :categorization-threshold :client-health-check-interval
+                                   :categorization-algorithm]))]
+        (when (settings/migrate-from-db-values! db-vals)
+          (t/log! :info "Preferences migrated to settings.json.")))
+      (auth/initialize!)
+      (t/log! :info "Setting log level according to preferences.")
+      (t/set-min-level! (preferences/log-level))
+      (diagnostics/start-watchdog! 60)
+      (start-imap-client context)
+      (events/start-event-loops event-register)
+      (server/start-server context))))
 
 (comment
   (server/start-server {:config {:server {:port 8080}}})

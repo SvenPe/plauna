@@ -389,7 +389,8 @@
 (defn- set-messages-as-peek [messages] (doseq [message messages] (set-message-as-peek message)))
 
 (defn move-messages-by-id-between-category-folders
-  "Return true if the message could be moved. False if not."
+  "Return true if the message could be moved, :not-found if its source folder was searched but no
+   matching message exists, and false for other failures (for example a disconnected store)."
   [^String id message-id ^String source-name ^String target-name context]
   (let [^ConnectionData connection-data (connection-data-from-id id)]
     (if (connected? connection-data)
@@ -434,7 +435,7 @@
                   (db/update-email-folder message-id target-folder-name)
                   true))
               (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName store)])
-                  false))))))
+                  :not-found))))))
       (do
         (t/log! :info ["IMAP store in connection" (:id (:config connection-data)) "is not connected. Cancelling the move attempt."])
         false))))

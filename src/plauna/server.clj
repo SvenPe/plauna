@@ -297,12 +297,16 @@
                       :search-text {:default nil :type-fn identity}
                       :subject-values {:default nil :type-fn vectorize}
                       :subject-values-exclude {:default nil :type-fn vectorize}
+                      :subject-values-none {:default nil :type-fn identity}
                       :from-keys {:default nil :type-fn vectorize}
                       :from-keys-exclude {:default nil :type-fn vectorize}
+                      :from-keys-none {:default nil :type-fn identity}
                       :to-keys {:default nil :type-fn vectorize}
                       :to-keys-exclude {:default nil :type-fn vectorize}
+                      :to-keys-none {:default nil :type-fn identity}
                       :category-ids {:default nil :type-fn vectorize}
                       :category-ids-exclude {:default nil :type-fn vectorize}
+                      :category-ids-none {:default nil :type-fn identity}
                       :date-from {:default nil :type-fn identity}
                       :date-to {:default nil :type-fn identity}})
 
@@ -348,6 +352,42 @@
   (connect-control-response context request id))
 
 (defn empty-global-messages [] (reset! global-messages []))
+
+(defn recategorize-email-response
+  "Handle an inline category change. A missing IMAP message is reported separately so the browser
+   can ask whether only Plauna's stored metadata should be corrected. The follow-up force=true
+   request deliberately skips the IMAP move and updates that metadata."
+  [context params]
+  (let [message-id (:message-id params)
+        category (:category params)
+        force? (contains? #{true "true"} (:force params))
+        new-category-id (when (seq category) (Integer/parseInt category))]
+    (cond
+      ;; Clearing the category never needs an IMAP move.
+      (nil? new-category-id)
+      (do (db/update-metadata-category message-id nil 1.0)
+          {:status 204})
+
+      ;; The user explicitly confirmed that the message is gone. Only update Plauna's metadata.
+      force?
+      (do (db/update-metadata-category message-id new-category-id 1.0)
+          {:status 204})
+
+      :else
+      (let [email-before (enriched-email-by-message-id message-id)
+            new-category-name (get (first (filter #(= (:id %) new-category-id) (db/get-categories))) :name "")
+            process (app/move-email-to-category email-before new-category-name context)]
+        (case (:result process)
+          :ok (do (db/update-metadata-category message-id new-category-id 1.0)
+                  {:status 204})
+          :not-found {:status 404
+                      :headers {"Content-Type" "text/plain; charset=UTF-8"}
+                      :body "email-not-found"}
+          ;; A general move failure is intentionally not overridable through the missing-email
+          ;; dialog: the category stays unchanged and the field receives its existing amber signal.
+          {:status 200
+           :headers {"Content-Type" "text/plain; charset=UTF-8"}
+           :body "saved-not-moved"})))))
 
 (defmacro result-with-messages [markup-call messages-var]
   `(if (seq @~messages-var)
@@ -564,26 +604,9 @@
 
    (comp/POST "/metadata/category" request
      ;; Recategorize a single email immediately (the e-mail list's category dropdown calls this on
-     ;; change, so no "Batch Update" click is needed). The category is only persisted when the IMAP move
-     ;; succeeds, so the stored category always reflects the real IMAP location. Clearing (n/a) always
-     ;; saves without a move. Returns 204 on full success, 200 (amber in the UI) when the move failed,
-     ;; and 500 on unexpected error.
-     (let [message-id (:message-id (:params request))
-           category (:category (:params request))
-           new-category-id (when (seq category) (Integer/parseInt category))]
-       (if (nil? new-category-id)
-         ;; Clearing the category — no move, just save.
-         (do (db/update-metadata-category message-id nil 1.0)
-             {:status 204})
-         (let [email-before (enriched-email-by-message-id message-id)
-               new-category-name (get (first (filter #(= (:id %) new-category-id) (db/get-categories))) :name "")
-               process (app/move-email-to-category email-before new-category-name context)
-               moved? (= :ok (:result process))]
-           (if moved?
-             (do (db/update-metadata-category message-id new-category-id 1.0)
-                 {:status 204})
-             ;; Move failed — do not update the category so metadata stays consistent with the real folder.
-             {:status 200 :headers {"Content-Type" "text/plain"} :body "saved-not-moved"})))))
+     ;; change, so no "Batch Update" click is needed). A missing IMAP message returns 404 and lets the
+     ;; UI offer a metadata-only update; other move failures remain non-overridable.
+     (recategorize-email-response context (:params request)))
 
    (comp/POST "/metadata/language" request
      ;; Update a single email's detected language immediately (the language field calls this on change).

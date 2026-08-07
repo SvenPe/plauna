@@ -17,7 +17,7 @@
       <div class="flex" style="gap: 4px; flex-wrap: wrap;">
         <fieldset class="fieldset">
           <legend class="fieldset-legend">Metadata</legend>
-          <select class="select" name="filter">
+          <select class="select" name="filter" id="metadata-filter-input">
             <option {% if page.filter = "all" %} selected {% endif %} value="all">
               All
             </option>
@@ -30,9 +30,9 @@
           </select>
         </fieldset>
         <fieldset class="fieldset">
-          <legend class="fieldset-legend">Search Text</legend>
-          <input type="text" name="search-text" class="input" placeholder="E-mail content contains..." value="{{page.search-text}}" />
-          <p class="label">Searches the e-mail body content. Use the Subject, From, and To column filters for those fields.</p>
+          <legend class="fieldset-legend">Search Body</legend>
+          <input type="text" name="search-text" id="body-search-input" class="input" placeholder='Words or "exact phrase"...' value="{{page.search-text}}" />
+          <p class="label">All words are required. Word prefixes and quoted phrases are supported.</p>
         </fieldset>
         <fieldset class="fieldset">
           <legend class="fieldset-legend">Date Range</legend>
@@ -55,6 +55,48 @@
   </div>
 </div>
 
+{% if page.any-filter-active? %}
+<div class="flex flex-wrap items-center gap-2 my-3" aria-label="Active filters">
+  <span class="text-sm font-semibold">Active filters:</span>
+  {% if page.metadata-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('metadata')" title="Remove metadata filter">
+    Metadata: {{page.filter}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.search-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('search')" title="Remove body search">
+    Body: {{page.search-text}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.date-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('date')" title="Remove date filter">
+    Date: {{page.date-from|default:"…"}} – {{page.date-to|default:"…"}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.subject-filter-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('subject-filter-checkbox')" title="Remove subject filter">
+    {{page.subject-filter-label}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.from-filter-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('from-filter-checkbox')" title="Remove sender filter">
+    {{page.from-filter-label}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.to-filter-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('to-filter-checkbox')" title="Remove recipient filter">
+    {{page.to-filter-label}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  {% if page.category-filter-active? %}
+  <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('category-filter-checkbox')" title="Remove category filter">
+    {{page.category-filter-label}} <span aria-hidden="true">×</span>
+  </button>
+  {% endif %}
+  <a class="btn btn-ghost btn-xs" href="/emails?size={{page.size}}">Clear all</a>
+</div>
+{% endif %}
+
 {% include "emails-pagination.html" %}
 
 <!-- The table renders even with zero results: hiding it along with the filter bar would make an
@@ -65,110 +107,134 @@
       <tr class="table-row">
         <th class="table-cell text-left"><strong>Date</strong></th>
         <th class="table-cell text-left">
-          <div class="dropdown">
-            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+          <details class="dropdown">
+            <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.subject-filter-active? %}text-primary{% endif %}">
               <strong>Subject</strong>
+              {% if page.subject-filter-active? %}<span class="badge badge-primary badge-xs" title="{{page.subject-filter-label}}">{{page.subject-filter-badge}}</span>{% endif %}
               <span aria-hidden="true">▾</span>
-            </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
-              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search subjects..." oninput="filterChecklist(this, 'subject-checklist')">
+            </summary>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] min-w-0 overflow-hidden p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search subjects..." oninput="filterChecklist(this, 'subject-checklist', 'subject-filter-select-all')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
                 <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="subject-filter-select-all"
-                       onclick="toggleAllInChecklist(this, 'subject-filter-checkbox')" {% if page.subject-values|empty? %}checked{% endif %}>
-                <span class="font-semibold">(Select All)</span>
+                       onchange="toggleVisibleInChecklist(this, 'subject-filter-checkbox', 'subject-checklist')">
+                <span class="font-semibold">Select all visible</span>
               </label>
-              <div id="subject-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
+              <div id="subject-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1 w-full max-w-full min-w-0">
                 {% for subject-row in subjects %}
                 <label class="flex items-center gap-2 min-w-0" title="{{subject-row.subject}}">
                   <input type="checkbox" class="checkbox checkbox-sm subject-filter-checkbox shrink-0" name="subject-values"
-                         value="{{subject-row.subject}}" form="page-form" onchange="submitFilterForm()" {% if subject-row.checked? %}checked{% endif %}>
+                         value="{{subject-row.subject}}" form="page-form" data-applied-checked="{% if subject-row.checked? %}true{% else %}false{% endif %}"
+                         onchange="updateSelectAllState('subject-filter-select-all', 'subject-filter-checkbox', 'subject-checklist')" {% if subject-row.checked? %}checked{% endif %}>
                   <span class="truncate">{{subject-row.subject}}</span>
                 </label>
                 {% endfor %}
               </div>
-              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+              <div class="grid grid-cols-3 gap-1 mt-2 w-full max-w-full min-w-0">
+                <button class="btn btn-primary btn-xs w-full min-w-0" type="submit" form="page-form">Apply</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="resetChecklist('subject-filter-checkbox', 'subject-filter-select-all', 'subject-checklist')">Reset</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="cancelChecklist(this, 'subject-filter-checkbox', 'subject-filter-select-all', 'subject-checklist')">Cancel</button>
+              </div>
             </div>
-          </div>
+          </details>
         </th>
         <th class="hidden lg:table-cell text-left">
-          <div class="dropdown">
-            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+          <details class="dropdown">
+            <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.from-filter-active? %}text-primary{% endif %}">
               <strong>From</strong>
+              {% if page.from-filter-active? %}<span class="badge badge-primary badge-xs" title="{{page.from-filter-label}}">{{page.from-filter-badge}}</span>{% endif %}
               <span aria-hidden="true">▾</span>
-            </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
-              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search senders..." oninput="filterChecklist(this, 'from-checklist')">
+            </summary>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] min-w-0 overflow-hidden p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search senders..." oninput="filterChecklist(this, 'from-checklist', 'from-filter-select-all')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
                 <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="from-filter-select-all"
-                       onclick="toggleAllInChecklist(this, 'from-filter-checkbox')" {% if page.from-keys|empty? %}checked{% endif %}>
-                <span class="font-semibold">(Select All)</span>
+                       onchange="toggleVisibleInChecklist(this, 'from-filter-checkbox', 'from-checklist')">
+                <span class="font-semibold">Select all visible</span>
               </label>
-              <div id="from-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
+              <div id="from-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1 w-full max-w-full min-w-0">
                 {% for sender in senders %}
                 <label class="flex items-center gap-2 min-w-0" title="{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}">
                   <input type="checkbox" class="checkbox checkbox-sm from-filter-checkbox shrink-0" name="from-keys"
-                         value="{{sender.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if sender.checked? %}checked{% endif %}>
+                         value="{{sender.contact_key}}" form="page-form" data-applied-checked="{% if sender.checked? %}true{% else %}false{% endif %}"
+                         onchange="updateSelectAllState('from-filter-select-all', 'from-filter-checkbox', 'from-checklist')" {% if sender.checked? %}checked{% endif %}>
                   <span class="truncate">{% if sender.name %}{{sender.name}} - {{sender.address}}{% else %}{{sender.address}}{% endif %}</span>
                 </label>
                 {% endfor %}
               </div>
-              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+              <div class="grid grid-cols-3 gap-1 mt-2 w-full max-w-full min-w-0">
+                <button class="btn btn-primary btn-xs w-full min-w-0" type="submit" form="page-form">Apply</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="resetChecklist('from-filter-checkbox', 'from-filter-select-all', 'from-checklist')">Reset</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="cancelChecklist(this, 'from-filter-checkbox', 'from-filter-select-all', 'from-checklist')">Cancel</button>
+              </div>
             </div>
-          </div>
+          </details>
         </th>
         <th class="hidden lg:table-cell text-left">
-          <div class="dropdown">
-            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+          <details class="dropdown">
+            <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.to-filter-active? %}text-primary{% endif %}">
               <strong>To</strong>
+              {% if page.to-filter-active? %}<span class="badge badge-primary badge-xs" title="{{page.to-filter-label}}">{{page.to-filter-badge}}</span>{% endif %}
               <span aria-hidden="true">▾</span>
-            </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] p-3">
-              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search recipients..." oninput="filterChecklist(this, 'to-checklist')">
+            </summary>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-96 max-w-[90vw] min-w-0 overflow-hidden p-3">
+              <input type="text" class="input input-sm mb-2 w-full" placeholder="Search recipients..." oninput="filterChecklist(this, 'to-checklist', 'to-filter-select-all')">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
                 <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="to-filter-select-all"
-                       onclick="toggleAllInChecklist(this, 'to-filter-checkbox')" {% if page.to-keys|empty? %}checked{% endif %}>
-                <span class="font-semibold">(Select All)</span>
+                       onchange="toggleVisibleInChecklist(this, 'to-filter-checkbox', 'to-checklist')">
+                <span class="font-semibold">Select all visible</span>
               </label>
-              <div id="to-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
+              <div id="to-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1 w-full max-w-full min-w-0">
                 {% for recipient in recipients %}
                 <label class="flex items-center gap-2 min-w-0" title="{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}">
                   <input type="checkbox" class="checkbox checkbox-sm to-filter-checkbox shrink-0" name="to-keys"
-                         value="{{recipient.contact_key}}" form="page-form" onchange="submitFilterForm()" {% if recipient.checked? %}checked{% endif %}>
+                         value="{{recipient.contact_key}}" form="page-form" data-applied-checked="{% if recipient.checked? %}true{% else %}false{% endif %}"
+                         onchange="updateSelectAllState('to-filter-select-all', 'to-filter-checkbox', 'to-checklist')" {% if recipient.checked? %}checked{% endif %}>
                   <span class="truncate">{% if recipient.name %}{{recipient.name}} - {{recipient.address}}{% else %}{{recipient.address}}{% endif %}</span>
                 </label>
                 {% endfor %}
               </div>
-              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+              <div class="grid grid-cols-3 gap-1 mt-2 w-full max-w-full min-w-0">
+                <button class="btn btn-primary btn-xs w-full min-w-0" type="submit" form="page-form">Apply</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="resetChecklist('to-filter-checkbox', 'to-filter-select-all', 'to-checklist')">Reset</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="cancelChecklist(this, 'to-filter-checkbox', 'to-filter-select-all', 'to-checklist')">Cancel</button>
+              </div>
             </div>
-          </div>
+          </details>
         </th>
         <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
         <th class="text-left">
-          <div class="dropdown">
-            <div tabindex="0" role="button" class="inline-flex items-center gap-1">
+          <details class="dropdown">
+            <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.category-filter-active? %}text-primary{% endif %}">
               <strong>Category</strong>
+              {% if page.category-filter-active? %}<span class="badge badge-primary badge-xs" title="{{page.category-filter-label}}">{{page.category-filter-badge}}</span>{% endif %}
               <span aria-hidden="true">▾</span>
-            </div>
-            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-72 max-w-[90vw] p-3">
+            </summary>
+            <div tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow z-10 w-72 max-w-[90vw] min-w-0 overflow-hidden p-3">
               <label class="flex items-center gap-2 pb-2 mb-2 border-b border-base-300">
                 <input type="checkbox" class="checkbox checkbox-sm shrink-0" id="category-filter-select-all"
-                       onclick="toggleAllInChecklist(this, 'category-filter-checkbox')" {% if page.category-ids|empty? %}checked{% endif %}>
-                <span class="font-semibold">(Select All)</span>
+                       onchange="toggleVisibleInChecklist(this, 'category-filter-checkbox', 'category-checklist')">
+                <span class="font-semibold">Select all</span>
               </label>
-              <div class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1">
+              <div id="category-checklist" class="max-h-56 overflow-y-auto overflow-x-hidden flex flex-col gap-1 w-full max-w-full min-w-0">
                 {% for category in category-filter-options %}
                 <label class="flex items-center gap-2 min-w-0" title="{{category.name}}">
                   <input type="checkbox" class="checkbox checkbox-sm category-filter-checkbox shrink-0" name="category-ids"
-                         value="{{category.id|default:"n-a"}}" form="page-form" onchange="submitFilterForm()" {% if category.checked? %}checked{% endif %}>
+                         value="{{category.id|default:"n-a"}}" form="page-form" data-applied-checked="{% if category.checked? %}true{% else %}false{% endif %}"
+                         onchange="updateSelectAllState('category-filter-select-all', 'category-filter-checkbox', 'category-checklist')" {% if category.checked? %}checked{% endif %}>
                   <span class="inline-block w-3 h-3 rounded-full shrink-0" style="background-color: {{category.color|category-color}};"></span>
                   <span class="truncate">{{category.name}}</span>
                 </label>
                 {% endfor %}
               </div>
-              <button class="btn btn-primary btn-xs mt-2 w-full" type="submit" form="page-form">Apply</button>
+              <div class="grid grid-cols-3 gap-1 mt-2 w-full max-w-full min-w-0">
+                <button class="btn btn-primary btn-xs w-full min-w-0" type="submit" form="page-form">Apply</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="resetChecklist('category-filter-checkbox', 'category-filter-select-all', 'category-checklist')">Reset</button>
+                <button class="btn btn-ghost btn-xs w-full min-w-0" type="button" onclick="cancelChecklist(this, 'category-filter-checkbox', 'category-filter-select-all', 'category-checklist')">Cancel</button>
+              </div>
             </div>
-          </div>
+          </details>
         </th>
         <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
       </tr>
@@ -194,6 +260,16 @@
       {% endfor %}
     </tbody>
     </table>
+  </div>
+
+  <div id="missing-email-category-dialog" role="dialog" aria-modal="false"
+       aria-labelledby="missing-email-category-dialog-message"
+       class="hidden fixed z-50 w-72 max-w-[calc(100vw-1rem)] rounded-box border border-base-300 bg-base-100 p-3 shadow-xl">
+    <p id="missing-email-category-dialog-message" class="text-sm font-semibold">E-Mail konnte nicht gefunden werden. Trotzdem Kategorie ändern?</p>
+    <div class="mt-3 flex justify-end gap-2">
+      <button type="button" class="btn btn-ghost btn-sm" onclick="answerMissingEmailCategory(false)">Nein</button>
+      <button type="button" class="btn btn-primary btn-sm" onclick="answerMissingEmailCategory(true)">Ja</button>
+    </div>
   </div>
 
 {% if emails|empty? %}
@@ -262,12 +338,95 @@
     var row = select.closest('tr');
     if (row) { row.style.backgroundColor = color ? hexToRgba(color, ROW_TINT_ALPHA) : ''; }
   }
-  document.querySelectorAll('.category-select').forEach(applyCategoryColor);
+  document.querySelectorAll('.category-select').forEach(function (select) {
+    applyCategoryColor(select);
+    select.dataset.savedValue = select.value;
+  });
+
+  var pendingMissingEmailSelect = null;
+
+  function restoreSavedCategory(select) {
+    select.value = select.dataset.savedValue;
+    applyCategoryColor(select);
+  }
+
+  function hideMissingEmailCategoryDialog() {
+    var dialog = document.getElementById('missing-email-category-dialog');
+    dialog.classList.add('hidden');
+    pendingMissingEmailSelect = null;
+  }
+
+  function showMissingEmailCategoryDialog(select) {
+    var dialog = document.getElementById('missing-email-category-dialog');
+    var rect = select.getBoundingClientRect();
+    var dialogWidth = Math.min(288, window.innerWidth - 16);
+    var left = Math.max(8, Math.min(rect.left, window.innerWidth - dialogWidth - 8));
+    if (pendingMissingEmailSelect && pendingMissingEmailSelect !== select) {
+      pendingMissingEmailSelect.disabled = false;
+      restoreSavedCategory(pendingMissingEmailSelect);
+    }
+    dialog.classList.remove('hidden');
+    var below = rect.bottom + 6;
+    var above = rect.top - dialog.offsetHeight - 6;
+    var top = below + dialog.offsetHeight <= window.innerHeight - 8 ? below : above;
+    dialog.style.left = left + 'px';
+    dialog.style.top = Math.max(8, Math.min(top, window.innerHeight - dialog.offsetHeight - 8)) + 'px';
+    pendingMissingEmailSelect = select;
+    dialog.querySelector('button').focus();
+  }
+
+  function saveCategoryChange(select, force) {
+    select.disabled = true;
+    var fields = {'message-id': select.dataset.messageId, 'category': select.value};
+    if (force) { fields.force = 'true'; }
+    fetch('/metadata/category', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams(fields)
+    }).then(function (res) {
+      if (res.status === 204) {
+        select.disabled = false;
+        select.dataset.savedValue = select.value;
+        applyCategoryColor(select);
+        flash(select, '#16a34a');
+      } else if (res.status === 404 && !force) {
+        // Keep the select disabled while the nearby confirmation is open so another change cannot
+        // replace the pending value underneath the dialog.
+        showMissingEmailCategoryDialog(select);
+      } else {
+        select.disabled = false;
+        restoreSavedCategory(select);
+        flash(select, res.ok ? '#d97706' : '#dc2626');
+      }
+    }).catch(function () {
+      select.disabled = false;
+      restoreSavedCategory(select);
+      flash(select, '#dc2626');
+    });
+  }
+
+  function answerMissingEmailCategory(changeAnyway) {
+    var select = pendingMissingEmailSelect;
+    hideMissingEmailCategoryDialog();
+    if (!select) { return; }
+    if (changeAnyway) {
+      saveCategoryChange(select, true);
+    } else {
+      select.disabled = false;
+      restoreSavedCategory(select);
+    }
+  }
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && pendingMissingEmailSelect) {
+      answerMissingEmailCategory(false);
+    }
+  });
 
   // Recategorize (and move) an e-mail when its category dropdown changes - no "Batch Update" needed.
   function recategorizeEmail(select) {
     applyCategoryColor(select);
-    autosave(select, '/metadata/category', {'message-id': select.dataset.messageId, 'category': select.value});
+    saveCategoryChange(select, false);
   }
 
   // Save an e-mail's language when its language field changes.
@@ -275,45 +434,93 @@
     autosave(input, '/metadata/language', {'message-id': input.dataset.messageId, 'language': input.value});
   }
 
-  // Checking or unchecking a box in a Subject/From/To/Category filter dropdown applies the filter
-  // immediately - no separate "Apply" click needed. The Apply button stays as a fallback for
-  // keyboard use or if JavaScript fails to load.
-  function submitFilterForm() {
-    document.getElementById('page-form').requestSubmit();
+  function closeFilterDropdown(element) {
+    var details = element.closest('details.dropdown');
+    if (details) {
+      details.open = false;
+      return;
+    }
+    var active = document.activeElement;
+    if (active && element.closest('.dropdown').contains(active)) { active.blur(); }
   }
 
-  // Each column header's "(Select All)" checkbox in its Excel-style filter dropdown: only toggles
-  // the individual boxes. It does NOT submit - if it did, unchecking it would immediately submit an
-  // empty selection (which means "unfiltered", not "everything excluded") before you ever get a
-  // chance to check the one or two boxes you actually wanted.
-  function toggleAllInChecklist(masterCheckbox, checkboxClass) {
-    document.querySelectorAll('.' + checkboxClass).forEach(function (checkbox) {
-      checkbox.checked = masterCheckbox.checked;
+  // Native <details>/<summary> makes the filters work consistently in Safari as well as Chromium.
+  // Close a filter when clicking elsewhere, preserving the familiar dropdown behavior.
+  document.addEventListener('click', function (event) {
+    document.querySelectorAll('details.dropdown[open]').forEach(function (dropdown) {
+      if (!dropdown.contains(event.target)) { dropdown.open = false; }
+    });
+  });
+
+  function cancelChecklist(button, checkboxClass, masterId, listId) {
+    // The server-rendered applied state is immutable until a submit reloads the page. Keeping it
+    // on each checkbox makes Cancel reliable for mouse, keyboard, and repeated dropdown openings.
+    document.querySelectorAll('.' + checkboxClass).forEach(function (box) {
+      box.checked = box.dataset.appliedChecked === 'true';
+    });
+    updateSelectAllState(masterId, checkboxClass, listId);
+    closeFilterDropdown(button);
+  }
+
+  function resetChecklist(checkboxClass, masterId, listId) {
+    document.querySelectorAll('.' + checkboxClass).forEach(function (box) { box.checked = true; });
+    updateSelectAllState(masterId, checkboxClass, listId);
+  }
+
+  function visibleChecklistBoxes(checkboxClass, listId) {
+    return Array.prototype.filter.call(document.querySelectorAll('.' + checkboxClass), function (box) {
+      var label = box.closest('label');
+      return !label || !label.hidden;
     });
   }
 
-  // Subject/From/To/Category can have hundreds of distinct values, so submitting every checked box
-  // as its own query parameter can produce a URL past the server's maximum URI length (HTTP 414) -
-  // and that isn't limited to the "everything checked" case: unchecking just a couple of boxes out
-  // of hundreds still leaves hundreds checked. Whichever side is smaller carries the same
-  // information, so right before submitting, each checklist sends the checked boxes normally under
-  // its usual name (e.g. "from-keys") if checked is the smaller side, or flips to sending the
-  // UNCHECKED boxes under an "-exclude" name (e.g. "from-keys-exclude", meaning "everyone except
-  // these") when checked is the larger side - capping what's ever sent at half the list either way.
-  // Disabling a checkbox excludes it from submission entirely without changing its checked state.
+  // The master checkbox operates only on values currently visible after the dropdown's text search.
+  // Its indeterminate state communicates a partial selection instead of pretending everything is on.
+  function toggleVisibleInChecklist(masterCheckbox, checkboxClass, listId) {
+    visibleChecklistBoxes(checkboxClass, listId).forEach(function (box) {
+      box.checked = masterCheckbox.checked;
+    });
+    updateSelectAllState(masterCheckbox.id, checkboxClass, listId);
+  }
+
+  function updateSelectAllState(masterId, checkboxClass, listId) {
+    var master = document.getElementById(masterId);
+    var boxes = visibleChecklistBoxes(checkboxClass, listId);
+    var checkedCount = boxes.filter(function (box) { return box.checked; }).length;
+    master.disabled = boxes.length === 0;
+    master.checked = boxes.length > 0 && checkedCount === boxes.length;
+    master.indeterminate = checkedCount > 0 && checkedCount < boxes.length;
+  }
+
+  function addFilterParameter(form, name, value) {
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = value;
+    input.className = 'generated-checklist-filter';
+    form.appendChild(input);
+  }
+
+  // Encode the shorter side of each checklist to keep the GET URL bounded. An explicit "-none"
+  // sentinel distinguishes a deliberately empty selection from an absent, unfiltered parameter.
   document.getElementById('page-form').addEventListener('submit', function () {
-    [['category-filter-checkbox', 'category-ids-exclude'],
-     ['subject-filter-checkbox', 'subject-values-exclude'],
-     ['from-filter-checkbox', 'from-keys-exclude'],
-     ['to-filter-checkbox', 'to-keys-exclude']].forEach(function (pair) {
-      var checkboxClass = pair[0], excludeName = pair[1];
-      var boxes = Array.prototype.slice.call(document.querySelectorAll('.' + checkboxClass));
+    var form = this;
+    form.querySelectorAll('.generated-checklist-filter').forEach(function (input) { input.remove(); });
+    [{checkboxClass: 'category-filter-checkbox', include: 'category-ids', exclude: 'category-ids-exclude', none: 'category-ids-none'},
+     {checkboxClass: 'subject-filter-checkbox', include: 'subject-values', exclude: 'subject-values-exclude', none: 'subject-values-none'},
+     {checkboxClass: 'from-filter-checkbox', include: 'from-keys', exclude: 'from-keys-exclude', none: 'from-keys-none'},
+     {checkboxClass: 'to-filter-checkbox', include: 'to-keys', exclude: 'to-keys-exclude', none: 'to-keys-none'}].forEach(function (config) {
+      var boxes = Array.prototype.slice.call(document.querySelectorAll('.' + config.checkboxClass));
       if (!boxes.length) return;
       var checked = boxes.filter(function (box) { return box.checked; });
       var unchecked = boxes.filter(function (box) { return !box.checked; });
-      if (checked.length > unchecked.length) {
-        checked.forEach(function (box) { box.disabled = true; });
-        unchecked.forEach(function (box) { box.checked = true; box.name = excludeName; });
+      boxes.forEach(function (box) { box.disabled = true; });
+      if (checked.length === 0) {
+        addFilterParameter(form, config.none, 'true');
+      } else if (checked.length < boxes.length && checked.length <= unchecked.length) {
+        checked.forEach(function (box) { addFilterParameter(form, config.include, box.value); });
+      } else if (unchecked.length > 0) {
+        unchecked.forEach(function (box) { addFilterParameter(form, config.exclude, box.value); });
       }
     });
   });
@@ -321,12 +528,39 @@
   // The search box at the top of a Subject/From/To filter dropdown: narrows the (possibly long)
   // checklist to matching entries, purely client-side - the underlying filter is still whichever
   // boxes end up checked, exactly like Excel's own column filter search box.
-  function filterChecklist(searchInput, listId) {
+  function filterChecklist(searchInput, listId, masterId) {
     var query = searchInput.value.toLowerCase();
     document.getElementById(listId).querySelectorAll('label').forEach(function (label) {
-      label.style.display = label.textContent.toLowerCase().indexOf(query) === -1 ? 'none' : '';
+      label.hidden = label.textContent.toLowerCase().indexOf(query) === -1;
     });
+    var firstBox = document.getElementById(listId).querySelector('input[type="checkbox"]');
+    if (firstBox) {
+      var checkboxClass = Array.prototype.find.call(firstBox.classList, function (name) {
+        return name.endsWith('-filter-checkbox');
+      });
+      updateSelectAllState(masterId, checkboxClass, listId);
+    }
   }
+
+  function clearAppliedFilter(filter) {
+    if (filter === 'metadata') {
+      document.getElementById('metadata-filter-input').value = 'all';
+    } else if (filter === 'search') {
+      document.getElementById('body-search-input').value = '';
+    } else if (filter === 'date') {
+      document.getElementById('date-from-input').value = '';
+      document.getElementById('date-to-input').value = '';
+    } else {
+      document.querySelectorAll('.' + filter).forEach(function (box) { box.checked = true; });
+    }
+    document.getElementById('page-form').requestSubmit();
+  }
+
+  [['subject-filter-select-all', 'subject-filter-checkbox', 'subject-checklist'],
+   ['from-filter-select-all', 'from-filter-checkbox', 'from-checklist'],
+   ['to-filter-select-all', 'to-filter-checkbox', 'to-checklist'],
+   ['category-filter-select-all', 'category-filter-checkbox', 'category-checklist']]
+    .forEach(function (config) { updateSelectAllState(config[0], config[1], config[2]); });
 
   // Date range filter: a single flatpickr calendar drives the two hidden date-from/date-to fields
   // that #page-form actually submits.

@@ -29,7 +29,9 @@
     (is (= 20 (:size (parse-fn {:size ""}))) "A blank size falls back to the default")
     (is (= 20 (:size (parse-fn {:size "abc"}))) "A non-numeric size falls back to the default")
     (is (= 50 (:size (parse-fn {:size "50"}))) "A valid size is parsed")
-    (is (= 1 (:page (parse-fn {:page ""}))) "A blank page falls back to the default"))
+    (is (= 1 (:page (parse-fn {:page ""}))) "A blank page falls back to the default")
+    (is (= "true" (:subject-values-none (parse-fn {:subject-values-none "true"})))
+        "An explicitly empty checklist survives request parsing"))
   "Blank or non-numeric size/page parameters fall back to their defaults")
 
 (deftest wrap-authentication-allows-public-paths
@@ -39,6 +41,36 @@
       (is (= 200 (:status (handler {:uri uri :session {}})))
           (str uri " is reachable without authentication"))))
   "Login and static assets are reachable without authentication")
+
+(deftest recategorize-email-reports-a-missing-imap-message-without-saving
+  (let [updates (atom [])]
+    (with-redefs [server/enriched-email-by-message-id (fn [_] {:header {:message-id "missing-1"}})
+                  db/get-categories (fn [] [{:id 7 :name "Correct"}])
+                  app/move-email-to-category (fn [_ _ _] {:result :not-found})
+                  db/update-metadata-category (fn [& args] (swap! updates conj args))]
+      (let [response (server/recategorize-email-response {} {:message-id "missing-1" :category "7"})]
+        (is (= 404 (:status response)))
+        (is (= "email-not-found" (:body response)))
+        (is (empty? @updates) "The category is not changed before the user confirms")))))
+
+(deftest recategorize-email-force-updates-only-plauna-metadata
+  (let [updates (atom [])]
+    (with-redefs [app/move-email-to-category (fn [& _] (throw (ex-info "IMAP must not be called" {})))
+                  db/update-metadata-category (fn [& args] (swap! updates conj args))]
+      (let [response (server/recategorize-email-response {} {:message-id "missing-1" :category "7" :force "true"})]
+        (is (= 204 (:status response)))
+        (is (= [["missing-1" 7 1.0]] @updates))))))
+
+(deftest recategorize-email-keeps-general-move-errors-non-overridable
+  (let [updates (atom [])]
+    (with-redefs [server/enriched-email-by-message-id (fn [_] {:header {:message-id "error-1"}})
+                  db/get-categories (fn [] [{:id 7 :name "Correct"}])
+                  app/move-email-to-category (fn [_ _ _] {:result :error})
+                  db/update-metadata-category (fn [& args] (swap! updates conj args))]
+      (let [response (server/recategorize-email-response {} {:message-id "error-1" :category "7"})]
+        (is (= 200 (:status response)))
+        (is (= "saved-not-moved" (:body response)))
+        (is (empty? @updates))))))
 
 (deftest reconnect-control-restarts-the-connection
   (let [calls (atom [])
