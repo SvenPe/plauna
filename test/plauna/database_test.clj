@@ -45,6 +45,22 @@
     (Thread/sleep 1000)
     (async/close! test-channel)))
 
+(deftest database-event-loop-flushes-a-partial-buffer-when-input-closes
+  (let [event {:type :parsed-email
+               :payload {:header {:message-id "shutdown-buffer"}
+                         :body [] :participants []}}
+        input (async/chan)
+        publisher (async/pub input :type)
+        saved (atom [])]
+    (with-redefs [db/save-emails-in-buffer (fn [buffer] (swap! saved conj buffer))]
+      (let [worker (db/database-event-loop publisher)]
+        (async/>!! input event)
+        (async/close! input)
+        (is (= :stopped (async/<!! worker)))
+        (is (= ["shutdown-buffer"]
+               (mapv #(get-in % [:headers 0 :message-id]) @saved))))))
+  "Shutdown waits for JDBC work on its dedicated thread and saves the final partial batch")
+
 (deftest enriched-email-simple
   (let [sql (db/data->sql {:entity :enriched-email :strict false})]
     (is (=  "SELECT headers.message_id, in_reply_to, subject, mime_type, date FROM headers LEFT JOIN metadata ON headers.message_id = metadata.message_id"
@@ -140,4 +156,3 @@
       (is (= #{cat-a} reachable) "Only the category reachable through the sender-scoped where-clause is returned")
       (is (contains? unscoped cat-a))
       (is (contains? unscoped cat-b) "Without a scoping where-clause, every category is reachable"))))
-

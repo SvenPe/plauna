@@ -266,23 +266,33 @@
         local-chan (async/merge [parsed-chan enriched-chan] batch-size)]
     (async/sub publisher :parsed-email local-chan)
     (async/sub publisher :enriched-email local-chan)
-    (async/go-loop [event (async/<! local-chan)
-                    buffer (empty-buffer)]
-      (when (some? event)
+    ;; JDBC is blocking work and must not occupy core.async's shared go-dispatch pool. A dedicated
+    ;; thread also lets shutdown block until the final partial buffer has been flushed.
+    (async/thread
+      (loop [event (async/<!! local-chan)
+             buffer (empty-buffer)]
         (cond
-          (= :timed-out event)
-          (do (t/log! :debug ["Received timeout. Saving everything in the buffer."])
-              (save-buffer-logging-errors! buffer)
-              (recur (async/<! local-chan) (empty-buffer)))
+          (nil? event)
+          (do
+            (when (seq (:headers buffer))
+              (t/log! :info ["Database event loop is stopping; flushing" (count (:headers buffer)) "buffered email(s)."])
+              (save-buffer-logging-errors! buffer))
+            :stopped)
 
-          (> (count (:headers buffer)) batch-size)
+          (= :timed-out event)
+          (do (when (seq (:headers buffer))
+                (t/log! :debug ["Received timeout. Saving everything in the buffer."])
+                (save-buffer-logging-errors! buffer))
+              (recur (async/<!! local-chan) (empty-buffer)))
+
+          (>= (count (:headers buffer)) batch-size)
           (do (t/log! :debug ["DB buffer full. Emptying"])
-              (let [updated-buffer (add-to-buffer (:payload event) buffer)]
-                (save-buffer-logging-errors! updated-buffer))
-              (recur (async/<! local-chan) (empty-buffer)))
+              (save-buffer-logging-errors! (add-to-buffer (:payload event) buffer))
+              (recur (async/<!! local-chan) (empty-buffer)))
 
           :else
-          (recur (async-utils/fetch-or-timeout! local-chan 1000) (add-to-buffer (:payload event) buffer)))))))
+          (recur (async-utils/fetch-or-timeout!! local-chan 1000)
+                 (add-to-buffer (:payload event) buffer)))))))
 
 (defn honey-intervals []
   (if (mariadb?)

@@ -523,6 +523,12 @@
 
 (defn disconnect-all [] (doseq [connection (vals @connections)] (disconnect connection)))
 
+(defn stop-health-checks! []
+  (doseq [[_ ^ScheduledFuture scheduled] @health-checks]
+    (.cancel scheduled true))
+  (reset! health-checks {})
+  (.shutdownNow ^ScheduledExecutorService executor-service))
+
 (defn reconnect [^ConnectionData connection-data]
   (try
     (t/log! :info ["Trying to reconnect to" (-> connection-data .config :host) "as" (-> connection-data .config :user)])

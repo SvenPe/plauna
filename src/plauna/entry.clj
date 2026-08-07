@@ -1,5 +1,6 @@
 (ns plauna.entry
   (:require
+   [clojure.core.async :as async]
    [plauna.analysis :as analysis]
    [plauna.application :as app]
    [plauna.auth :as auth]
@@ -29,10 +30,34 @@
 
 (set! *warn-on-reflection* true)
 
-(def event-register {:enrichment-event-loop (fn [] (analysis/enrichment-event-loop @messaging/main-publisher @messaging/main-chan))
+(defonce event-loop-workers (atom {}))
+
+(defn- track-event-worker [key start-fn]
+  (let [worker (start-fn)]
+    (swap! event-loop-workers assoc key worker)
+    worker))
+
+(def event-register {:enrichment-event-loop (fn []
+                                               (track-event-worker
+                                                :enrichment-event-loop
+                                                #(analysis/enrichment-event-loop @messaging/main-publisher @messaging/main-chan)))
                      ;:client-event-loop (fn [] (client/client-event-loop @messaging/main-publisher))
-                     :database-event-loop (fn [] (db/database-event-loop @messaging/main-publisher))
-                     :parser-event-loop (fn [] (parser/parser-event-loop @messaging/main-publisher @messaging/main-chan))})
+                     :database-event-loop (fn []
+                                            (track-event-worker
+                                             :database-event-loop
+                                             #(db/database-event-loop @messaging/main-publisher)))
+                     :parser-event-loop (fn []
+                                          (track-event-worker
+                                           :parser-event-loop
+                                           #(parser/parser-event-loop @messaging/main-publisher @messaging/main-chan)))})
+
+(defn- await-event-workers! []
+  (doseq [[key worker] @event-loop-workers]
+    (let [[result port] (async/alts!! [worker (async/timeout 10000)])]
+      (if (= port worker)
+        (t/log! :info ["Event worker" key "stopped with" result])
+        (t/log! :warn ["Timed out waiting for event worker" key "to stop."]))))
+  (reset! event-loop-workers {}))
 
 (defn start-imap-client
   [context]
@@ -64,10 +89,16 @@
    (Thread.
     ^Runnable (fn []
                 (t/log! :info "Shutdown signal received. Stopping Plauna gracefully.")
-                (doseq [[label teardown] [["automatic training" server/stop-training-scheduler!]
-                                          ["web server" server/stop-server]
-                                          ["IMAP connections" client/disconnect-all]
-                                          ["watchdog" diagnostics/stop-watchdog!]]]
+                (doseq [[label teardown]
+                        [["automatic training" server/stop-training-scheduler!]
+                         ["web server" server/stop-server]
+                         ["IMAP connections" client/disconnect-all]
+                         ["IMAP health checks" client/stop-health-checks!]
+                         ["event-loop supervisor" events/stop-event-loops!]
+                         ["event input" messaging/stop!]
+                         ["event workers" await-event-workers!]
+                         ["database pool" db/close-pool!]
+                         ["watchdog" diagnostics/stop-watchdog!]]]
                   (try (teardown)
                        (catch Throwable e
                          (t/log! {:level :error :error e} ["Error while stopping" label]))))))))
