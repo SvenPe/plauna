@@ -38,3 +38,23 @@
 (defn client-health-check-interval [] (w/lookup-or-miss cache
                                                         :client-health-check-interval
                                                         (fn [key] (preference-with-default key or 60))))
+
+(defn automatic-training-time [] (w/lookup-or-miss cache
+                                                   :automatic-training-time
+                                                   (fn [key] (preference-with-default key or "02:00"))))
+
+(defn time-zone [] (w/lookup-or-miss cache
+                                    :time-zone
+                                    (fn [key] (preference-with-default key or
+                                                                       (.getId (java.time.ZoneId/systemDefault))))))
+
+(defn zone-id []
+  (try
+    (java.time.ZoneId/of (time-zone))
+    (catch Exception _ (java.time.ZoneId/systemDefault))))
+
+(defn last-successful-training-at []
+  (some-> (settings/fetch-setting :last-successful-training-at) str java.time.Instant/parse))
+
+(defn record-successful-training! [instant]
+  (settings/update-setting! :last-successful-training-at (str instant)))

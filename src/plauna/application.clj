@@ -4,6 +4,7 @@
             [clojure.core.async :as async]
             [clojure.string :as str]
             [plauna.core.email :as core-email]
+            [plauna.preferences :as preferences]
             [plauna.util.page :as page]))
 
 (defn- escape-like
@@ -154,12 +155,12 @@
     :else nil))
 
 (defn- date-string->epoch-seconds
-  "Convert a 'YYYY-MM-DD' string to a UTC unix timestamp (seconds) at the start of that day,
+  "Convert a 'YYYY-MM-DD' string to a unix timestamp at the start of that day in the configured zone,
    or the start of the following day when next-day? is true (used for an inclusive upper bound)."
-  [date-str next-day?]
+  [date-str next-day? zone-id]
   (let [^java.time.LocalDate base (java.time.LocalDate/parse date-str)
         ^java.time.LocalDate day (if next-day? (.plusDays base 1) base)]
-    (.toEpochSecond (.atStartOfDay day java.time.ZoneOffset/UTC))))
+    (.toEpochSecond (.atStartOfDay day zone-id))))
 
 (defn- date->where
   "Build a where-clause filtering headers.date (stored as unix seconds) between the given dates.
@@ -167,9 +168,9 @@
    qualified column (rather than relying on database.clj's key-lookup postwalk, which only runs for
    the main e-mail-list query) so this fragment can also be reused directly in the checklist filters'
    scoped distinct-value queries — see other-filters-where."
-  [date-from date-to]
-  (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false))
-        to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true))]
+  [date-from date-to zone-id]
+  (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false zone-id))
+        to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true zone-id))]
     (cond
       (and from to) [:and [:>= :headers.date from] [:< :headers.date to]]
       from [:>= :headers.date from]
@@ -369,7 +370,10 @@
         subject-selection (checklist-selection parameters :subject-values :subject-values-exclude :subject-values-none)
         from-selection (checklist-selection parameters :from-keys :from-keys-exclude :from-keys-none)
         to-selection (checklist-selection parameters :to-keys :to-keys-exclude :to-keys-none)
-        date-filter (date->where (:date-from parameters) (:date-to parameters))
+        zone-id (if-let [configured-zone (:time-zone context)]
+                  (java.time.ZoneId/of configured-zone)
+                  (preferences/zone-id))
+        date-filter (date->where (:date-from parameters) (:date-to parameters) zone-id)
         date-filter-active? (some? date-filter)
         fulltext-min-token-length (when (= :mariadb (:db-type context))
                                     (long (or (:fulltext-min-token-length context)

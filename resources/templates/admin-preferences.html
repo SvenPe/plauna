@@ -25,6 +25,15 @@
       <label class="block mb-2 text-sm font-medium text-gray-900" for="categorization-threshold">IMAP Client Watcher Health Check Interval</label>
       <input class="input" name="client-health-check-interval" value="{{client-health-check-interval}}">
     </div>
+    <div>
+      <label class="block mb-2 text-sm font-medium text-gray-900" for="automatic-training-time">Daily Training Time</label>
+      <input class="input" name="automatic-training-time" type="time" value="{{automatic-training-time}}" required>
+    </div>
+    <div>
+      <label class="block mb-2 text-sm font-medium text-gray-900" for="time-zone">Time Zone</label>
+      <input class="input" name="time-zone" value="{{time-zone}}" placeholder="Europe/Berlin" required>
+      <div class="text-xs text-gray-500 mt-1">Used for daily training, displayed e-mail dates and date filters.</div>
+    </div>
   </div>
   <button class="btn btn-primary" type="send">Save</button>
  </form>

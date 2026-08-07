@@ -426,6 +426,17 @@
       (is (some #{:headers.date} where-flat) "Filters on the date column")))
   "Date-from/date-to are translated into a date-range filter on the email date")
 
+(deftest fetch-emails-interprets-calendar-dates-in-the-configured-time-zone
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db :time-zone "Europe/Berlin"}
+                      {:filter "all" :page 1 :size 20
+                       :date-from "2026-06-01" :date-to "2026-06-01"})
+    (let [[_ [_ _ lower] [_ _ upper]] (:where @captured)]
+      (is (= 1780264800 lower) "Midnight is converted with the Berlin summer offset")
+      (is (= 1780351200 upper) "The exclusive next-day boundary uses the same local calendar")))
+  "Date filters and displayed local dates share the configured time zone")
+
 (deftest fetch-emails-uses-date-first-related-filter-strategy
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]

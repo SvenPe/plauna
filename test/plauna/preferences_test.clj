@@ -19,3 +19,12 @@
   (swap! sut/cache (fn [_] (c/ttl-cache-factory {} :ttl 1)))
   (return-fn-for-preferences "0.01")
   (t/is (= (sut/categorization-threshold) 0.01)))
+
+(t/deftest scheduled-training-preferences-return-validated-string-values
+  (swap! sut/cache (fn [_] (c/ttl-cache-factory {} :ttl 1)))
+  (return-fn-for-preferences "03:30")
+  (t/is (= "03:30" (sut/automatic-training-time)))
+  (swap! sut/cache (fn [_] (c/ttl-cache-factory {} :ttl 1)))
+  (return-fn-for-preferences "Europe/Berlin")
+  (t/is (= "Europe/Berlin" (sut/time-zone)))
+  (t/is (= (java.time.ZoneId/of "Europe/Berlin") (sut/zone-id))))

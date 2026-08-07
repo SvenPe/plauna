@@ -33,6 +33,7 @@
             [selmer.parser :as selmer]
             [taoensso.telemere :as t])
   (:import [java.net ServerSocket]
+           [java.time Duration Instant LocalTime ZonedDateTime ZoneId]
            [java.util UUID]
            [java.util.concurrent ExecutorService Executors ScheduledExecutorService ThreadFactory TimeUnit]
            [org.eclipse.jetty.server Server]
@@ -48,8 +49,6 @@
 (defonce ^:private training-scheduler (atom nil))
 
 (def ^:private training-lock (Object.))
-
-(def ^:private automatic-training-interval-hours 24)
 
 (def html-headers {"Content-Type" "text/html; charset=UTF-8"})
 
@@ -184,11 +183,15 @@
   (try
     (t/log! :info "Starting automatic model training.")
     (if-let [result (write-emails-to-training-files-and-train)]
-      (t/log! :warn ["Automatic model training was skipped:" (:content result)])
-      (t/log! :info "Automatic model training completed."))
+      (do (t/log! :warn ["Automatic model training was skipped:" (:content result)])
+          false)
+      (do (p/record-successful-training! (Instant/now))
+          (t/log! :info "Automatic model training completed.")
+          true))
     (catch Throwable e
       (t/log! {:level :error :error e}
-              "Automatic model training failed. Plauna will try again at the next scheduled time."))))
+              "Automatic model training failed. Plauna will try again at the next scheduled time.")
+      false)))
 
 (defn- training-thread-factory []
   (reify ThreadFactory
@@ -196,13 +199,64 @@
       (doto (Thread. ^Runnable runnable "plauna-training-scheduler")
         (.setDaemon true)))))
 
+(defn daily-training-delay-millis
+  "Milliseconds from now until the next required daily training. If today's configured time has
+   passed and no successful run was recorded for it, return zero so a restart catches it up."
+  [^ZonedDateTime now ^LocalTime training-time last-success]
+  (let [zone (.getZone now)
+        today (.atZone (.atTime (.toLocalDate now) training-time) zone)
+        before-today? (.isBefore now today)
+        latest-due (if before-today? (.minusDays today 1) today)
+        missed? (if last-success
+                  (.isBefore ^Instant last-success (.toInstant latest-due))
+                  (not before-today?))
+        next-time (if missed?
+                    now
+                    (if before-today? today (.plusDays today 1)))]
+    (max 0 (.toMillis (Duration/between (.toInstant now) (.toInstant next-time))))))
+
+(declare schedule-next-daily-training!)
+
+(defn- schedule-next-daily-training!
+  [^ScheduledExecutorService executor catch-up-missed?]
+  (let [^ZoneId zone (p/zone-id)
+        ^LocalTime training-time (LocalTime/parse (p/automatic-training-time))
+        ^ZonedDateTime now (ZonedDateTime/now zone)
+        ;; Only startup/reconfiguration catches up a missed persisted run. After an attempted run,
+        ;; even a failure waits for the next day instead of spinning in an immediate retry loop.
+        effective-last-success (if catch-up-missed?
+                                 (p/last-successful-training-at)
+                                 (.toInstant now))
+        ^long delay (daily-training-delay-millis now training-time effective-last-success)]
+    (t/log! :info ["Next automatic model training is scheduled for"
+                   (.plusNanos now (* delay 1000000))])
+    (.schedule executor
+               ^Runnable (fn []
+                           (run-automatic-training!)
+                           (when (and (identical? executor @training-scheduler)
+                                      (not (.isShutdown executor)))
+                             (schedule-next-daily-training! executor false)))
+               delay
+               TimeUnit/MILLISECONDS)))
+
 (defn start-training-scheduler!
-  "Schedule model training every 24 hours, with the first automatic run 24 hours after startup.
-   Calling this more than once is safe and does not create duplicate schedules."
+  "Schedule model training at the configured local wall-clock time. A persisted successful-run
+   timestamp makes a missed run catch up after restart. Calling this repeatedly is idempotent."
   ([]
-   (start-training-scheduler! automatic-training-interval-hours
-                              automatic-training-interval-hours
-                              TimeUnit/HOURS))
+   (locking training-scheduler
+     (if-let [^ScheduledExecutorService existing @training-scheduler]
+       existing
+       (let [^ScheduledExecutorService executor
+             (Executors/newSingleThreadScheduledExecutor (training-thread-factory))]
+         (try
+           (reset! training-scheduler executor)
+           (schedule-next-daily-training! executor true)
+           executor
+           (catch Throwable e
+             (reset! training-scheduler nil)
+             (.shutdownNow executor)
+             (throw e)))))))
+  ;; Deterministic interval form retained for tests and diagnostics.
   ([initial-delay interval ^TimeUnit time-unit]
    (locking training-scheduler
      (if-let [^ScheduledExecutorService existing @training-scheduler]
@@ -216,8 +270,7 @@
                                     (long interval)
                                     time-unit)
            (reset! training-scheduler executor)
-           (t/log! :info ["Scheduled automatic model training every"
-                          automatic-training-interval-hours "hours."])
+           (t/log! :info ["Scheduled automatic model training every" interval time-unit])
            executor
            (catch Throwable e
              (.shutdownNow executor)
@@ -231,6 +284,10 @@
       (reset! training-scheduler nil)
       (.shutdownNow executor)
       (t/log! :info "Stopped automatic model training."))))
+
+(defn restart-training-scheduler! []
+  (stop-training-scheduler!)
+  (start-training-scheduler!))
 
 (defn categorize-content [content language] ;; FIXME This kills the process if content is nil
   (let [category (analysis/categorize content (files/model-file language))
@@ -348,6 +405,12 @@
 
     :client-health-check-interval
     (try (pos? (Long/parseLong value)) (catch Exception _ false))
+
+    :automatic-training-time
+    (try (LocalTime/parse value) true (catch Exception _ false))
+
+    :time-zone
+    (try (ZoneId/of value) true (catch Exception _ false))
 
     :log-level
     (contains? valid-log-levels (st/replace (str value) #"^:" ""))
@@ -641,12 +704,16 @@
      (let [language-datection-threshold (p/language-detection-threshold)
            categorization-threshold (p/categorization-threshold)
            client-health-check-interval (p/client-health-check-interval)
+           automatic-training-time (p/automatic-training-time)
+           time-zone (p/time-zone)
            log-level (p/log-level)]
        (success-html-with-body (markup/preferences-page
                                 {:language-detection-threshold language-datection-threshold
                                  :categorization-threshold categorization-threshold
                                  :log-level log-level
-                                 :client-health-check-interval client-health-check-interval}))))
+                                 :client-health-check-interval client-health-check-interval
+                                 :automatic-training-time automatic-training-time
+                                 :time-zone time-zone}))))
 
    (comp/POST "/admin/preferences" request
      (let [prefs (dissoc (:params request) :redirect-url)
@@ -659,6 +726,8 @@
          (do (doseq [[k v] prefs]
                (p/update-preference k v))
              (t/set-min-level! (p/log-level))
+             (when (some #(contains? prefs %) [:automatic-training-time :time-zone])
+               (restart-training-scheduler!))
              (redirect-request request)))))
 
    (comp/POST "/admin/languages" {params :params}
@@ -731,7 +800,9 @@
 
    (comp/POST "/training" request
      (let [result (write-emails-to-training-files-and-train)]
-       (when (some? result) (swap! global-messages (fn [mess] (conj mess result))))
+       (if (some? result)
+         (swap! global-messages (fn [mess] (conj mess result)))
+         (p/record-successful-training! (Instant/now)))
        (redirect-to-referer request)))
 
    (comp/POST "/training/new" request

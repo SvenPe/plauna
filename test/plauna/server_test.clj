@@ -5,8 +5,10 @@
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
             [plauna.database :as db]
+            [plauna.preferences :as preferences]
             [plauna.server :as server])
-  (:import [java.util.concurrent ScheduledExecutorService TimeUnit]))
+  (:import [java.time Instant LocalTime ZoneId ZonedDateTime]
+           [java.util.concurrent ScheduledExecutorService TimeUnit]))
 
 (defn- ok-handler [_] {:status 200 :body "secret"})
 
@@ -15,7 +17,8 @@
         completed (promise)
         executor (atom nil)]
     (try
-      (with-redefs [server/write-emails-to-training-files-and-train
+      (with-redefs [preferences/record-successful-training! (fn [_])
+                    server/write-emails-to-training-files-and-train
                     (fn []
                       (if (= 1 (swap! attempts inc))
                         (throw (ex-info "simulated training failure" {}))
@@ -35,6 +38,24 @@
         (when-let [^ScheduledExecutorService ex @executor]
           (is (.isShutdown ex) "Stopping Plauna also shuts down automatic training")))))
   "Automatic training remains periodic after errors and has only one scheduler")
+
+(deftest daily-training-schedule-uses-a-wall-clock-time-and-catches-up-missed-runs
+  (let [zone (ZoneId/of "Europe/Berlin")
+        time (LocalTime/parse "02:00")
+        before (ZonedDateTime/of 2026 8 7 1 0 0 0 zone)
+        after (ZonedDateTime/of 2026 8 7 3 0 0 0 zone)
+        successful-today (Instant/parse "2026-08-07T00:05:00Z")
+        successful-yesterday (Instant/parse "2026-08-06T00:05:00Z")]
+    (is (= (* 60 60 1000)
+           (server/daily-training-delay-millis before time nil))
+        "Before today's time, a new installation waits until that time")
+    (is (zero? (server/daily-training-delay-millis after time nil))
+        "After today's time, a missing first run starts immediately")
+    (is (= (* 23 60 60 1000)
+           (server/daily-training-delay-millis after time successful-today))
+        "A completed daily run schedules tomorrow at the configured time")
+    (is (zero? (server/daily-training-delay-millis after time successful-yesterday))
+        "A restart catches up when today's run was missed")))
 
 (deftest wrap-authentication-blocks-unauthenticated
   (let [handler (server/wrap-authentication ok-handler)

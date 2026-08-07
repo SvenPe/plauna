@@ -2,7 +2,21 @@
   (:require [clojure.string :as str]
             [clojure.test :refer :all]
             [plauna.client :as client]
-            [plauna.markup :as markup]))
+            [plauna.markup :as markup]
+            [plauna.preferences :as preferences]))
+
+(deftest timestamps-are-rendered-in-the-configured-time-zone
+  (with-redefs [preferences/zone-id (fn [] (java.time.ZoneId/of "Europe/Berlin"))]
+    (is (= (java.time.LocalDateTime/of 1970 1 1 1 0)
+           (markup/timestamp->date 0)))))
+
+(deftest preferences-page-renders-the-daily-training-time-and-time-zone
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/preferences-page {:automatic-training-time "03:30"
+                                         :time-zone "Europe/Berlin"
+                                         :log-level-options []})]
+      (is (str/includes? html "name=\"automatic-training-time\" type=\"time\" value=\"03:30\""))
+      (is (str/includes? html "name=\"time-zone\" value=\"Europe/Berlin\"")))))
 
 (deftest disconnected-banner-is-hidden-when-no-connections-are-disconnected
   (with-redefs [client/disconnected-connections (fn [] [])]

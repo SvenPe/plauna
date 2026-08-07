@@ -6,12 +6,13 @@
             [clojure.string :as str]
             [ring.util.codec :refer [base64-encode]]
             [plauna.client :as client]
+            [plauna.preferences :as preferences]
             [scicloj.tableplot.v1.hanami :as hanami]
             [tablecloth.api :as tc]
             [tablecloth.column.api :as tcc]
             [tech.v3.datatype.datetime :as datetime])
   (:import
-   (java.time LocalDateTime ZoneOffset)))
+   (java.time Instant LocalDateTime)))
 
 (set! *warn-on-reflection* true)
 
@@ -28,7 +29,7 @@
 (defn timestamp->date [timestamp]
   (if (nil? timestamp)
     nil
-    (. LocalDateTime ofEpochSecond timestamp 0 ZoneOffset/UTC)))
+    (LocalDateTime/ofInstant (Instant/ofEpochSecond timestamp) (preferences/zone-id))))
 
 (defn type->toast-role [message]
   (cond
