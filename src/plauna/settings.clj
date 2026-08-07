@@ -11,6 +11,7 @@
   {:log-level                    "info"
    :language-detection-threshold 0.8
    :categorization-threshold     0.65
+   :categorization-algorithm     "naive-bayes"
    :client-health-check-interval 60
    :automatic-training-time      "02:00"
    :time-zone                    (.getId (ZoneId/systemDefault))})

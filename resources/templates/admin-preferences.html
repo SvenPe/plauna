@@ -36,5 +36,77 @@
     </div>
   </div>
   <button class="btn btn-primary" type="send">Save</button>
- </form>
+</form>
+
+<div class="divider my-8"></div>
+
+<form id="categorization-model-form" action="/admin/preferences/model" method="POST" class="max-w-xl">
+  <input type="hidden" name="redirect-url" value="/admin/preferences">
+  <label class="block mb-2 text-sm font-medium text-gray-900" for="categorization-model">Categorization Model</label>
+  <select id="categorization-model" class="select w-full" name="model" onchange="confirmCategorizationModelChange()">
+    {% for option in categorization-model-options %}
+    <option value="{{option.id}}" {% if option.id = categorization-model %}selected{% endif %}>{{option.name}}</option>
+    {% endfor %}
+  </select>
+  <div class="text-xs text-gray-500 mt-1">
+    MaxEnt combines sender, sender domain, subject and a bounded part of the message body. Changing
+    the model does not modify existing category assignments.
+  </div>
+
+  <dialog id="categorization-model-dialog" class="modal" data-current-model="{{categorization-model}}">
+    <div class="modal-box">
+      <h3 class="text-lg font-bold">Kategorisierungsmodell wechseln?</h3>
+      <p class="py-3">
+        Plauna kann alle aktuell kategorisierten E-Mails in den für das Training aktivierten Sprachen
+        als korrekte Trainingsbeispiele für das neue Modell übernehmen. Die vorhandenen Kategorien
+        werden dabei nicht verändert.
+      </p>
+      <label class="label cursor-pointer justify-start gap-3">
+        <input class="checkbox" type="checkbox" name="use-current-categories" value="true" checked>
+        <span>Aktuelle Kategoriezuordnungen für das Training verwenden</span>
+      </label>
+      <label class="form-control mt-4">
+        <span class="label-text">Zur Bestätigung „Training starten“ eingeben:</span>
+        <input id="model-switch-confirmation" class="input input-bordered mt-1" name="confirmation"
+               type="text" autocomplete="off" oninput="validateModelSwitchConfirmation()">
+      </label>
+      <div class="modal-action">
+        <button class="btn btn-ghost" type="button" onclick="cancelCategorizationModelChange()">Abbrechen</button>
+        <button id="model-switch-submit" class="btn btn-primary" type="submit" disabled>Modell wechseln</button>
+      </div>
+    </div>
+    <button type="button" class="modal-backdrop" onclick="cancelCategorizationModelChange()">close</button>
+  </dialog>
+</form>
+
+<script>
+  const modelDialog = document.getElementById('categorization-model-dialog');
+  const modelSelect = document.getElementById('categorization-model');
+  const confirmationInput = document.getElementById('model-switch-confirmation');
+  const modelSubmit = document.getElementById('model-switch-submit');
+
+  function confirmCategorizationModelChange() {
+    if (modelSelect.value === modelDialog.dataset.currentModel) return;
+    confirmationInput.value = '';
+    modelSubmit.disabled = true;
+    modelDialog.showModal();
+    confirmationInput.focus();
+  }
+
+  function validateModelSwitchConfirmation() {
+    modelSubmit.disabled = confirmationInput.value !== 'Training starten';
+  }
+
+  function cancelCategorizationModelChange() {
+    modelSelect.value = modelDialog.dataset.currentModel;
+    confirmationInput.value = '';
+    modelSubmit.disabled = true;
+    modelDialog.close();
+  }
+
+  modelDialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    cancelCategorizationModelChange();
+  });
+</script>
 {% endblock %}

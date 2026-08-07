@@ -13,3 +13,67 @@
 (deftest normalization-2
   (let [res (analysis/normalize (slurp (io/resource "test/normalization/greek-lorem-ipsum.txt")))]
     (is (= (s/trim (slurp (io/resource "test/normalization/normalized-greek-lorem-ipsum.txt"))) res))))
+
+(deftest training-and-prediction-share-namespaced-features
+  (let [email {:header {:subject "Invoice Ready"}
+               :participants [{:type :sender :address "Billing@Example.COM"}
+                              {:type :receiver :address "me@example.net"}]
+               :body [{:mime-type "text/plain"
+                       :content (s/join " " (repeat 510 "Payment"))}]
+               :metadata {:category-id 7}}
+        tokens (analysis/classification-tokens email)
+        training-line (analysis/format-training-data [email])]
+    (is (= ["sender-address:billing@example.com"
+            "sender-domain:example.com"
+            "subject:invoice"
+            "subject:ready"]
+           (subvec tokens 0 4)))
+    (is (= analysis/max-body-features
+           (count (filter #(s/starts-with? % "body:") tokens)))
+        "Long bodies are bounded before either training or prediction")
+    (is (= (str "7 " (s/join " " tokens) "\n") training-line)
+        "The serialized training example contains exactly the prediction features")))
+
+(deftest legacy-models-keep-their-original-body-only-features
+  (let [email {:header {:subject "New Subject"}
+               :participants [{:type :sender :address "sender@example.com"}]
+               :body [{:mime-type "text/plain" :content "Legacy Body Tokens"}]}]
+    (is (= ["Legacy" "Body" "Tokens"]
+           (analysis/legacy-classification-tokens email)))
+    (is (not-any? #(or (s/starts-with? % "sender-")
+                       (s/starts-with? % "subject:")
+                       (s/starts-with? % "body:"))
+                  (analysis/legacy-classification-tokens email)))
+    (is (= (analysis/legacy-classification-tokens email)
+           (analysis/classification-tokens-for-model
+            email "eng" (java.io.File. "train-eng.bin"))))
+    (is (= (analysis/classification-tokens email)
+           (analysis/classification-tokens-for-model
+            email "eng" (java.io.File. "train-eng-maxent.bin"))))))
+
+(deftest categorization-model-names-map-to-opennlp-trainers
+  (is (= "NAIVEBAYES" (analysis/categorization-algorithm "naive-bayes")))
+  (is (= "MAXENT" (analysis/categorization-algorithm "maxent"))))
+
+(deftest naive-bayes-and-maxent-can-train-the-same-feature-data
+  (let [training-file (java.io.File/createTempFile "plauna-training-" ".train")
+        model-file (java.io.File/createTempFile "plauna-model-" ".bin")
+        samples (str "1 sender-domain:shop.example subject:invoice body:payment\n"
+                     "1 sender-domain:shop.example subject:receipt body:purchase\n"
+                     "1 sender-domain:billing.example subject:invoice body:amount\n"
+                     "2 sender-domain:friends.example subject:dinner body:tomorrow\n"
+                     "2 sender-domain:friends.example subject:weekend body:meeting\n"
+                     "2 sender-domain:club.example subject:invitation body:party\n")]
+    (try
+      (spit training-file samples)
+      (doseq [model ["naive-bayes" "maxent"]]
+        (let [trained (first (analysis/train-data [{:language "eng" :file training-file}] model))]
+          (with-open [os (io/output-stream model-file)]
+            (analysis/serialize-and-write-model! (:model trained) os))
+          (is (= "1" (:name (analysis/categorize-tokens
+                              ["sender-domain:shop.example" "subject:invoice" "body:payment"]
+                              model-file)))
+              (str model " produces a readable classifier"))))
+      (finally
+        (io/delete-file training-file true)
+        (io/delete-file model-file true)))))

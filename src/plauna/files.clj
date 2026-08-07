@@ -68,15 +68,33 @@
 
 (defn model-files [] (files-with-type :model))
 
-(defn model-file "Returns the model file for the language specified."
-  [^String language] ^File (io/file (file-dir) (str "train-" language ".bin")))
+(defn- model-file-for-write [^String language model]
+  (io/file (file-dir) (str "train-" language "-" model ".bin")))
+
+(defn model-file
+  "Return a model file. The two-argument form keeps Naive Bayes and MaxEnt side by side. For Naive
+   Bayes it transparently reads the legacy train-<lang>.bin name until that model is retrained."
+  ([^String language]
+   ^File (io/file (file-dir) (str "train-" language ".bin")))
+  ([^String language model]
+   (let [specific (model-file-for-write language model)
+         legacy (model-file language)]
+     ^File (if (and (= "naive-bayes" model)
+                    (not (.exists ^File specific))
+                    (.exists ^File legacy))
+             legacy
+             specific))))
 
 (defn write-model-file-atomically!
   "Write a model to a temporary sibling file and publish it only after writing completed successfully.
    Readers therefore see either the previous complete model or the new complete model, never a partially
    serialized file. write-fn receives the temporary file's output stream."
-  [language write-fn]
-  (let [^File target-file (model-file language)]
+  ([language write-fn]
+   (write-model-file-atomically! language nil write-fn))
+  ([language model write-fn]
+  (let [^File target-file (if model
+                            (model-file-for-write language model)
+                            (model-file language))]
     (io/make-parents target-file)
     (let [target-path (.toPath target-file)
           parent-path (.getParent target-path)
@@ -98,7 +116,7 @@
                         (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
         target-file
         (finally
-          (Files/deleteIfExists temp-path))))))
+          (Files/deleteIfExists temp-path)))))))
 
 (defn delete-files-with-type [type]
   (case type

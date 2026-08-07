@@ -37,6 +37,27 @@
           (io/delete-file file true)))))
   "Training never exposes a partially written model to categorization")
 
+(deftest categorization-model-families-are-kept-side-by-side
+  (let [temp-dir (.toFile (Files/createTempDirectory "plauna-model-family-test-" (make-array FileAttribute 0)))]
+    (try
+      (with-redefs [files/file-dir (fn [] (.getAbsolutePath temp-dir))]
+        (let [legacy (files/model-file "deu")]
+          (spit legacy "legacy-naive-bayes")
+          (is (= (.getAbsolutePath legacy)
+                 (.getAbsolutePath (files/model-file "deu" "naive-bayes")))
+              "An existing pre-migration Naive Bayes model remains usable")
+          (files/write-model-file-atomically! "deu" "maxent"
+                                              #(.write % (.getBytes "maxent")))
+          (files/write-model-file-atomically! "deu" "naive-bayes"
+                                              #(.write % (.getBytes "new-naive-bayes")))
+          (is (= "maxent" (slurp (files/model-file "deu" "maxent"))))
+          (is (= "new-naive-bayes" (slurp (files/model-file "deu" "naive-bayes"))))
+          (is (= "legacy-naive-bayes" (slurp legacy))
+              "Training either family never overwrites the legacy fallback file")))
+      (finally
+        (doseq [file (reverse (file-seq temp-dir))]
+          (io/delete-file file true))))))
+
 (deftest read-single-item-mbox
   (let [test-chan (chan 20)]
     (files/read-emails-from-mbox (resource->is "test/email_corpus/test-email-1.mbox") test-chan)

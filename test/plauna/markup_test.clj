@@ -10,13 +10,28 @@
     (is (= (java.time.LocalDateTime/of 1970 1 1 1 0)
            (markup/timestamp->date 0)))))
 
+(deftest confidences-are-rendered-as-percentages
+  (is (= "100.00 %" (markup/confidence->percent 1.0)))
+  (is (= "87.65 %" (markup/confidence->percent 0.87654)))
+  (is (= "0.00 %" (markup/confidence->percent 0)))
+  (is (= "—" (markup/confidence->percent nil))))
+
 (deftest preferences-page-renders-the-daily-training-time-and-time-zone
   (with-redefs [client/disconnected-connections (fn [] [])]
     (let [html (markup/preferences-page {:automatic-training-time "03:30"
                                          :time-zone "Europe/Berlin"
+                                         :categorization-model "naive-bayes"
+                                         :categorization-model-options [{:id "naive-bayes" :name "Naive Bayes"}
+                                                                        {:id "maxent" :name "Maximum Entropy (MaxEnt)"}]
                                          :log-level-options []})]
       (is (str/includes? html "name=\"automatic-training-time\" type=\"time\" value=\"03:30\""))
-      (is (str/includes? html "name=\"time-zone\" value=\"Europe/Berlin\"")))))
+      (is (str/includes? html "name=\"time-zone\" value=\"Europe/Berlin\""))
+      (is (str/includes? html "action=\"/admin/preferences/model\""))
+      (is (str/includes? html "value=\"naive-bayes\" selected"))
+      (is (str/includes? html "value=\"maxent\""))
+      (is (str/includes? html "Aktuelle Kategoriezuordnungen für das Training verwenden"))
+      (is (str/includes? html "Training starten"))
+      (is (str/includes? html "confirmationInput.value !== 'Training starten'")))))
 
 (deftest disconnected-banner-is-hidden-when-no-connections-are-disconnected
   (with-redefs [client/disconnected-connections (fn [] [])]

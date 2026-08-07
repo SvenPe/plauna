@@ -5,6 +5,7 @@
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
             [plauna.database :as db]
+            [plauna.files :as files]
             [plauna.preferences :as preferences]
             [plauna.server :as server])
   (:import [java.time Instant LocalTime ZoneId ZonedDateTime]
@@ -56,6 +57,55 @@
         "A completed daily run schedules tomorrow at the configured time")
     (is (zero? (server/daily-training-delay-millis after time successful-yesterday))
         "A restart catches up when today's run was missed")))
+
+(deftest categorization-model-switch-requires-the-exact-confirmation
+  (let [calls (atom [])]
+    (with-redefs [preferences/categorization-model (fn [] "naive-bayes")
+                  server/train-categorization-model! (fn [model] (swap! calls conj [:train model]))
+                  preferences/update-preference (fn [& args] (swap! calls conj [:update args]))]
+      (let [result (server/switch-categorization-model!
+                    {:model "maxent" :use-current-categories "true" :confirmation "training starten"})]
+        (is (= :alert (:type result)))
+        (is (empty? @calls) "Neither training nor the preference changes without exact confirmation")))))
+
+(deftest categorization-model-switch-trains-before-activating-the-target
+  (let [calls (atom [])]
+    (with-redefs [preferences/categorization-model (fn [] "naive-bayes")
+                  server/train-categorization-model! (fn [model] (swap! calls conj [:train model]) nil)
+                  preferences/update-preference (fn [key value] (swap! calls conj [:update key value]))
+                  preferences/record-successful-training! (fn [_] (swap! calls conj [:record-success]))]
+      (let [result (server/switch-categorization-model!
+                    {:model "maxent"
+                     :use-current-categories "true"
+                     :confirmation server/model-switch-confirmation})]
+        (is (= :success (:type result)))
+        (is (= [[:train "maxent"]
+                [:update :categorization-algorithm "maxent"]
+                [:record-success]]
+               @calls)
+            "The active setting changes only after target training completed")))))
+
+(deftest failed-model-migration-keeps-the-previous-model-active
+  (let [updates (atom [])]
+    (with-redefs [preferences/categorization-model (fn [] "naive-bayes")
+                  server/train-categorization-model! (fn [_] (throw (ex-info "training failed" {})))
+                  preferences/update-preference (fn [& args] (swap! updates conj args))]
+      (let [result (server/switch-categorization-model!
+                    {:model "maxent"
+                     :use-current-categories "true"
+                     :confirmation server/model-switch-confirmation})]
+        (is (= :alert (:type result)))
+        (is (empty? @updates) "A failed target model is never made active")))))
+
+(deftest first-switch-cannot-skip-training-when-no-target-model-exists
+  (with-redefs [preferences/categorization-model (fn [] "naive-bayes")
+                server/languages-to-use-in-training (fn [] ["deu"])
+                files/model-file (fn [_ _] (java.io.File. "/definitely/not/a/plauna/model.bin"))]
+    (let [result (server/switch-categorization-model!
+                  {:model "maxent"
+                   :confirmation server/model-switch-confirmation})]
+      (is (= :alert (:type result)))
+      (is (str/includes? (:content result) "No complete model")))))
 
 (deftest wrap-authentication-blocks-unauthenticated
   (let [handler (server/wrap-authentication ok-handler)

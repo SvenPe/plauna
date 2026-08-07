@@ -20,6 +20,11 @@
   (return-fn-for-preferences "0.01")
   (t/is (= (sut/categorization-threshold) 0.01)))
 
+(t/deftest categorization-model-supports-new-and-legacy-setting-values
+  (t/is (= "naive-bayes" (sut/canonical-categorization-model nil)))
+  (t/is (= "naive-bayes" (sut/canonical-categorization-model "NAIVEBAYES")))
+  (t/is (= "maxent" (sut/canonical-categorization-model "MAXENT"))))
+
 (t/deftest scheduled-training-preferences-return-validated-string-values
   (swap! sut/cache (fn [_] (c/ttl-cache-factory {} :ttl 1)))
   (return-fn-for-preferences "03:30")

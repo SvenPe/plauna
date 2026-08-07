@@ -63,13 +63,13 @@
       <td>{{email.participants|concat-senders}}</td>
       <td>{{email.header.subject}}</td>
       <td><input form="emails" name="language" type="text" value="{{email.metadata.language}}"></td>
-      <td>{{email.metadata.language-confidence}}</td>
+      <td>{{email.metadata.language-confidence|confidence-percent}}</td>
       <td><select class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5" form="emails" name="category">
           {% for category in categories %}
           <option value="{{category.id}}" {% if category.id = email.metadata.category-id %}selected{% endif %}>{{category.name}}</option>
           {% endfor %}
       </select></td>
-      <td>{{email.metadata.category-confidence}}</td>
+      <td>{{email.metadata.category-confidence|confidence-percent}}</td>
     </tr>
 
     {% endfor %}

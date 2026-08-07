@@ -35,6 +35,19 @@
                                                     :categorization-threshold
                                                     (fn [key] (preference-with-default key or 0.65))))
 
+(defn canonical-categorization-model
+  "Normalise both Plauna's stable setting names and the OpenNLP constants stored by older versions."
+  [value]
+  (case (some-> value str clojure.string/lower-case)
+    ("maxent" "max-ent") "maxent"
+    ("naivebayes" "naive-bayes" "naive_bayes") "naive-bayes"
+    "naive-bayes"))
+
+(defn categorization-model []
+  (w/lookup-or-miss cache
+                    :categorization-algorithm
+                    (fn [key] (canonical-categorization-model (@fetch-fn key)))))
+
 (defn client-health-check-interval [] (w/lookup-or-miss cache
                                                         :client-health-check-interval
                                                         (fn [key] (preference-with-default key or 60))))

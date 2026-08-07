@@ -12,7 +12,8 @@
             [tablecloth.column.api :as tcc]
             [tech.v3.datatype.datetime :as datetime])
   (:import
-   (java.time Instant LocalDateTime)))
+   (java.time Instant LocalDateTime)
+   (java.util Locale)))
 
 (set! *warn-on-reflection* true)
 
@@ -88,12 +89,16 @@
 
 (add-filter! :base64-encode (fn [^String string] (base64-encode (.getBytes string))))
 
-(add-filter! :double-format-nillable (fn [n & [decimal-places]]
-                                       (if (nil? n)
-                                         0
-                                         (let [n (double n)]
-                                           (format (str "%." (if decimal-places decimal-places "1") "f")
-                                                   n)))))
+(defn confidence->percent
+  "Render a stored 0..1 model probability as a percentage. A missing probability is deliberately
+   shown as unknown instead of as 0 %, because those two states have different meanings."
+  [confidence]
+  (if (nil? confidence)
+    "—"
+    (String/format Locale/ROOT "%.2f %%"
+                   (object-array [(* 100.0 (double confidence))]))))
+
+(add-filter! :confidence-percent confidence->percent)
 
 (def default-category-color
   "Used for a category saved before color-coding existed, or with a corrupted value.
@@ -206,8 +211,16 @@
   ([config folders categories] (render "admin-connection.html" (merge config {:folders folders :active-nav :admin :categories (cons nil categories)})))
   ([config folders messages categories] (render "admin-connection.html" (merge config {:folders folders :messages (mapv type->toast-role messages) :active-nav :admin :categories (cons nil categories)}))))
 
-(defn preferences-page [data] (let [log-levels {:log-level-options [{:key :error :name "Error"} {:key :info :name "Info"} {:key :debug :name "Debug"}] :active-nav :admin}]
-                                (render "admin-preferences.html" (conj data log-levels))))
+(defn preferences-page
+  ([data] (preferences-page data nil))
+  ([data messages]
+   (let [log-levels {:log-level-options [{:key :error :name "Error"}
+                                         {:key :info :name "Info"}
+                                         {:key :debug :name "Debug"}]
+                     :active-nav :admin}]
+     (render "admin-preferences.html"
+             (cond-> (conj data log-levels)
+               (seq messages) (assoc :messages (mapv type->toast-role messages)))))))
 
 (defn new-connection [providers]
   (render "admin-new-connection.html" {:auth-providers providers}))

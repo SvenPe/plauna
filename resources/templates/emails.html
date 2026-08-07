@@ -247,7 +247,7 @@
         <td class="hidden lg:table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.participants|concat-senders}}</a></td>
         <td class="hidden lg:table-cell" style="text-wrap-mode: wrap;"><a href="/emails/{{email.header.message-id|base64-encode}}">{{email.participants|concat-receivers}}</a></td>
         <td class="hidden lg:table-cell"><input class="input" type="text" value="{{email.metadata.language}}" data-message-id="{{email.header.message-id}}" onchange="updateLanguage(this)"></td>
-        <td class="hidden lg:table-cell">{{email.metadata.language-confidence|double-format-nillable:10}}</td>
+        <td class="hidden lg:table-cell">{{email.metadata.language-confidence|confidence-percent}}</td>
         <td>
           <select class="select w-28 sm:w-32 category-select" style="border-left: 6px solid transparent;"
                   data-message-id="{{email.header.message-id}}" onchange="recategorizeEmail(this)">
@@ -255,7 +255,7 @@
             <option value="{{category.id}}" data-color="{{category.color|category-color}}" {% if email.metadata.category-id = category.id %} selected {% endif %}>{{category.name}}</option>
             {% endfor %}
         </select></td>
-        <td class="hidden lg:table-cell">{{email.metadata.category-confidence|double-format-nillable:10}}</td>
+        <td class="hidden lg:table-cell">{{email.metadata.category-confidence|confidence-percent}}</td>
       </tr>
       {% endfor %}
     </tbody>

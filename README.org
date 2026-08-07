@@ -104,14 +104,24 @@ Example file with the user-facing keys and their defaults:
   "log-level": "info",
   "language-detection-threshold": 0.8,
   "categorization-threshold": 0.65,
-  "client-health-check-interval": 60
+  "categorization-algorithm": "naive-bayes",
+  "client-health-check-interval": 60,
+  "automatic-training-time": "02:00",
+  "time-zone": "Europe/Berlin"
 }
 #+end_src
 
 - =log-level= — =error=, =info=, or =debug=.
 - =language-detection-threshold= — confidence (0–1) below which a language is not assigned; default 0.8.
 - =categorization-threshold= — confidence (0–1) below which a category is not assigned; default 0.65.
+- =categorization-algorithm= — =naive-bayes= or =maxent=; default =naive-bayes=. Change this through the Preferences page so Plauna can confirm and train the target model safely.
 - =client-health-check-interval= — IMAP connection health-check period in seconds; default 60.
+- =automatic-training-time= — local wall-clock time for the daily model training; default =02:00=.
+- =time-zone= — IANA time zone used for training schedules, displayed dates and date filters.
+
+Plauna keeps Naive Bayes and MaxEnt model files side by side. When the model type is changed in
+"Admin" → "Preferences", Plauna can train the target model from the existing category assignments.
+The previous model remains active until the complete target training succeeds.
 
 If you are upgrading from an earlier version that stored preferences in the database, Plauna migrates them into =settings.json= automatically on the first startup after the upgrade.
 

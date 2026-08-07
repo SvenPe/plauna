@@ -165,17 +165,73 @@
                                  (files/write-to-training-file language formatted))))]]
     (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false)))
 
-(defn write-emails-to-training-files-and-train []
+(defn train-categorization-model!
+  "Build the requested model family from the current categorized e-mails. Model files are kept per
+   algorithm, so training an inactive family cannot damage the active classifier. Returns an alert
+   map when there is no usable training data and nil on success; training failures propagate."
+  [model]
   ;; Rebuilding the training files is destructive. Serialize manual and automatic runs so one cannot
   ;; delete or overwrite the files while the other is still reading them.
   (locking training-lock
     (if (seq (languages-to-use-in-training))
       (do (write-all-categorized-emails-to-training-files)
-          (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
-            (files/write-model-file-atomically!
-             (:language training-model)
-             #(analysis/serialize-and-write-model! (:model training-model) %))))
+          (let [training-files (vec (files/training-files))]
+            (if (seq training-files)
+              (doseq [training-model (analysis/train-data training-files model)]
+                (files/write-model-file-atomically!
+                 (:language training-model)
+                 model
+                 #(analysis/serialize-and-write-model! (:model training-model) %)))
+              {:type :alert :content "There are no categorized e-mails in the selected training languages."})))
       {:type :alert :content "There are no selected languages to train in. Cannot proceed."})))
+
+(defn write-emails-to-training-files-and-train []
+  (train-categorization-model! (p/categorization-model)))
+
+(def model-switch-confirmation "Training starten")
+
+(defn- model-files-available? [model]
+  (let [languages (vec (languages-to-use-in-training))]
+    (and (seq languages)
+         (every? #(.exists ^java.io.File (files/model-file % model)) languages))))
+
+(defn switch-categorization-model!
+  "Validate and perform an administrator-requested model switch. The active preference changes only
+   after every requested target model was trained successfully (or a complete target model set was
+   already available)."
+  [{:keys [model use-current-categories confirmation]}]
+  (let [valid-models (set (map :id analysis/supported-categorization-models))
+        target (when (contains? valid-models model) model)
+        current (p/categorization-model)
+        train-current? (contains? #{true "true" "on"} use-current-categories)]
+    (cond
+      (nil? target)
+      {:type :alert :content "Unknown categorization model. Nothing was changed."}
+
+      (= target current)
+      {:type :info :content "The selected categorization model is already active."}
+
+      (not= model-switch-confirmation confirmation)
+      {:type :alert :content (str "Model switch not confirmed. Enter ‘" model-switch-confirmation "’ exactly.")}
+
+      :else
+      (try
+        (if train-current?
+          (if-let [result (train-categorization-model! target)]
+            result
+            (do (p/update-preference :categorization-algorithm target)
+                (p/record-successful-training! (Instant/now))
+                {:type :success
+                 :content (str "Switched to " target " after training with the current category assignments.")}))
+          (if (model-files-available? target)
+            (do (p/update-preference :categorization-algorithm target)
+                {:type :success :content (str "Switched to the existing " target " model.")})
+            {:type :alert
+             :content "No complete model of that type exists yet. Keep the training option selected for the first switch."}))
+        (catch Throwable e
+          (t/log! {:level :error :error e} "Categorization model switch failed; the previous model remains active.")
+          {:type :alert
+           :content "Training failed. The previous categorization model remains active."})))))
 
 (defn- run-automatic-training! []
   ;; Never let an exception escape the scheduled task: ScheduledExecutorService would otherwise
@@ -289,8 +345,8 @@
   (stop-training-scheduler!)
   (start-training-scheduler!))
 
-(defn categorize-content [content language] ;; FIXME This kills the process if content is nil
-  (let [category (analysis/categorize content (files/model-file language))
+(defn categorize-email [email]
+  (let [category (analysis/category-for-email email (-> email :metadata :language))
         matched  (analysis/label->category (:name category))]
     {:id         (:id matched)
      :name       (:name matched)
@@ -298,10 +354,15 @@
 
 (defn categorize-uncategorized-n-emails [n]
   (let [languages-to-use (map :language (db/get-activated-language-preferences))
-        uncategorized-bodies (:data (db/fetch-data {:entity :body-part :page {:page 0 :size n}} {:where [:and [:in :language languages-to-use] [:<> :language nil] [:= :category nil] [:= :mime-type "text/html"]]}))
-        ;; Body parts fetched from the DB carry raw :content; :sanitized-content only exists on emails
-        ;; prepared for display. Normalize the raw content here or the categorizer always receives nil.
-        trained-emails (map (fn [email] (conj {:message-id (-> email :body-part :message-id)} (categorize-content (analysis/normalize-body-part (:body-part email)) (-> email :metadata :language)))) uncategorized-bodies)]
+        uncategorized-emails (:data (db/fetch-data {:entity :enriched-email :strict false
+                                                    :page {:page 1 :size n}}
+                                                   {:where [:and [:in :language languages-to-use]
+                                                            [:<> :language nil]
+                                                            [:= :category nil]]}))
+        trained-emails (map (fn [email]
+                              (assoc (categorize-email email)
+                                     :message-id (-> email :header :message-id)))
+                            uncategorized-emails)]
     (doseq [trained-email trained-emails
             ;; Below-threshold results come back with a nil category; skip them instead of
             ;; overwriting the row with category nil / confidence 0.
@@ -706,14 +767,20 @@
            client-health-check-interval (p/client-health-check-interval)
            automatic-training-time (p/automatic-training-time)
            time-zone (p/time-zone)
+           categorization-model (p/categorization-model)
            log-level (p/log-level)]
-       (success-html-with-body (markup/preferences-page
-                                {:language-detection-threshold language-datection-threshold
-                                 :categorization-threshold categorization-threshold
-                                 :log-level log-level
-                                 :client-health-check-interval client-health-check-interval
-                                 :automatic-training-time automatic-training-time
-                                 :time-zone time-zone}))))
+       (success-html-with-body
+        (result-with-messages
+         (markup/preferences-page
+          {:language-detection-threshold language-datection-threshold
+           :categorization-threshold categorization-threshold
+           :log-level log-level
+           :client-health-check-interval client-health-check-interval
+           :automatic-training-time automatic-training-time
+           :time-zone time-zone
+           :categorization-model categorization-model
+           :categorization-model-options analysis/supported-categorization-models})
+         global-messages))))
 
    (comp/POST "/admin/preferences" request
      (let [prefs (dissoc (:params request) :redirect-url)
@@ -729,6 +796,9 @@
              (when (some #(contains? prefs %) [:automatic-training-time :time-zone])
                (restart-training-scheduler!))
              (redirect-request request)))))
+
+   (comp/POST "/admin/preferences/model" request
+     (redirect-request request (switch-categorization-model! (:params request))))
 
    (comp/POST "/admin/languages" {params :params}
      (let [langs-to-use (if (vector? (:use params)) (:use params) [(:use params)])]
@@ -799,9 +869,13 @@
      (redirect-to-referer request))
 
    (comp/POST "/training" request
-     (let [result (write-emails-to-training-files-and-train)]
+     (let [result (try
+                    (write-emails-to-training-files-and-train)
+                    (catch Throwable e
+                      (t/log! {:level :error :error e} "Manual categorization training failed.")
+                      {:type :alert :content "Training failed. The existing model remains active."}))]
        (if (some? result)
-         (swap! global-messages (fn [mess] (conj mess result)))
+         (swap! global-messages conj result)
          (p/record-successful-training! (Instant/now)))
        (redirect-to-referer request)))
 
