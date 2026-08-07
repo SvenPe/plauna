@@ -1,18 +1,27 @@
-FROM clojure:temurin-25-tools-deps-bookworm-slim as build
-RUN apt update && apt install -y nodejs npm
-COPY . /usr/src/app/
+FROM node:22-bookworm-slim AS frontend
 WORKDIR /usr/src/app
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . ./
 RUN npm run build
-# FIXME Tests are currently disabled because some of them fail at random due to concurrency
-# RUN clojure -M:test
+
+FROM clojure:temurin-25-tools-deps-bookworm-slim AS build
+WORKDIR /usr/src/app
+COPY . ./
+COPY --from=frontend /usr/src/app/resources/public/css/tailwind.css resources/public/css/tailwind.css
+COPY --from=frontend /usr/src/app/resources/public/js/vendor resources/public/js/vendor
+RUN clojure -M:test
 RUN clojure -T:build uber
 
 FROM eclipse-temurin:25-alpine
-COPY --from=build /usr/src/app/target/plauna-standalone.jar /app/
+RUN addgroup -S plauna \
+    && adduser -S -G plauna -h /app plauna \
+    && mkdir -p /var/lib/plauna \
+    && chown plauna:plauna /var/lib/plauna
+COPY --from=build --chown=plauna:plauna /usr/src/app/target/plauna-standalone.jar /app/
 EXPOSE 8080
 WORKDIR /app
-RUN mkdir /var/lib/plauna # Default location for data files
+USER plauna
 # 'exec' so the JVM replaces the shell and runs as PID 1: this gives it proper signal handling
 # (clean shutdown, and SIGQUIT/kill -3 thread dumps go straight to the JVM).
 CMD ["sh", "-c", "exec java -jar plauna-standalone.jar $PLAUNA_ARGS"]
