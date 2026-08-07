@@ -53,9 +53,6 @@
         ring/ring-core {:mvn/version "1.15.3"}
         ring/ring-jetty-adapter {:mvn/version "1.15.3"}
         selmer/selmer {:mvn/version "1.12.69"}
-        org.scicloj/tableplot {:git/url "https://github.com/scicloj/tableplot" :git/sha "0f46227fa35cb756ac44ab1f1e732464a096bc6b"}
-        scicloj/tablecloth {:mvn/version "7.067"}
-        cnuernber/dtype-next {:mvn/version "10.146"}
         }}
 
     

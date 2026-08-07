@@ -6,11 +6,7 @@
             [clojure.string :as str]
             [ring.util.codec :refer [base64-encode]]
             [plauna.client :as client]
-            [plauna.preferences :as preferences]
-            [scicloj.tableplot.v1.hanami :as hanami]
-            [tablecloth.api :as tc]
-            [tablecloth.column.api :as tcc]
-            [tech.v3.datatype.datetime :as datetime])
+            [plauna.preferences :as preferences])
   (:import
    (java.time Instant LocalDateTime)
    (java.util Locale)))
@@ -126,77 +122,99 @@
   ([email-data categories messages]
    (render "email.html" {:email (update-in email-data [:header :date] timestamp->date) :categories categories :active-nav :emails :messages (mapv type->toast-role messages)})))
 
-(defmacro pie-chart [data-values key key-label description]
-  `{:data {:values ~data-values}
-    :title ~description
-    :description ~description
-    :transform [{:joinaggregate [{:op "sum" :field :count :as :total}]}
-                {:calculate (str "datum.count / datum.total < 0.1 ? 'others' : datum['" ~key "']") :as (keyword ~key)}
-                {:aggregate [{:op :sum :field :count :as :count}] :groupby [(keyword ~key)]}]
-    :layer [{:mark {:type :arc :outerRadius 10 :stroke "#fff"}}
-            {:mark {:type :text :radiusOffset 30}
-             :encoding {:text {:field (keyword ~key) :type "nominal"}}}]
-    :encoding {:theta {:field :count :type "quantitative" :stack true}
-               :radius {:field :count :scale {:type :sqrt :zero true :rangeMin 15}}
-               :color {:field (keyword ~key) :legend nil}
-               :tooltip [{:field (keyword ~key) :type "nominal" :title ~key-label}
-                         {:field :count :type "nominal" :title "Count"}]}
-    :config {:background nil}})
+(def ^:private vega-lite-schema "https://vega.github.io/schema/vega-lite/v6.json")
+(def ^:private chart-color "#8c0327")
 
-(defn transform-into-overview-dataset [dataset key]
-  (-> (tc/group-by dataset [(keyword key)])
-      (tc/aggregate {:count #(-> % :count tcc/sum)})
-      (tc/join-columns :joined [:count (keyword key)] {:result-type :map})
-      first
-      second))
+(defn- count-value [row]
+  (long (or (:count row) 0)))
 
-(defn statistics-overall [yearly-emails yearly-mime-types yearly-languages yearly-categories]
-  (let [overall-email (if (seq yearly-emails)
-                        (-> yearly-emails
-                            (tc/dataset {:key-fn keyword})
-                            (tc/map-columns :date #(datetime/instant->local-date-time (datetime/seconds-since-epoch->instant %)))
-                            (tc/add-column :interval #(datetime/long-temporal-field :years (:date %)))
-                            (tc/group-by [:interval])
-                            (tc/aggregate {:total-count #(-> % :count tcc/sum)})
-                            (hanami/plot hanami/bar-chart {:=background nil :=x :interval :=x-type :nominal :=x-title "Years" :=y :total-count :=y-title "Number of E-mails" :=title "Yearly E-Mails"}))
-                        yearly-emails)
-        mime-type-data (tc/dataset yearly-mime-types)
-        mime-type-overview (if (seq mime-type-data)
-                             (-> mime-type-data
-                                 (transform-into-overview-dataset 'mime-type)
-                                 (pie-chart 'mime-type "MIME TYPE" "MIME Types Overview"))
-                             mime-type-data)
-        mime-type-bar-data (if (seq mime-type-data)
-                             (-> (tc/group-by mime-type-data [:mime-type])
-                                 (tc/aggregate {:sum #(-> % :count tcc/sum)})
-                                 (tc/order-by :sum :desc)
-                                 (hanami/plot hanami/bar-chart {:=y :mime-type :=y-title "Mime Type" :=x :sum :=x-title "Total Count" :=title "Mime Types by Occurence" :=background nil :=y-sort nil :=x-sort nil})
-                                 (update-in [:encoding :y] conj {:sort nil}))
-                             mime-type-data)
-        language-data (-> (filterv (fn [col] (some? (:interval col))) yearly-languages) tc/dataset)
-        language-overview (-> language-data
-                              (transform-into-overview-dataset 'language)
-                              (pie-chart 'language "LANGUAGE" "Language Overview"))
-        language-bar-data (hanami/plot language-data hanami/bar-chart {:=x :interval :=y :count :=background nil :=color :language :=x-title "Year" :=y-title "Lanuages"})
+(defn- sum-counts [rows]
+  (reduce + 0 (map count-value rows)))
 
-        categories-data  (-> (filterv (fn [col] (some? (:interval col))) yearly-categories) tc/dataset)
-        categories-overview (-> categories-data
-                                (transform-into-overview-dataset 'category)
-                                (pie-chart 'category "Category" "Category Overview"))
-        categories-bar-data (hanami/plot categories-data hanami/bar-chart {:=x :interval :=y :count :=background nil :=color :category :=x-title "Year" :=y-title "Categories"})]
+(defn- present-label? [value]
+  (and (some? value) (not (str/blank? (str value))) (not= "n/a" value)))
+
+(defn- normalized-breakdown [rows field missing-label]
+  (->> rows
+       (map (fn [row]
+              {field (if (present-label? (get row field)) (str (get row field)) missing-label)
+               :count (count-value row)}))
+       (sort-by :count >)
+       vec))
+
+(defn- base-chart [description values]
+  {(keyword "$schema") vega-lite-schema
+   :description description
+   :width "container"
+   :autosize {:type "fit-x" :contains "padding" :resize true}
+   :data {:values values}
+   :config {:background nil
+            :view {:stroke nil}
+            :axis {:labelColor "#374151" :titleColor "#374151" :gridColor "#e5e7eb"}
+            :font "system-ui"}})
+
+(defn- volume-chart [values]
+  (merge (base-chart "Number of e-mails per year" values)
+         {:height 280
+          :mark {:type "bar" :tooltip true :color chart-color
+                 :cornerRadiusTopLeft 3 :cornerRadiusTopRight 3}
+          :encoding {:x {:field "time-bucket" :type "ordinal" :title "Year" :sort nil}
+                     :y {:field "count" :type "quantitative" :title "E-mails"
+                         :axis {:tickMinStep 1 :format "d"}}
+                     :tooltip [{:field "time-bucket" :type "ordinal" :title "Year"}
+                               {:field "count" :type "quantitative" :title "E-mails"}]}}))
+
+(defn- breakdown-chart [description values field label-title]
+  (merge (base-chart description values)
+         {:height (max 60 (* 30 (count values)))
+          :mark {:type "bar" :tooltip true :color chart-color :cornerRadiusEnd 3 :size 22}
+          :encoding {:y {:field (name field) :type "nominal" :title nil :sort "-x"
+                         :axis {:labelLimit 240}}
+                     :x {:field "count" :type "quantitative" :title "E-mails"
+                         :axis {:tickMinStep 1 :format "d"}}
+                     :tooltip [{:field (name field) :type "nominal" :title label-title}
+                               {:field "count" :type "quantitative" :title "E-mails"}]}}))
+
+(defn- percentage-string [part total]
+  (if (zero? total)
+    "0.0 %"
+    (String/format Locale/ROOT "%.1f %%"
+                   (object-array [(* 100.0 (/ (double part) (double total)))]))))
+
+(defn- chart-context [id title description values spec]
+  {:id id
+   :title title
+   :description description
+   :has-data (boolean (seq values))
+   :json-data (when (seq values) (json/write-str spec))})
+
+(defn statistics-overall [yearly-emails mime-types languages categories]
+  (let [email-values (->> yearly-emails
+                          (keep (fn [{:keys [time-bucket] :as row}]
+                                  (when (some? time-bucket)
+                                    {:time-bucket (str time-bucket) :count (count-value row)})))
+                          vec)
+        mime-values (normalized-breakdown mime-types :mime-type "Unknown")
+        language-values (normalized-breakdown languages :language "Not detected")
+        category-values (normalized-breakdown categories :name "Uncategorized")
+        total-emails (sum-counts categories)
+        categorized-emails (sum-counts (filter #(present-label? (:name %)) categories))
+        detected-languages (count (set (keep #(when (present-label? (:language %)) (:language %)) languages)))
+        known-mime-types (count (set (keep #(when (present-label? (:mime-type %)) (:mime-type %)) mime-types)))]
     (render "statistics.html"
-            {:statistics [{:title "Overall"
-                           :contents [{:type :bar-chart :header "" :id "emails" :json-data (json/write-str overall-email)}
-                                      {:type :bar-chart :id "overview" :json-data (json/write-str mime-type-overview)}
-                                      {:type :bar-chart :id "most-common" :json-data (json/write-str mime-type-bar-data)}]}
-                          {:title "Languages"
-                           :contents [{:type :bar-chart :id "languages-overview" :json-data (json/write-str language-overview)}
-                                      {:type :bar-chart :id "languages" :json-data (json/write-str language-bar-data)}]}
-                          {:title "Categories"
-                           :contents [{:type :bar-chart :id "categories-overview" :json-data (json/write-str categories-overview)}
-                                      {:type :bar-chart :id "categories" :json-data (json/write-str categories-bar-data)}]}]
-             :active-nav :statistics
-             :no-data (empty? yearly-emails)})))
+            {:active-nav :statistics
+             :summary [{:label "Total e-mails" :value total-emails}
+                       {:label "Categorized" :value (percentage-string categorized-emails total-emails)}
+                       {:label "Detected languages" :value detected-languages}
+                       {:label "MIME types" :value known-mime-types}]
+             :charts [(chart-context "email-volume" "E-mail volume" "Number of stored e-mails per year."
+                                     email-values (volume-chart email-values))
+                      (chart-context "mime-types" "MIME types" "Message formats across stored e-mails."
+                                     mime-values (breakdown-chart "E-mails by MIME type" mime-values :mime-type "MIME type"))
+                      (chart-context "languages" "Languages" "Detected language across all stored e-mails."
+                                     language-values (breakdown-chart "E-mails by detected language" language-values :language "Language"))
+                      (chart-context "categories" "Categories" "Current category assignments, including uncategorized e-mails."
+                                     category-values (breakdown-chart "E-mails by category" category-values :name "Category"))]})))
 
 (defn categories-page [categories] (render "admin-categories.html" {:categories categories :active-nav :admin}))
 

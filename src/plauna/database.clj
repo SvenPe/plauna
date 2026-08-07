@@ -297,7 +297,7 @@
           (recur (async-utils/fetch-or-timeout!! local-chan 1000)
                  (add-to-buffer (:payload event) buffer)))))))
 
-(defn honey-intervals []
+(defn honey-time-buckets []
   (if (mariadb?)
     {:yearly  [:year [:from_unixtime :date]]
      :monthly [:date_format [:from_unixtime :date] "%Y-%m"]}
@@ -487,7 +487,9 @@
 
 (defn body-parts-for-options [] "SELECT * FROM bodies INNER JOIN metadata ON metadata.message_id = bodies.message_id")
 
-(defn interval-for-honey [key] (get (honey-intervals) key :yearly))
+(defn time-bucket-for-honey [key]
+  (let [buckets (honey-time-buckets)]
+    (get buckets key (:yearly buckets))))
 
 (defn convert-to-count [sql-result entity]
   (let [sql (first sql-result)
@@ -627,8 +629,26 @@
 (defmethod fetch-data :participant [entity-clause sql-clause]
   (map core.email/map->Participant (jdbc/execute! (ds) (data->sql entity-clause sql-clause) builder-function-kebab)))
 
+(defn email-statistics-query
+  "Build a portable query that counts e-mails in database-side time buckets. The expression itself is
+   repeated in GROUP BY and ORDER BY instead of referring to a SELECT alias. In particular, never use
+   `interval` as an unquoted alias: INTERVAL is reserved by MariaDB."
+  [period]
+  (let [time-bucket (time-bucket-for-honey period)]
+    {:select [[time-bucket :time-bucket]
+              [[:count :headers.message-id] :count]]
+     :from [:headers]
+     :where [:is-not :headers.date nil]
+     :group-by [time-bucket]
+     :order-by [[time-bucket :asc]]}))
+
+(defn email-statistics-by-period [period]
+  (jdbc/execute! (ds)
+                 (honey/format (email-statistics-query period))
+                 builder-function-kebab))
+
 (defn yearly-email-stats []
-  (jdbc/execute! (ds) ["SELECT COUNT(message_id) AS count, date AS date FROM headers WHERE date IS NOT NULL GROUP BY date"] builder-function-kebab))
+  (email-statistics-by-period :yearly))
 
 (defn query-db [honeysql-query]
   (jdbc/execute! (ds) (honey/format honeysql-query) builder-function-kebab))

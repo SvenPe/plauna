@@ -188,7 +188,7 @@
 (defn write-emails-to-training-files-and-train []
   (train-categorization-model! (p/categorization-model)))
 
-(def model-switch-confirmation "Training starten")
+(def model-switch-confirmation "Start training")
 
 (defn- model-files-available? [model]
   (let [languages (vec (languages-to-use-in-training))]
@@ -369,37 +369,31 @@
             :when (some? (:id trained-email))]
       (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email)))))
 
-(defn mime-type-statistics [period]
-  ;; MariaDB does not allow SELECT aliases in WHERE; reference the source column directly.
-  (let [iv (db/interval-for-honey period)]
-    (db/query-db {:select [[[:count :headers.message-id] :count] :bodies.mime-type [iv :interval]] :from [:bodies]
-                  :join [:headers [:= :bodies.message-id :headers.message_id]]
-                  :where [:is-not :headers.date nil]
-                  :group-by [:interval :bodies.mime-type]
-                  :order-by [[:count :desc]]})))
+(defn mime-type-statistics []
+  ;; Header MIME type represents one value per e-mail. Counting body parts here would count multipart
+  ;; messages more than once and make this chart disagree with the total e-mail count.
+  (db/query-db {:select [:headers.mime-type [[:count :headers.message-id] :count]]
+                :from [:headers]
+                :group-by [:headers.mime-type]
+                :order-by [[[:count :headers.message-id] :desc]]}))
 
-(defn language-statistics-by-period [period]
-  (db/query-db {:select [[[:count :metadata.language] :count] :metadata.language [(db/interval-for-honey period) :interval]] :from [:metadata]
-                :join [:headers [:= :metadata.message-id :headers.message_id]]
-                :group-by [:language :interval]}))
+(defn language-statistics []
+  ;; Start at headers and LEFT JOIN metadata so e-mails without detected language remain visible.
+  (db/query-db {:select [:metadata.language [[:count :headers.message-id] :count]]
+                :from [:headers]
+                :left-join [:metadata [:= :headers.message-id :metadata.message-id]]
+                :group-by [:metadata.language]
+                :order-by [[[:count :headers.message-id] :desc]]}))
 
-(defn category-statistics-by-period [period]
-  ;; MariaDB does not allow SELECT aliases in WHERE; inline the interval expression there.
-  (let [year       (:year period)
-        iv         (db/interval-for-honey (:interval period))
-        categories (reduce (fn [acc el] (merge acc {(:id el) (:name el)})) {} (db/get-categories))
-        statistics (if (some? year)
-                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [iv :interval]] :from [:metadata]
-                                   :join [:headers [:= :metadata.message-id :headers.message_id]]
-                                   :where [:and [:<> :category nil] [:like iv (str year "%")]]
-                                   :group-by [:category :interval]})
-                     (db/query-db {:select [[[:count :metadata.category] :count] :metadata.category [iv :interval]] :from [:metadata]
-                                   :join [:headers [:= :metadata.message-id :headers.message_id]]
-                                   :where [:<> :category nil]
-                                   :group-by [:category :interval]}))]
-    (map (comp
-          (fn [map] (if (= 0 (get map :category)) map (update map :category (fn [cat-key] (get categories cat-key)))))
-          (fn [map] (update map :category #(if (int? %) % (Integer/parseInt %))))) statistics)))
+(defn category-statistics []
+  ;; Resolve category names in SQL and retain uncategorized e-mails as the NULL group. This avoids
+  ;; loading every category merely to translate ids after the aggregate query.
+  (db/query-db {:select [:categories.name [[:count :headers.message-id] :count]]
+                :from [:headers]
+                :left-join [:metadata [:= :headers.message-id :metadata.message-id]
+                            :categories [:= :metadata.category :categories.id]]
+                :group-by [:categories.id :categories.name]
+                :order-by [[[:count :headers.message-id] :desc]]}))
 
 (defn enriched-email-by-message-id [id] (first (db/fetch-data {:entity :enriched-email :strict false} {:where [:= :message-id id]})))
 
@@ -836,7 +830,11 @@
       :body    (markup/administration {:repl (get-status-repl-server)})})
 
    (comp/GET "/statistics" {}
-     (success-html-with-body (markup/statistics-overall (db/yearly-email-stats) (mime-type-statistics :yearly) (language-statistics-by-period :yearly) (category-statistics-by-period {:interval :yearly}))))
+     (success-html-with-body
+      (markup/statistics-overall (db/yearly-email-stats)
+                                 (mime-type-statistics)
+                                 (language-statistics)
+                                 (category-statistics))))
 
    (comp/POST "/metadata/category" request
      ;; Recategorize a single email immediately (the e-mail list's category dropdown calls this on
@@ -1067,12 +1065,31 @@
         (t/log! {:level :error :error e} ["Unhandled error while processing" (:uri request)])
         {:status 500 :headers html-headers :body "An unexpected error occurred."}))))
 
+(defn wrap-static-asset-revalidation
+  "Keep static assets cacheable, but require browsers to check for a newer copy after a deployment.
+   Asset URLs are intentionally stable, so long-lived freshness would otherwise leave users with old
+   CSS or JavaScript until they clear their browser cache manually."
+  [handler]
+  (fn [request]
+    (let [response (handler request)
+          uri (:uri request)]
+      (if (and response
+               (or (.startsWith ^String uri "/css/")
+                   (.startsWith ^String uri "/js/")
+                   (.startsWith ^String uri "/favicon")
+                   (.startsWith ^String uri "/android-chrome")
+                   (= uri "/plauna-banner.png")
+                   (= uri "/site.webmanifest")))
+        (assoc-in response [:headers "Cache-Control"] "no-cache")
+        response))))
+
 (defn app [context] (-> (fn [req] ((make-routes context) req))
                         wrap-authentication
                         wrap-keyword-params
                         (wrap-multipart-params {:progress-fn upload-progress})
                         wrap-params
                         wrap-exception-handling
+                        wrap-static-asset-revalidation
                         (wrap-session {:store (cookie-store {:key (settings/session-key)})
                                        ;; HttpOnly keeps the cookie out of JS; SameSite=Lax blocks forged
                                        ;; cross-site POSTs (CSRF) while still allowing the OAuth provider's

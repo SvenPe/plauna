@@ -1,6 +1,7 @@
 (ns plauna.server-test
   (:require [clojure.string :as str]
             [clojure.test :refer :all]
+            [honey.sql :as honey]
             [plauna.application :as app]
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
@@ -10,6 +11,30 @@
             [plauna.server :as server])
   (:import [java.time Instant LocalTime ZoneId ZonedDateTime]
            [java.util.concurrent ScheduledExecutorService TimeUnit]))
+
+(deftest statistics-queries-are-portable-and-fully-aggregated
+  (let [captured (atom [])]
+    (with-redefs [db/query-db (fn [query] (swap! captured conj query) [])]
+      (server/mime-type-statistics)
+      (server/language-statistics)
+      (server/category-statistics))
+    (let [sql (mapv #(first (honey/format % {:inline true})) @captured)]
+      (is (= 3 (count sql)))
+      (is (every? #(str/includes? % "COUNT(headers.message_id)") sql))
+      (is (every? #(not (re-find #"(?i)\binterval\b" %)) sql))
+      (is (str/includes? (second sql) "LEFT JOIN metadata"))
+      (is (str/includes? (nth sql 2) "LEFT JOIN categories")))))
+
+(deftest yearly-statistics-query-does-not-use-a-reserved-alias
+  (doseq [[mariadb? expected-bucket]
+          [[true "YEAR(FROM_UNIXTIME(date))"]
+           [false "STRFTIME('%Y', DATETIME(date, 'unixepoch'))"]]]
+    (with-redefs [db/mariadb? (constantly mariadb?)]
+      (let [sql (first (honey/format (db/email-statistics-query :yearly) {:inline true}))]
+        (is (str/includes? sql (str expected-bucket " AS time_bucket")))
+        (is (str/includes? sql (str "GROUP BY " expected-bucket)))
+        (is (not (re-find #"(?i)\bAS\s+interval\b" sql))))))
+  "MariaDB and SQLite aggregate by year in SQL instead of returning one row per timestamp")
 
 (defn- ok-handler [_] {:status 200 :body "secret"})
 
@@ -64,7 +89,7 @@
                   server/train-categorization-model! (fn [model] (swap! calls conj [:train model]))
                   preferences/update-preference (fn [& args] (swap! calls conj [:update args]))]
       (let [result (server/switch-categorization-model!
-                    {:model "maxent" :use-current-categories "true" :confirmation "training starten"})]
+                    {:model "maxent" :use-current-categories "true" :confirmation "start training"})]
         (is (= :alert (:type result)))
         (is (empty? @calls) "Neither training nor the preference changes without exact confirmation")))))
 
@@ -141,6 +166,14 @@
       (is (= 200 (:status (handler {:uri uri :session {}})))
           (str uri " is reachable without authentication"))))
   "Login and static assets are reachable without authentication")
+
+(deftest static-assets-are-revalidated-after-a-deployment
+  (let [handler (server/wrap-static-asset-revalidation
+                 (fn [_] {:status 200 :headers {"Content-Type" "text/css"} :body "asset"}))]
+    (is (= "no-cache" (get-in (handler {:uri "/css/tailwind.css"}) [:headers "Cache-Control"])))
+    (is (= "no-cache" (get-in (handler {:uri "/js/vendor/vega.min.js"}) [:headers "Cache-Control"])))
+    (is (nil? (get-in (handler {:uri "/statistics"}) [:headers "Cache-Control"]))))
+  "Stable asset URLs must not leave browsers on an old UI after a container update")
 
 (deftest recategorize-email-reports-a-missing-imap-message-without-saving
   (let [updates (atom [])]

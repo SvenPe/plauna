@@ -29,9 +29,14 @@
       (is (str/includes? html "action=\"/admin/preferences/model\""))
       (is (str/includes? html "value=\"naive-bayes\" selected"))
       (is (str/includes? html "value=\"maxent\""))
-      (is (str/includes? html "Aktuelle Kategoriezuordnungen für das Training verwenden"))
-      (is (str/includes? html "Training starten"))
-      (is (str/includes? html "confirmationInput.value !== 'Training starten'")))))
+      (is (str/includes? html "Switch categorization model?"))
+      (is (str/includes? html "Use current category assignments for training"))
+      (is (str/includes? html "Start training"))
+      (is (str/includes? html "class=\"label-text block\" for=\"model-switch-confirmation\""))
+      (is (str/includes? html "class=\"input input-bordered mt-1 w-full\""))
+      (is (str/includes? html "class=\"modal-action flex-wrap\""))
+      (is (not (str/includes? html "class=\"form-control mt-4\"")))
+      (is (str/includes? html "confirmationInput.value !== 'Start training'")))))
 
 (deftest disconnected-banner-is-hidden-when-no-connections-are-disconnected
   (with-redefs [client/disconnected-connections (fn [] [])]
@@ -71,7 +76,29 @@
       (is (str/includes? html "/js/vendor/vega.min.js"))
       (is (str/includes? html "/js/vendor/vega-lite.min.js"))
       (is (str/includes? html "/js/vendor/vega-embed.min.js"))
-      (is (not (str/includes? html "cdn.jsdelivr.net"))))))
+      (is (not (str/includes? html "cdn.jsdelivr.net")))
+      (is (str/includes? html "Total e-mails"))
+      (is (str/includes? html "No data available for this chart.")))))
+
+(deftest statistics-page-renders-responsive-direct-vega-lite-specifications
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/statistics-overall
+                [{:time-bucket 2024 :count 5}]
+                [{:mime-type "text/plain" :count 4} {:mime-type nil :count 1}]
+                [{:language "en" :count 3} {:language nil :count 2}]
+                [{:name "Work" :count 4} {:name nil :count 1}])]
+      (is (str/includes? html ">5</strong>"))
+      (is (str/includes? html ">80.0 %</strong>"))
+      (is (str/includes? html "\"$schema\""))
+      (is (str/includes? html "vega-lite\\/v6.json"))
+      (is (str/includes? html "\"width\":\"container\""))
+      (is (str/includes? html "\"time-bucket\":\"2024\""))
+      (is (str/includes? html "Uncategorized"))
+      (is (str/includes? html "Not detected"))
+      (is (str/includes? html "Unknown"))
+      (is (str/includes? html "{actions: false, renderer: 'svg'}"))
+      (is (not (str/includes? html "\"format\":{\"type\":\"csv\"")))))
+  "Charts use small JSON value arrays directly and size themselves to their cards")
 
 (deftest email-list-renders-explicit-column-filter-workflow-and-active-chips
   (with-redefs [client/disconnected-connections (fn [] [])]

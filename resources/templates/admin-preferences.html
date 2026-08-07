@@ -55,24 +55,25 @@
 
   <dialog id="categorization-model-dialog" class="modal" data-current-model="{{categorization-model}}">
     <div class="modal-box">
-      <h3 class="text-lg font-bold">Kategorisierungsmodell wechseln?</h3>
+      <h3 class="text-lg font-bold">Switch categorization model?</h3>
       <p class="py-3">
-        Plauna kann alle aktuell kategorisierten E-Mails in den für das Training aktivierten Sprachen
-        als korrekte Trainingsbeispiele für das neue Modell übernehmen. Die vorhandenen Kategorien
-        werden dabei nicht verändert.
+        Plauna can use all currently categorized e-mails in the languages enabled for training as
+        correct training examples for the new model. Existing category assignments will not be changed.
       </p>
       <label class="label cursor-pointer justify-start gap-3">
         <input class="checkbox" type="checkbox" name="use-current-categories" value="true" checked>
-        <span>Aktuelle Kategoriezuordnungen für das Training verwenden</span>
+        <span>Use current category assignments for training</span>
       </label>
-      <label class="form-control mt-4">
-        <span class="label-text">Zur Bestätigung „Training starten“ eingeben:</span>
-        <input id="model-switch-confirmation" class="input input-bordered mt-1" name="confirmation"
+      <div class="mt-4">
+        <label class="label-text block" for="model-switch-confirmation">
+          Enter “Start training” to confirm:
+        </label>
+        <input id="model-switch-confirmation" class="input input-bordered mt-1 w-full" name="confirmation"
                type="text" autocomplete="off" oninput="validateModelSwitchConfirmation()">
-      </label>
-      <div class="modal-action">
-        <button class="btn btn-ghost" type="button" onclick="cancelCategorizationModelChange()">Abbrechen</button>
-        <button id="model-switch-submit" class="btn btn-primary" type="submit" disabled>Modell wechseln</button>
+      </div>
+      <div class="modal-action flex-wrap">
+        <button class="btn btn-ghost" type="button" onclick="cancelCategorizationModelChange()">Cancel</button>
+        <button id="model-switch-submit" class="btn btn-primary" type="submit" disabled>Switch model</button>
       </div>
     </div>
     <button type="button" class="modal-backdrop" onclick="cancelCategorizationModelChange()">close</button>
@@ -94,7 +95,7 @@
   }
 
   function validateModelSwitchConfirmation() {
-    modelSubmit.disabled = confirmationInput.value !== 'Training starten';
+    modelSubmit.disabled = confirmationInput.value !== 'Start training';
   }
 
   function cancelCategorizationModelChange() {
