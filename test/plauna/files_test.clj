@@ -2,10 +2,40 @@
   (:require [clojure.test :refer :all]
             [clojure.java.io :as io]
             [plauna.files :as files]
-            [clojure.core.async :refer [<!! chan close!]]))
+            [clojure.core.async :refer [<!! chan close!]])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
 (defn resource->is [resource-path]
   (io/input-stream (io/resource resource-path)))
+
+(deftest model-file-is-published-only-after-a-successful-write
+  (let [temp-dir (.toFile (Files/createTempDirectory "plauna-model-test-" (make-array FileAttribute 0)))]
+    (try
+      (with-redefs [files/file-dir (fn [] (.getAbsolutePath temp-dir))]
+        (let [target (files/model-file "deu")]
+          (spit target "old model")
+          (files/write-model-file-atomically!
+           "deu"
+           (fn [os]
+             (.write os (.getBytes "new model"))
+             (is (= "old model" (slurp target))
+                 "Readers keep seeing the complete old model while the replacement is written")))
+          (is (= "new model" (slurp target))))
+        (let [target (files/model-file "eng")]
+          (spit target "working model")
+          (is (thrown-with-msg? Exception #"serialization failed"
+                                (files/write-model-file-atomically!
+                                 "eng"
+                                 (fn [os]
+                                   (.write os (.getBytes "partial model"))
+                                   (throw (ex-info "serialization failed" {}))))))
+          (is (= "working model" (slurp target))
+              "A failed serialization leaves the previous model untouched")))
+      (finally
+        (doseq [file (reverse (file-seq temp-dir))]
+          (io/delete-file file true)))))
+  "Training never exposes a partially written model to categorization")
 
 (deftest read-single-item-mbox
   (let [test-chan (chan 20)]

@@ -173,8 +173,9 @@
     (if (seq (languages-to-use-in-training))
       (do (write-all-categorized-emails-to-training-files)
           (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
-            (with-open [os (io/output-stream (files/model-file (:language training-model)))]
-              (analysis/serialize-and-write-model! (:model training-model) os))))
+            (files/write-model-file-atomically!
+             (:language training-model)
+             #(analysis/serialize-and-write-model! (:model training-model) %))))
       {:type :alert :content "There are no selected languages to train in. Cannot proceed."})))
 
 (defn- run-automatic-training! []

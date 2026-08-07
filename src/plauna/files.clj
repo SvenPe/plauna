@@ -6,7 +6,9 @@
             [taoensso.telemere :as t]
             [plauna.messaging :as messaging]
             [plauna.core.events :as events])
-  (:import [java.io File]))
+  (:import [java.io File]
+           [java.nio.file AtomicMoveNotSupportedException CopyOption Files StandardCopyOption]
+           [java.nio.file.attribute FileAttribute]))
 
 (set! *warn-on-reflection* true)
 
@@ -68,6 +70,35 @@
 
 (defn model-file "Returns the model file for the language specified."
   [^String language] ^File (io/file (file-dir) (str "train-" language ".bin")))
+
+(defn write-model-file-atomically!
+  "Write a model to a temporary sibling file and publish it only after writing completed successfully.
+   Readers therefore see either the previous complete model or the new complete model, never a partially
+   serialized file. write-fn receives the temporary file's output stream."
+  [language write-fn]
+  (let [^File target-file (model-file language)]
+    (io/make-parents target-file)
+    (let [target-path (.toPath target-file)
+          parent-path (.getParent target-path)
+          prefix (str "." (.getFileName target-path) "-")
+          temp-path (Files/createTempFile parent-path prefix ".tmp" (make-array FileAttribute 0))]
+      (try
+        (with-open [os (io/output-stream (.toFile temp-path))]
+          (write-fn os))
+        (try
+          (Files/move temp-path target-path
+                      (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                              StandardCopyOption/REPLACE_EXISTING]))
+          (catch AtomicMoveNotSupportedException _
+            ;; A completed sibling file is still safer than writing directly to the live model. Most
+            ;; local filesystems implement this replacement as a rename even without the explicit flag.
+            (t/log! :warn ["Atomic file moves are not supported for" target-path
+                           "- replacing the completed model with a regular move."])
+            (Files/move temp-path target-path
+                        (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+        target-file
+        (finally
+          (Files/deleteIfExists temp-path))))))
 
 (defn delete-files-with-type [type]
   (case type
