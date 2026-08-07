@@ -1,13 +1,15 @@
 {
     "scripts": {
-        "build": "npx @tailwindcss/cli -i resources/public/css/custom.css -c resources/public/js/tailwind.config.js -o resources/public/css/tailwind.css",
-        "dev": "npx @tailwindcss/cli -i resources/public/css/custom.css -c resources/public/js/tailwind.config.js -o resources/public/css/tailwind.css -w"
-    },
-    "dependencies": {
+        "build": "npx @tailwindcss/cli -i resources/public/css/custom.css -c resources/public/js/tailwind.config.js -o resources/public/css/tailwind.css && npm run vendor",
+        "dev": "npm run vendor && npx @tailwindcss/cli -i resources/public/css/custom.css -c resources/public/js/tailwind.config.js -o resources/public/css/tailwind.css -w",
+        "vendor": "node scripts/copy-vendor-assets.mjs"
     },
     "devDependencies": {
+        "@tailwindcss/cli": "^4.1.4",
         "daisyui": "^5.0.23",
         "tailwindcss": "^4.1.4",
-        "@tailwindcss/cli": "^4.1.4"
+        "vega": "6.3.1",
+        "vega-embed": "7.1.0",
+        "vega-lite": "6.4.3"
     }
 }

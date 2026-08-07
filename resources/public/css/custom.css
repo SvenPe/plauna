@@ -1,6 +1,7 @@
 /*@config "../js/tailwind.config.js";*/
 
 @import "tailwindcss";
+@source not "../js/vendor";
 @plugin "daisyui" {
   themes: autumn --default;
 }

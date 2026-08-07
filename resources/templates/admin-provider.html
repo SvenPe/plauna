@@ -24,7 +24,7 @@
               <td><input class="input" name="token_url" value=""></td>
               <td><input class="input" name="redirect_url" value=""></td>
               <td><input class="input" name="client_id" value=""></td>
-              <td><input class="input" name="client_secret" value=""></td>
+              <td><input class="input" name="client_secret" type="password" value="" autocomplete="new-password"></td>
               <td><input class="input" name="scope" value=""></td>
               <td><button form="new-auth-provider" class="btn btn-primary" type="submit">Add New Provider</button></td>
             </form>
@@ -38,7 +38,7 @@
               <td><input class="input" name="token_url" form="provider-{{provider.id}}" value="{{provider.token-url}}"></td>
               <td><input class="input" name="redirect_url" form="provider-{{provider.id}}" value="{{provider.redirect-url}}"></td>
               <td><input class="input" name="client_id" form="provider-{{provider.id}}" value="{{provider.client-id}}"></td>
-              <td><input class="input" name="client_secret" form="provider-{{provider.id}}" value="{{provider.client-secret}}"></td>
+              <td><input class="input" name="client_secret" form="provider-{{provider.id}}" type="password" value="" placeholder="Leave blank to keep current" autocomplete="new-password"></td>
               <td><input class="input" name="scope" form="provider-{{provider.id}}" value="{{provider.scope}}"></td>
               <td>
                 <div id="update-button-{{provider.id}}" class="btn">Update</div>

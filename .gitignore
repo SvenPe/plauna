@@ -19,4 +19,5 @@ pom.xml.asc
 .cpcache/
 /node_modules
 /resources/public/css/tailwind.css
+/resources/public/js/vendor/
 /tmp

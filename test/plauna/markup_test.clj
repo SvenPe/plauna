@@ -15,6 +15,35 @@
       (is (str/includes? html "IMAP connection not active:"))
       (is (str/includes? html "me@imap.example.com")))))
 
+(deftest connection-pages-never-render-stored-secrets-or-statistics-scripts
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [stored-imap-secret "imap-secret-must-not-reach-browser"
+          stored-client-secret "oauth-secret-must-not-reach-browser"
+          html (markup/connection
+                {:id "connection-1"
+                 :host "imap.example.com"
+                 :user "me@example.com"
+                 :secret stored-imap-secret
+                 :auth-providers [{:id 1
+                                   :name "Example"
+                                   :client-secret stored-client-secret}]}
+                []
+                [])]
+      (is (not (str/includes? html stored-imap-secret)))
+      (is (not (str/includes? html stored-client-secret)))
+      (is (str/includes? html "Leave blank to keep the current secret"))
+      (is (not (str/includes? html "cdn.jsdelivr.net")))
+      (is (not (str/includes? html "/js/vendor/vega.min.js")))))
+  "Admin pages contain blank password fields and do not load chart code")
+
+(deftest statistics-page-loads-only-local-chart-scripts
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/statistics-overall [] [] [] [])]
+      (is (str/includes? html "/js/vendor/vega.min.js"))
+      (is (str/includes? html "/js/vendor/vega-lite.min.js"))
+      (is (str/includes? html "/js/vendor/vega-embed.min.js"))
+      (is (not (str/includes? html "cdn.jsdelivr.net"))))))
+
 (deftest email-list-renders-explicit-column-filter-workflow-and-active-chips
   (with-redefs [client/disconnected-connections (fn [] [])]
     (let [html (markup/list-emails

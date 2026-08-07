@@ -390,7 +390,34 @@
 
 (defn get-status-repl-server [] {:status (some? @repl-server) :port 7888})
 
-(defn connection-information [id] (let [conn (db/get-connection id)] (merge conn (client/monitor->map (get @client/connections (:id conn))))))
+(defn- without-provider-secrets [providers]
+  (mapv #(dissoc % :client-secret :client_secret) providers))
+
+(defn- keep-existing-when-blank [submitted existing]
+  (if (st/blank? submitted) existing submitted))
+
+(defn- connection-update-from-params [params existing]
+  {:id (get params :id)
+   :host (get params :host)
+   :user (get params :user)
+   :secret (keep-existing-when-blank (get params :secret) (:secret existing))
+   :folder (get params :folder)
+   :debug (= "true" (get params :debug))
+   :security (get params :security)
+   :port (when (seq (get params :port)) (Integer/parseInt (get params :port)))
+   :check-ssl-certs (= "true" (get params :check-ssl-certs))
+   :auth-type (get params :auth-type)
+   :auth-provider (when (seq (get params :auth-provider))
+                    (Integer/parseInt (get params :auth-provider)))})
+
+(defn- auth-provider-update-from-params [params existing]
+  ;; Form fields use SQL-style underscores while rows read from next.jdbc use kebab-case.
+  (update params :client_secret keep-existing-when-blank (:client-secret existing)))
+
+(defn connection-information [id]
+  (let [conn (db/get-connection id)]
+    ;; A stored password must never enter the template context, even though the password input is blank.
+    (dissoc (merge conn (client/monitor->map (get @client/connections (:id conn)))) :secret)))
 (defn connection-folders [conn]
   (if (= true (:connected conn))
     (client/folders-in-store (:store (client/connection-data-from-id (:id conn))))
@@ -402,7 +429,13 @@
       (= :redirect (:result action))
       (let [csrf (.toString (UUID/randomUUID))]
         (-> (redirect (oauth/authorize-uri (:provider action) csrf))
-            (assoc :session (merge (:session request) {:oauth-csrf csrf :connection-id id :provider (:provider action)}))))
+            ;; Cookie-backed sessions belong to the browser. Store only the provider id, never its
+            ;; client secret; the callback loads the provider from the database when it needs it.
+            (assoc :session (-> (:session request)
+                                (dissoc :provider)
+                                (assoc :oauth-csrf csrf
+                                       :connection-id id
+                                       :provider-id (:id (:provider action)))))))
 
       (= :ok (:result action))
       (redirect-request request)
@@ -749,7 +782,7 @@
        {:status 200}))
 
    (comp/GET "/admin/new-connection" []
-     (let [providers (db/get-auth-providers)]
+     (let [providers (without-provider-secrets (db/get-auth-providers))]
        {:status 200
         :header html-headers
         :body   (markup/new-connection providers)}))
@@ -770,12 +803,13 @@
          (redirect-request request))))
 
    (comp/PUT "/admin/auth-providers/:id" request
-     (let [params (:params request)]
-       (db/update-auth-provider params)))
+     (let [params (:params request)
+           existing (db/get-auth-provider (:id params))]
+       (db/update-auth-provider (auth-provider-update-from-params params existing))))
 
    (comp/GET "/admin/connections/:id" [id]
      (let [conn-info (connection-information id)
-           providers (db/get-auth-providers)
+           providers (without-provider-secrets (db/get-auth-providers))
            categories (db/get-categories)]
        (if (seq @global-messages)
          (let [messages @global-messages]
@@ -784,8 +818,9 @@
          (success-html-with-body (markup/connection (assoc conn-info :auth-providers providers) (connection-folders conn-info) categories)))))
 
    (comp/PUT "/admin/connections/:id" request
-     (let [params (:params request)]
-       (db/update-connection {:id (get params :id) :host (get params :host) :user (get params :user) :secret (get params :secret) :folder (get params :folder) :debug (= "true" (get params :debug)) :security (get params :security) :port (when (seq (get params :port)) (Integer/parseInt (get params :port))) :check-ssl-certs (= "true" (get params :check-ssl-certs)) :auth-type (get params :auth-type) :auth-provider (when (seq (get params :auth-provider)) (Integer/parseInt (get params :auth-provider)))})
+     (let [params (:params request)
+           existing (db/get-connection (:id params))]
+       (db/update-connection (connection-update-from-params params existing))
        {:status 200}))
 
    (comp/POST "/admin/connections/:id/controls" request
@@ -828,13 +863,19 @@
            expected-csrf (:oauth-csrf session)]
        (if (and (seq state) (seq expected-csrf) (= state expected-csrf))
          (try
-           (let [response (oauth/exchange-code-for-access-token (:provider session) (:code params))]
+           (let [provider (db/get-auth-provider (:provider-id session))
+                 response (oauth/exchange-code-for-access-token provider (:code params))]
              (db/save-oauth-token (assoc response :connection-id (:connection-id session)))
-             (app/connect-to-client context (:connection-id session)))
-           (redirect "/admin/connections")
-           (catch Exception e (t/log! :error e) (redirect "/admin/connections")))
+             (app/connect-to-client context (:connection-id session))
+             (assoc (redirect "/admin/connections")
+                    :session (dissoc session :oauth-csrf :connection-id :provider-id :provider)))
+           (catch Exception e
+             (t/log! :error e)
+             (assoc (redirect "/admin/connections")
+                    :session (dissoc session :oauth-csrf :connection-id :provider-id :provider))))
          (do (t/log! :warn "OAuth callback rejected: missing or mismatched CSRF token.")
-             (redirect "/admin/connections")))))
+             (assoc (redirect "/admin/connections")
+                    :session (dissoc session :oauth-csrf :connection-id :provider-id :provider))))))
 
    (route/resources "/")))
 

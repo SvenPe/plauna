@@ -1,7 +1,9 @@
 (ns plauna.server-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.string :as str]
+            [clojure.test :refer :all]
             [plauna.application :as app]
             [plauna.client :as client]
+            [plauna.client.oauth :as oauth]
             [plauna.database :as db]
             [plauna.server :as server])
   (:import [java.util.concurrent ScheduledExecutorService TimeUnit]))
@@ -120,6 +122,83 @@
                @calls))
         (is (= 303 (:status response)))
         (is (= "/admin/connections" (get-in response [:headers "Location"])))))))
+
+(deftest blank-secrets-keep-the-values-already-stored
+  (let [connection (#'server/connection-update-from-params
+                    {:id "connection-1"
+                     :host "imap.example.com"
+                     :user "me@example.com"
+                     :secret ""
+                     :folder "INBOX"
+                     :security "ssl"
+                     :auth-type "basic"}
+                    {:secret "stored-imap-secret"})
+        provider (#'server/auth-provider-update-from-params
+                  {:id "12" :name "Example" :client_secret ""}
+                  {:client-secret "stored-oauth-secret"})]
+    (is (= "stored-imap-secret" (:secret connection)))
+    (is (= "stored-oauth-secret" (:client_secret provider)))
+    (is (= "new-secret"
+           (:secret (#'server/connection-update-from-params
+                     {:id "connection-1" :secret "new-secret" :security "ssl" :auth-type "basic"}
+                     {:secret "stored-imap-secret"}))))
+    (is (= "new-client-secret"
+           (:client_secret (#'server/auth-provider-update-from-params
+                            {:id "12" :client_secret "new-client-secret"}
+                            {:client-secret "stored-oauth-secret"}))))))
+
+(deftest connection-template-context-excludes-the-stored-imap-secret
+  (with-redefs [db/get-connection (fn [_] {:id "connection-1"
+                                           :host "imap.example.com"
+                                           :secret "must-not-enter-template-context"})
+                client/monitor->map (fn [_] {:connected false})]
+    (let [connection (server/connection-information "connection-1")]
+      (is (= "imap.example.com" (:host connection)))
+      (is (not (contains? connection :secret))))))
+
+(deftest oauth-start-stores-only-the-provider-id-in-the-browser-session
+  (let [provider {:id 12
+                  :name "Example"
+                  :auth-url "https://login.example.com/authorize"
+                  :client-id "client-id"
+                  :client-secret "must-stay-on-server"
+                  :redirect-url "https://plauna.example.com/oauth2/callback"
+                  :scope "mail"}]
+    (with-redefs [app/connect-to-client (fn [_ _] {:result :redirect :provider provider})]
+      (let [response (#'server/connect-control-response
+                      {}
+                      {:session {:authenticated true
+                                 :provider {:client-secret "old-secret-from-an-existing-session"}}}
+                      "connection-1")
+            session (:session response)]
+        (is (= 302 (:status response)))
+        (is (= 12 (:provider-id session)))
+        (is (not (contains? session :provider)))
+        (is (not (str/includes? (pr-str session) "must-stay-on-server")))))))
+
+(deftest oauth-callback-loads-provider-server-side-and-clears-one-time-session-data
+  (let [provider {:id 12 :client-secret "server-side-secret"}
+        exchanged (atom nil)]
+    (with-redefs [db/get-auth-provider (fn [id]
+                                        (is (= 12 id))
+                                        provider)
+                  oauth/exchange-code-for-access-token
+                  (fn [loaded-provider code]
+                    (reset! exchanged [loaded-provider code])
+                    {:access_token "token"})
+                  db/save-oauth-token (fn [_])
+                  app/connect-to-client (fn [_ _] {:result :ok})]
+      (let [response ((server/make-routes {})
+                      {:request-method :get
+                       :uri "/oauth2/callback"
+                       :params {:state "csrf" :code "authorization-code"}
+                       :session {:authenticated true
+                                 :oauth-csrf "csrf"
+                                 :connection-id "connection-1"
+                                 :provider-id 12}})]
+        (is (= [provider "authorization-code"] @exchanged))
+        (is (= 302 (:status response)))
+        (is (= {:authenticated true} (:session response)))))))
 
 (deftest refetch-email-saves-participants
   (let [participants [{:message-id "msg-1" :contact-key "sender-key" :name "Sender" :address "sender@example.com" :type :sender}

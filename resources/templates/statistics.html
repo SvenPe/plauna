@@ -1,5 +1,11 @@
 {% extends "base.html" %}
 
+{% block head-extra %}
+<script src="/js/vendor/vega.min.js" type="text/javascript"></script>
+<script src="/js/vendor/vega-lite.min.js" type="text/javascript"></script>
+<script src="/js/vendor/vega-embed.min.js" type="text/javascript"></script>
+{% endblock %}
+
 {% block content %}
 
 {% if interval-filter %}
