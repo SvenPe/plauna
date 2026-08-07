@@ -44,6 +44,8 @@
 
 (declare schedule-health-checks)
 
+(declare refresh-access-token)
+
 (defn default-port-for-security [security]
   (if (= security "ssl") 993 143))
 
@@ -388,56 +390,54 @@
 
 (defn- set-messages-as-peek [messages] (doseq [message messages] (set-message-as-peek message)))
 
+(defn move-message-on-dedicated-store!
+  "Move message-id between two folders using a short-lived Store that is independent of IdleManager.
+   The Store and both folders are always closed after the attempt."
+  [connection-config source-folder-name target-folder-name message-id]
+  (when (oauth2? connection-config)
+    (refresh-access-token connection-config))
+  (with-open [^Store move-store (login connection-config)
+              ^IMAPFolder target-folder (open-folder-in-store move-store target-folder-name)
+              ^IMAPFolder source-folder (open-folder-in-store move-store source-folder-name)]
+    (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
+      (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
+      (if (some? (seq found-messages))
+        (do
+          (set-messages-as-peek found-messages)
+          (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name
+                          "using a dedicated IMAP connection"])
+          (.moveMessages source-folder (into-array Message found-messages) target-folder)
+          (db/update-email-folder message-id target-folder-name)
+          true)
+        (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName move-store)])
+            :not-found)))))
+
 (defn move-messages-by-id-between-category-folders
   "Return true if the message could be moved, :not-found if its source folder was searched but no
    matching message exists, and false for other failures (for example a disconnected store)."
-  [^String id message-id ^String source-name ^String target-name context]
+  [^String id message-id ^String source-name ^String target-name _context]
   (let [^ConnectionData connection-data (connection-data-from-id id)]
-    (if (connected? connection-data)
-      (let [^Store store (:store connection-data)
+    (if (and (some? connection-data) (connected? connection-data))
+      (let [^Store monitored-store (:store connection-data)
+            connection-config (:config connection-data)
             ^String source-folder-name (let [recorded-folder (db/email-folder message-id)]
                                          (if (s/blank? recorded-folder)
                                            ;; No recorded folder: the email predates folder tracking, so it lives under
                                            ;; the DEFAULT category folder, never a (newer, possibly-changed) custom destination.
-                                           (inbox-or-default-category-folder-name store source-name (-> connection-data :config :folder))
+                                           (inbox-or-default-category-folder-name monitored-store source-name (:folder connection-config))
                                            recorded-folder))
-            ^String target-folder-name (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))]
+            ^String target-folder-name (inbox-or-category-folder-name monitored-store target-name (:folder connection-config))]
         (if (= source-folder-name target-folder-name)
           (do (t/log! :info ["Source and target folder are both" target-folder-name "- leaving the message in place."])
               ;; Even though nothing moves, record the resolved folder so a previously-unrecorded
               ;; (legacy) email gets a concrete location and stays findable for future moves.
               (db/update-email-folder message-id target-folder-name)
               true)
-          (with-open [^IMAPFolder target-folder (open-folder-in-store store target-folder-name)
-                    ^IMAPFolder source-folder (open-folder-in-store store source-folder-name)]
-          (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
-            (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
-            (if (some? (seq found-messages))
-              (if (= target-folder-name (:folder (:config connection-data)))
-                (do
-                  (stop-monitoring connection-data)
-                  ;; The move happens on the monitored folder, so monitoring is paused first. Use
-                  ;; try/finally so a failure mid-move can never leave monitoring permanently off.
-                  ;; stop-monitoring also cancels the periodic health check, so it must be
-                  ;; rescheduled here — otherwise the connection silently loses auto-reconnect.
-                  (try
-                    (set-messages-as-peek found-messages)
-                    (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
-                    (.moveMessages source-folder (into-array Message found-messages) target-folder)
-                    (db/update-email-folder message-id target-folder-name)
-                    true
-                    (finally
-                      (schedule-health-checks (start-monitoring connection-data context) context))))
-                (do
-                  (set-messages-as-peek found-messages)
-                  (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name])
-                  (.moveMessages source-folder (into-array Message found-messages) target-folder)
-                  (db/update-email-folder message-id target-folder-name)
-                  true))
-              (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName store)])
-                  :not-found))))))
+          ;; Never open move folders on the Store used by IdleManager. Closing either folder after the
+          ;; move could otherwise close the monitored INBOX and create a gap in real-time delivery.
+          (move-message-on-dedicated-store! connection-config source-folder-name target-folder-name message-id)))
       (do
-        (t/log! :info ["IMAP store in connection" (:id (:config connection-data)) "is not connected. Cancelling the move attempt."])
+        (t/log! :info ["IMAP store in connection" id "is not connected. Cancelling the move attempt."])
         false))))
 
 (defn- invalid-grant-error?

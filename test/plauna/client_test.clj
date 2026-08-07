@@ -239,3 +239,28 @@
                 client/inbox-or-category-folder-name (fn [_ folder-name _] (if (= folder-name "projects") "Recorded/Folder" "Derived/Work"))]
     (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
   "The recorded folder drives source resolution: the recorded source equals the resolved target so the move is a no-op (true). If the category-derived folder were used instead, source would be 'Derived/Work' != target and the code would try to open a (nil) store and fail.")
+
+(deftest move-emails-uses-a-dedicated-store-and-leaves-the-monitor-store-open
+  (let [monitored-store (Object.)
+        connection-config {:id "conn-1" :folder "INBOX" :auth-type "basic"}
+        connection-data (->ConnectionData connection-config monitored-store nil nil nil nil)
+        move-call (atom nil)]
+    (with-redefs [client/connection-data-from-id (fn [_] connection-data)
+                  client/connected? (fn [_] true)
+                  client/inbox-or-default-category-folder-name (fn [store _ _]
+                                                                 (is (identical? monitored-store store))
+                                                                 "INBOX")
+                  client/inbox-or-category-folder-name (fn [store _ _]
+                                                         (is (identical? monitored-store store))
+                                                         "Categories/Work")
+                  client/move-message-on-dedicated-store! (fn [& args]
+                                                            (reset! move-call args)
+                                                            true)
+                  db/email-folder (fn [_] "INBOX")
+                  db/update-email-folder (fn [& _]
+                                           (throw (ex-info "The dedicated move owns the folder update" {})))]
+      (is (true? (client/move-messages-by-id-between-category-folders
+                  "conn-1" "msg-id" nil "work" {})))
+      (is (= [connection-config "INBOX" "Categories/Work" "msg-id"] @move-call)
+          "The actual move is delegated without opening a folder on the monitored Store")))
+  "Recategorization resolves names from the live connection but performs the move on a dedicated Store")
