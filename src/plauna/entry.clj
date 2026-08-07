@@ -56,7 +56,7 @@
   (t/log! :debug "Listening to new emails from listen-channel"))
 
 (defn- register-shutdown-hook!
-  "Ensure IMAP connections, the web server, and the watchdog are torn down cleanly on SIGTERM
+  "Ensure automatic training, IMAP connections, the web server, and the watchdog are torn down cleanly on SIGTERM
    (e.g. `docker stop`) instead of the JVM being killed mid-flight."
   []
   (.addShutdownHook
@@ -64,7 +64,8 @@
    (Thread.
     ^Runnable (fn []
                 (t/log! :info "Shutdown signal received. Stopping Plauna gracefully.")
-                (doseq [[label teardown] [["web server" server/stop-server]
+                (doseq [[label teardown] [["automatic training" server/stop-training-scheduler!]
+                                          ["web server" server/stop-server]
                                           ["IMAP connections" client/disconnect-all]
                                           ["watchdog" diagnostics/stop-watchdog!]]]
                   (try (teardown)
@@ -95,10 +96,13 @@
       (diagnostics/start-watchdog! 60)
       (start-imap-client context)
       (events/start-event-loops event-register)
-      (server/start-server context))))
+      (server/start-server context)
+      (server/start-training-scheduler!))))
 
 (comment
   (server/start-server {:config {:server {:port 8080}}})
+  (server/start-training-scheduler!)
+  (server/stop-training-scheduler!)
   (server/stop-server)
   (require '[flow-storm.api :as fs-api])
   (fs-api/local-connect)

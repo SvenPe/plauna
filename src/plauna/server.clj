@@ -34,7 +34,7 @@
             [taoensso.telemere :as t])
   (:import [java.net ServerSocket]
            [java.util UUID]
-           [java.util.concurrent ExecutorService Executors]
+           [java.util.concurrent ExecutorService Executors ScheduledExecutorService ThreadFactory TimeUnit]
            [org.eclipse.jetty.server Server]
            [org.eclipse.jetty.util.thread QueuedThreadPool]))
 
@@ -44,6 +44,12 @@
 (defonce server (atom nil))
 
 (defonce repl-server (atom nil))
+
+(defonce ^:private training-scheduler (atom nil))
+
+(def ^:private training-lock (Object.))
+
+(def ^:private automatic-training-interval-hours 24)
 
 (def html-headers {"Content-Type" "text/html; charset=UTF-8"})
 
@@ -161,12 +167,69 @@
     (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false)))
 
 (defn write-emails-to-training-files-and-train []
-  (if (seq (languages-to-use-in-training))
-    (do (write-all-categorized-emails-to-training-files)
-        (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
-          (with-open [os (io/output-stream (files/model-file (:language training-model)))]
-            (analysis/serialize-and-write-model! (:model training-model) os))))
-    {:type :alert :content "There are no selected languages to train in. Cannot proceed."}))
+  ;; Rebuilding the training files is destructive. Serialize manual and automatic runs so one cannot
+  ;; delete or overwrite the files while the other is still reading them.
+  (locking training-lock
+    (if (seq (languages-to-use-in-training))
+      (do (write-all-categorized-emails-to-training-files)
+          (doseq [training-model (remove nil? (analysis/train-data (files/training-files)))]
+            (with-open [os (io/output-stream (files/model-file (:language training-model)))]
+              (analysis/serialize-and-write-model! (:model training-model) os))))
+      {:type :alert :content "There are no selected languages to train in. Cannot proceed."})))
+
+(defn- run-automatic-training! []
+  ;; Never let an exception escape the scheduled task: ScheduledExecutorService would otherwise
+  ;; silently suppress every subsequent run.
+  (try
+    (t/log! :info "Starting automatic model training.")
+    (if-let [result (write-emails-to-training-files-and-train)]
+      (t/log! :warn ["Automatic model training was skipped:" (:content result)])
+      (t/log! :info "Automatic model training completed."))
+    (catch Throwable e
+      (t/log! {:level :error :error e}
+              "Automatic model training failed. Plauna will try again at the next scheduled time."))))
+
+(defn- training-thread-factory []
+  (reify ThreadFactory
+    (newThread [_ runnable]
+      (doto (Thread. ^Runnable runnable "plauna-training-scheduler")
+        (.setDaemon true)))))
+
+(defn start-training-scheduler!
+  "Schedule model training every 24 hours, with the first automatic run 24 hours after startup.
+   Calling this more than once is safe and does not create duplicate schedules."
+  ([]
+   (start-training-scheduler! automatic-training-interval-hours
+                              automatic-training-interval-hours
+                              TimeUnit/HOURS))
+  ([initial-delay interval ^TimeUnit time-unit]
+   (locking training-scheduler
+     (if-let [^ScheduledExecutorService existing @training-scheduler]
+       existing
+       (let [^ScheduledExecutorService executor
+             (Executors/newSingleThreadScheduledExecutor (training-thread-factory))]
+         (try
+           (.scheduleWithFixedDelay executor
+                                    ^Runnable (fn [] (run-automatic-training!))
+                                    (long initial-delay)
+                                    (long interval)
+                                    time-unit)
+           (reset! training-scheduler executor)
+           (t/log! :info ["Scheduled automatic model training every"
+                          automatic-training-interval-hours "hours."])
+           executor
+           (catch Throwable e
+             (.shutdownNow executor)
+             (throw e))))))))
+
+(defn stop-training-scheduler! []
+  (locking training-scheduler
+    (when-let [^ScheduledExecutorService executor @training-scheduler]
+      ;; Clear the shared state before interrupting a running training task so a later startup can
+      ;; always create a fresh scheduler.
+      (reset! training-scheduler nil)
+      (.shutdownNow executor)
+      (t/log! :info "Stopped automatic model training."))))
 
 (defn categorize-content [content language] ;; FIXME This kills the process if content is nil
   (let [category (analysis/categorize content (files/model-file language))

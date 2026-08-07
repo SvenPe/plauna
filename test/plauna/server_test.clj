@@ -3,9 +3,36 @@
             [plauna.application :as app]
             [plauna.client :as client]
             [plauna.database :as db]
-            [plauna.server :as server]))
+            [plauna.server :as server])
+  (:import [java.util.concurrent ScheduledExecutorService TimeUnit]))
 
 (defn- ok-handler [_] {:status 200 :body "secret"})
+
+(deftest automatic-training-retries-after-a-failed-run-and-does-not-start-twice
+  (let [attempts (atom 0)
+        completed (promise)
+        executor (atom nil)]
+    (try
+      (with-redefs [server/write-emails-to-training-files-and-train
+                    (fn []
+                      (if (= 1 (swap! attempts inc))
+                        (throw (ex-info "simulated training failure" {}))
+                        (do (deliver completed true)
+                            nil)))]
+        (let [^ScheduledExecutorService first-executor
+              (server/start-training-scheduler! 0 10 TimeUnit/MILLISECONDS)
+              second-executor (server/start-training-scheduler! 0 10 TimeUnit/MILLISECONDS)]
+          (reset! executor first-executor)
+          (is (identical? first-executor second-executor)
+              "Starting the scheduler twice reuses the existing schedule")
+          (is (true? (deref completed 1000 false))
+              "A failed automatic run does not prevent the next training attempt")
+          (is (<= 2 @attempts))))
+      (finally
+        (server/stop-training-scheduler!)
+        (when-let [^ScheduledExecutorService ex @executor]
+          (is (.isShutdown ex) "Stopping Plauna also shuts down automatic training")))))
+  "Automatic training remains periodic after errors and has only one scheduler")
 
 (deftest wrap-authentication-blocks-unauthenticated
   (let [handler (server/wrap-authentication ok-handler)
