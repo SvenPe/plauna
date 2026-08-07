@@ -264,8 +264,11 @@
   (let [parsed-chan (async/chan)
         enriched-chan (async/chan)
         local-chan (async/merge [parsed-chan enriched-chan] batch-size)]
-    (async/sub publisher :parsed-email local-chan)
-    (async/sub publisher :enriched-email local-chan)
+    ;; Subscribe the publisher to the merge *inputs*. Subscribing both topics to local-chan (the
+    ;; merge output) creates two producers for a channel core.async itself owns and can close it
+    ;; before the publisher has delivered its final queued event during shutdown.
+    (async/sub publisher :parsed-email parsed-chan)
+    (async/sub publisher :enriched-email enriched-chan)
     ;; JDBC is blocking work and must not occupy core.async's shared go-dispatch pool. A dedicated
     ;; thread also lets shutdown block until the final partial buffer has been flushed.
     (async/thread
