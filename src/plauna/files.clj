@@ -192,13 +192,24 @@
         (filter some?)
         (map parse-cli-arg)))
 
+(defn- deep-merge
+  "Recursively merge configuration maps so a high-priority nested value such as server.port does
+   not discard unrelated keys from the lower-priority source. Later maps win."
+  [& maps]
+  (letfn [(merge-value [left right]
+            (if (and (map? left) (map? right))
+              (merge-with merge-value left right)
+              right))]
+    (reduce #(merge-with merge-value %1 %2) {} maps)))
+
 (defn parse-config-from-cli-arguments [cli-args]
   (let [parsed-config (reduce (fn [acc val] (conj acc (parse-cli-arg val))) {} (partition-cli-args cli-args))
-        env-config (transduce env-key-pair-transformation aggregate-config-map {} env-var-key-pairs)]
-    (cond
-      (some? (:config-file parsed-config))
-      (swap! plauna-config (fn [_] (merge (default-config) env-config (config-from-file (:config-file parsed-config)))))
-      (some? (:config-file env-config))
-      (swap! plauna-config (fn [_] (merge (default-config) env-config (config-from-file (:config-file env-config)))))
-      :else
-      (swap! plauna-config (fn [_] (merge (default-config) env-config parsed-config))))))
+        env-config (transduce env-key-pair-transformation aggregate-config-map {} env-var-key-pairs)
+        config-path (or (:config-file parsed-config) (:config-file env-config))
+        file-config (if config-path (config-from-file config-path) {})]
+    ;; Documented precedence: explicit CLI > environment > config file > built-in defaults.
+    (reset! plauna-config
+            (deep-merge (default-config)
+                        file-config
+                        (dissoc env-config :config-file)
+                        (dissoc parsed-config :config-file)))))

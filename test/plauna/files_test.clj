@@ -58,11 +58,25 @@
         (recur (<!! test-chan) (conj results result))))))
 
 (deftest parse-config-with-explicit-config
-  "If --config-file argument is given, it should take precedence over anything else.
-   The default values are used for any missing fields in the config file."
+  "The selected config file supplies base values, but another explicit CLI value still wins."
   (let [config-file (files/parse-config-from-cli-arguments ["--config-file" "./resources/test/test.edn"
                                                             "--server-port" "6060"])]
-    (is (and (= 8080 (-> config-file :server :port)) (= "./tmp/" (:data-folder config-file))))))
+    (is (and (= 6060 (-> config-file :server :port)) (= "./tmp/" (:data-folder config-file))))))
+
+(deftest config-precedence-is-cli-then-environment-then-file-then-defaults
+  (with-redefs [files/config-from-file (fn [_] {:server {:port 4000 :bind "127.0.0.1"}
+                                                :data-folder "/from/file"
+                                                :file-only true})]
+    (binding [plauna.files/system-env (fn [key]
+                                        (get {"SERVER_PORT" "5000"
+                                              "DATA_FOLDER" "/from/environment"}
+                                             key))]
+      (let [config (files/parse-config-from-cli-arguments
+                    ["--config-file" "test.edn" "--server-port" "6000"])]
+        (is (= 6000 (get-in config [:server :port])) "CLI wins over the environment and file")
+        (is (= "/from/environment" (:data-folder config)) "Environment wins over the file")
+        (is (= "127.0.0.1" (get-in config [:server :bind])) "Nested unrelated file values survive")
+        (is (true? (:file-only config)))))))
 
 (deftest parse-config-with-arguments
   "If --data-folder and --server-port arguments are given, they must be used."
