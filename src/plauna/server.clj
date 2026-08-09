@@ -616,10 +616,14 @@
 
    (route/resources "/")
 
-   (comp/GET "/login" {} (success-html-with-body (markup/login-page)))
+   (comp/GET "/login" request
+     (if (get-in request [:session :authenticated])
+       (redirect "/")
+       (success-html-with-body (markup/login-page))))
 
    (comp/POST "/login" request
-     (if (auth/verify-web-password? (-> request :params :password))
+     (if (or (get-in request [:session :authenticated])
+             (auth/verify-web-password? (-> request :params :password)))
        (-> (redirect "/")
            (assoc :session (assoc (:session request) :authenticated true)))
        (success-html-with-body (markup/login-page {:error "Invalid password."}))))
@@ -1041,14 +1045,29 @@
       (= uri "/site.webmanifest")))
 
 (defn wrap-authentication
-  "Require a logged-in session for every request except public paths. Unauthenticated requests are
-   redirected to the login page."
+  "Require a logged-in session or an allowlisted mTLS client certificate for every non-public
+   request. A successful certificate authentication is promoted to the normal signed browser
+   session; invalid or unconfigured proxy headers fall back to the password login."
   [handler]
   (fn [request]
-    (if (or (public-path? (:uri request))
-            (get-in request [:session :authenticated]))
-      (handler request)
-      (redirect "/login"))))
+    (let [already-authenticated?     (get-in request [:session :authenticated])
+          certificate-authenticated? (and (not already-authenticated?)
+                                          (auth/mtls-request-authorized? request))
+          authenticated-request      (if certificate-authenticated?
+                                       (assoc-in request [:session :authenticated] true)
+                                       request)]
+      (if (or (public-path? (:uri request))
+              already-authenticated?
+              certificate-authenticated?)
+        (let [response (handler authenticated-request)]
+          ;; Ring only persists a modified request session when the response carries :session.
+          ;; Respect explicit route decisions such as /logout setting it to nil.
+          (if (and certificate-authenticated?
+                   response
+                   (not (contains? response :session)))
+            (assoc response :session (:session authenticated-request))
+            response))
+        (redirect "/login")))))
 
 (defn wrap-exception-handling
   "Catch exceptions escaping a handler so bad input or unexpected failures return a clean response

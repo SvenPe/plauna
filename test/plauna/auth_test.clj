@@ -37,3 +37,59 @@
     (is (false? (auth/verify-web-password? "nope")))
     (is (false? (auth/verify-web-password? nil))))
   "verify-web-password? checks the plaintext against the in-memory hash")
+
+(deftest mtls-configuration-is-opt-in-and-normalizes-fingerprints
+  (let [fingerprint (apply str (repeat 32 "ab"))
+        with-colons (str/join ":" (map #(apply str %) (partition-all 2 fingerprint)))
+        config (auth/mtls-config-from-env
+                {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (str with-colons ", " (str/upper-case fingerprint))
+                 "PLAUNA_MTLS_PROXY_SECRET" (apply str (repeat 32 "s"))})]
+    (is (nil? (auth/mtls-config-from-env {})) "No allowlist leaves mTLS authentication disabled")
+    (is (= #{fingerprint} (:fingerprints config)) "Colon-delimited and uppercase forms normalize")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least 32"
+                          (auth/mtls-config-from-env
+                           {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" fingerprint
+                            "PLAUNA_MTLS_PROXY_SECRET" "too-short"})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only full SHA-256"
+                          (auth/mtls-config-from-env
+                           {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" "not-a-fingerprint"
+                            "PLAUNA_MTLS_PROXY_SECRET" (apply str (repeat 32 "s"))}))))
+  "mTLS cannot be enabled accidentally or with an incomplete security configuration")
+
+(deftest nginx-escaped-client-certificate-is-decoded-and-fingerprinted
+  (let [pem "-----BEGIN CERTIFICATE-----
+MIICEjCCAXugAwIBAgIUax4S8bdFcu8CFsqSW3efMJzaFR8wDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQUGxhdW5hLW1UTFMtdGVzdDAeFw0yNjA4MDkxMDUzNTVa
+Fw0zNjA4MDYxMDUzNTVaMBsxGTAXBgNVBAMMEFBsYXVuYS1tVExTLXRlc3QwgZ8w
+DQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBALl6VTumaTgVxbT+5QHEpEeg9amXlMiK
+sI/YM6XKjOLxp21PTRQaMvZakKEv6m68LzD4Vhtpz6QTjsnS3rddFddfh12DDo2E
+uLY26nccOwUT467M83PiBZXLWrqKjB9efyNNKL2tmxv8hXt+EmBLprx1szxZxN1A
+ObqXHm8pdgrbAgMBAAGjUzBRMB0GA1UdDgQWBBSIQbB/5fwHLF68lzyHOaIu+ZBP
+JjAfBgNVHSMEGDAWgBSIQbB/5fwHLF68lzyHOaIu+ZBPJjAPBgNVHRMBAf8EBTAD
+AQH/MA0GCSqGSIb3DQEBCwUAA4GBAHzi6YvjzDO2a2qkQMqau+ap8F14XK/WoTuG
+KA8WPmOp/2rD1vdWluGZUgbQ9utfb29jq/BqJQB0KSaH/qXSdvZPmxil2jmC92Pt
+bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
+3mQ1d9hv
+-----END CERTIFICATE-----"
+        escaped (java.net.URLEncoder/encode pem java.nio.charset.StandardCharsets/UTF_8)]
+    (is (= "c1c21201ecf8376ee554e44382b9d0abbc342603f79f5340e290a319d83b7b41"
+           (auth/client-certificate-sha256 escaped)))
+    (is (nil? (auth/client-certificate-sha256 "not-a-certificate"))))
+  "Plauna derives SHA-256 from the certificate itself instead of trusting a forwarded identity")
+
+(deftest mtls-authorization-requires-proxy-secret-verification-and-allowlisted-certificate
+  (let [fingerprint (apply str (repeat 32 "ab"))
+        secret      (apply str (repeat 32 "s"))
+        config      {:proxy-secret secret :fingerprints #{fingerprint}}
+        request     {:headers {"x-plauna-proxy-secret" secret
+                               "x-plauna-client-verify" "SUCCESS"
+                               "x-plauna-client-cert" "escaped-certificate"}}]
+    (with-redefs [auth/client-certificate-sha256 (constantly fingerprint)]
+      (is (true? (auth/mtls-request-authorized-with-config? config request)))
+      (is (false? (auth/mtls-request-authorized-with-config?
+                   config (assoc-in request [:headers "x-plauna-proxy-secret"] "forged"))))
+      (is (false? (auth/mtls-request-authorized-with-config?
+                   config (assoc-in request [:headers "x-plauna-client-verify"] "FAILED"))))
+      (is (false? (auth/mtls-request-authorized-with-config?
+                   (assoc config :fingerprints #{"different"}) request)))))
+  "All proxy assertions are required before passwordless access is granted")

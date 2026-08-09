@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### ✨ Features
+
+- Allow explicitly selected mTLS client certificates, verified by an NGINX reverse proxy, to bypass
+  the web UI password and establish a normal signed Plauna session. The opt-in integration uses a
+  SHA-256 certificate-fingerprint allowlist and requires a shared proxy secret so forwarded headers
+  cannot be spoofed by a client with direct access to Plauna.
+
 ## [2026-07-10.0] - 2026-07-10
 
 ### 🐛 Bug Fixes
@@ -436,4 +445,3 @@ All notable changes to this project will be documented in this file.
 - Restart all event loops after a failure or restart in messaging
 - Add new languages to language preferences with the value false
 - Confidence is set properly after categorization
-

@@ -3,6 +3,7 @@
             [clojure.test :refer :all]
             [honey.sql :as honey]
             [plauna.application :as app]
+            [plauna.auth :as auth]
             [plauna.client :as client]
             [plauna.client.oauth :as oauth]
             [plauna.database :as db]
@@ -145,6 +146,26 @@
     (is (= 200 (:status response)))
     (is (= "secret" (:body response))))
   "A logged-in session can reach protected paths")
+
+(deftest wrap-authentication-promotes-allowlisted-mtls-certificate-to-session
+  (with-redefs [auth/mtls-request-authorized? (constantly true)]
+    (let [handler  (server/wrap-authentication ok-handler)
+          response (handler {:uri "/emails"
+                             :session {:oauth-csrf "keep-me"}
+                             :headers {}})]
+      (is (= 200 (:status response)))
+      (is (= "secret" (:body response)))
+      (is (= {:oauth-csrf "keep-me" :authenticated true} (:session response))
+          "The signed browser session is established without discarding other session state")))
+  "An allowlisted client certificate bypasses the password and creates a normal session")
+
+(deftest wrap-authentication-does-not-trust-unapproved-mtls-request
+  (with-redefs [auth/mtls-request-authorized? (constantly false)]
+    (let [response ((server/wrap-authentication ok-handler)
+                    {:uri "/emails" :session {} :headers {}})]
+      (is (= 302 (:status response)))
+      (is (= "/login" (get-in response [:headers "Location"])))))
+  "Failed or incomplete proxy assertions still require the Plauna password")
 
 (deftest emails-parameters-tolerate-blank-numbers
   ;; The page-size field is a free-form number input; clearing it submits size= (empty string).

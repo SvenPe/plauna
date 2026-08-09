@@ -115,7 +115,8 @@ The Docker image creates =/var/lib/plauna= automatically. When running the jar d
 
 The runtime configuration accepts =DATA_FOLDER=, =SERVER_PORT= and =CONFIG_FILE=.
 
-You can also set the web UI password with =PLAUNA_PASSWORD= (see "Web UI Password Protection" below).
+You can also set the web UI password with =PLAUNA_PASSWORD= and allow selected mTLS client
+certificates through a trusted reverse proxy (see "Web UI Password Protection" below).
 
 Database connection can be configured via environment variables (see "MariaDB" below).
 
@@ -221,6 +222,59 @@ docker run -d --name plauna -p 8080:8080 \
 #+end_src
 
 If you do not set =PLAUNA_PASSWORD=, check the container logs (=docker logs plauna=) after the first start to find the generated password.
+
+*** Passwordless login with selected mTLS certificates behind NGINX
+
+Plauna can turn a client certificate already verified by an NGINX reverse proxy into a normal
+signed Plauna session. Only certificates whose SHA-256 fingerprint is explicitly configured bypass
+the password. Requests without an allowed certificate continue to use the password login.
+
+Set these environment variables on Plauna:
+
+#+begin_src
+PLAUNA_MTLS_TRUSTED_CERT_SHA256=AA:BB:...:FF,11:22:...:99
+PLAUNA_MTLS_PROXY_SECRET=a-random-shared-secret-with-at-least-32-characters
+#+end_src
+
+The fingerprint list accepts commas, semicolons or whitespace as separators and accepts fingerprints
+with or without colons. Get a fingerprint with:
+
+#+begin_src sh
+openssl x509 -in client.crt -noout -fingerprint -sha256 | cut -d= -f2
+#+end_src
+
+Generate the shared secret, for example, with =openssl rand -hex 32=. Configure the same value in
+NGINX and forward only NGINX's own TLS variables:
+
+#+begin_src nginx
+server {
+    listen 443 ssl;
+    server_name plauna.example.com;
+
+    ssl_certificate     /etc/nginx/tls/server.crt;
+    ssl_certificate_key /etc/nginx/tls/server.key;
+
+    ssl_client_certificate /etc/nginx/tls/client-ca.crt;
+    ssl_verify_client optional;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Plauna-Client-Verify $ssl_client_verify;
+        proxy_set_header X-Plauna-Client-Cert $ssl_client_escaped_cert;
+        proxy_set_header X-Plauna-Proxy-Secret "a-random-shared-secret-with-at-least-32-characters";
+        proxy_pass http://plauna:8080;
+    }
+}
+#+end_src
+
+Use =ssl_verify_client optional= when users without a certificate should still see Plauna's password
+login. With =ssl_verify_client on=, NGINX itself rejects clients that do not present a CA-trusted
+certificate before Plauna can offer the password form.
+
+The proxy secret is mandatory. It prevents a client that can reach Plauna directly from forging the
+forwarded certificate headers. Still, do not publish port 8080: only NGINX should be able to reach
+Plauna's HTTP listener. NGINX must overwrite all three =X-Plauna-*= headers as shown. If the allowlist
+or secret is absent or malformed, Plauna fails closed and leaves mTLS login disabled.
 
 *** Upgrading an existing Docker volume
 
