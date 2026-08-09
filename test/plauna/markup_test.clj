@@ -70,6 +70,39 @@
       (is (not (str/includes? html "/js/vendor/vega.min.js")))))
   "Admin pages contain blank password fields and do not load chart code")
 
+(deftest mtls-page-shows-fingerprints-but-never-renders-the-proxy-secret
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [secret "proxy-secret-must-not-reach-browser"
+          html (markup/mtls-page {:enabled true
+                                  :environment-managed false
+                                  :secret-configured true
+                                  :trusted-cert-sha256 "aabbcc"
+                                  :proxy-secret secret
+                                  :current-password secret})]
+      (is (str/includes? html "name=\"trusted-cert-sha256\""))
+      (is (str/includes? html "aabbcc"))
+      (is (str/includes? html "Leave blank to keep the current secret"))
+      (is (str/includes? html "Delete the stored proxy secret"))
+      (is (str/includes? html "name=\"current-password\""))
+      (is (str/includes? html "required"))
+      (is (not (str/includes? html secret)))))
+  "The administration form treats the shared proxy secret as write-only")
+
+(deftest login-page-offers-enrollment-for-a-verified-mtls-certificate
+  (let [fingerprint (apply str (repeat 32 "ab"))
+        html (markup/login-page {:mtls-candidate {:fingerprint fingerprint :can-add true}})
+        env-html (markup/login-page {:mtls-candidate {:fingerprint fingerprint
+                                                      :can-add false
+                                                      :environment-managed true}})]
+    (is (str/includes? html fingerprint))
+    (is (str/includes? html "name=\"add-mtls-certificate\""))
+    (is (str/includes? html "Trust this certificate for future passwordless logins"))
+    (is (not (str/includes? html "name=\"fingerprint\"")))
+    (is (not (str/includes? env-html "name=\"add-mtls-certificate\"")))
+    (is (str/includes? env-html "PLAUNA_MTLS_TRUSTED_CERT_SHA256"))
+    (is (str/includes? (markup/login-page {}) "name=\"password\"")))
+  "The browser can request enrollment but cannot choose which fingerprint is trusted")
+
 (deftest statistics-page-loads-only-local-chart-scripts
   (with-redefs [client/disconnected-connections (fn [] [])]
     (let [html (markup/statistics-overall [] [] [] [])]

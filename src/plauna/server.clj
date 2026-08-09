@@ -619,14 +619,30 @@
    (comp/GET "/login" request
      (if (get-in request [:session :authenticated])
        (redirect "/")
-       (success-html-with-body (markup/login-page))))
+       (success-html-with-body
+        (markup/login-page {:mtls-candidate (auth/mtls-login-candidate request)}))))
 
    (comp/POST "/login" request
-     (if (or (get-in request [:session :authenticated])
-             (auth/verify-web-password? (-> request :params :password)))
-       (-> (redirect "/")
-           (assoc :session (assoc (:session request) :authenticated true)))
-       (success-html-with-body (markup/login-page {:error "Invalid password."}))))
+     (let [password       (-> request :params :password)
+           authenticated (or (get-in request [:session :authenticated])
+                             (auth/verify-web-password? password))]
+       (if authenticated
+         (do
+           (when (= "true" (get-in request [:params :add-mtls-certificate]))
+             (try
+               (auth/add-verified-mtls-certificate! request password)
+               (add-to-messages {:type :success
+                                 :content "The client certificate was added to the mTLS allowlist."})
+               (catch clojure.lang.ExceptionInfo e
+                 ;; Certificate enrollment is optional: a valid password still signs the user in.
+                 (add-to-messages {:type :alert
+                                   :content (str "Signed in, but the client certificate was not added: "
+                                                 (.getMessage e))}))))
+           (-> (redirect "/")
+               (assoc :session (assoc (:session request) :authenticated true))))
+         (success-html-with-body
+          (markup/login-page {:error "Invalid password."
+                              :mtls-candidate (auth/mtls-login-candidate request)})))))
 
    (comp/GET "/logout" {}
      (-> (redirect "/login") (assoc :session nil)))
@@ -731,6 +747,22 @@
          :else
          (do (auth/set-password! new-password)
              (redirect-request request {:type :success :content "Password changed successfully."})))))
+
+   (comp/GET "/admin/mtls" {}
+     (let [messages @global-messages
+           state    (auth/mtls-admin-state)]
+       (reset! global-messages [])
+       (success-html-with-body
+        (if (seq messages)
+          (markup/mtls-page state messages)
+          (markup/mtls-page state)))))
+
+   (comp/POST "/admin/mtls" request
+     (try
+       (auth/save-mtls-settings! (:params request))
+       (redirect-request request {:type :success :content "mTLS login configuration saved and activated."})
+       (catch clojure.lang.ExceptionInfo e
+         (redirect-request request {:type :alert :content (.getMessage e)}))))
 
    (comp/GET "/" {} (let [data (db/yearly-email-stats)]
                       (if (> (count data) 0)

@@ -1,7 +1,8 @@
 (ns plauna.auth-test
   (:require [clojure.test :refer :all]
             [clojure.string :as str]
-            [plauna.auth :as auth]))
+            [plauna.auth :as auth]
+            [plauna.settings :as settings]))
 
 (deftest hash-and-verify-roundtrip
   (let [hash (auth/hash-password "correct horse battery staple")]
@@ -93,3 +94,104 @@ bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
       (is (false? (auth/mtls-request-authorized-with-config?
                    (assoc config :fingerprints #{"different"}) request)))))
   "All proxy assertions are required before passwordless access is granted")
+
+(deftest verified-but-unlisted-certificate-is-offered-as-a-login-candidate
+  (let [fingerprint (apply str (repeat 32 "ef"))]
+    (with-redefs [auth/system-env (constantly nil)
+                  auth/verified-mtls-client-fingerprint (constantly fingerprint)]
+      (is (= {:fingerprint fingerprint :can-add true :environment-managed false}
+             (auth/mtls-login-candidate {}))))
+    (with-redefs [auth/system-env #(get {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (apply str (repeat 32 "ab"))} %)
+                  auth/verified-mtls-client-fingerprint (constantly fingerprint)]
+      (is (= {:fingerprint fingerprint :can-add false :environment-managed true}
+             (auth/mtls-login-candidate {})))))
+  "A verified certificate can be enrolled in UI mode and is informational in environment mode")
+
+(deftest ui-mtls-settings-are-validated-saved-atomically-and-activated
+  (let [fingerprint (apply str (repeat 32 "ab"))
+        secret      (apply str (repeat 32 "s"))
+        stored      (atom {:mtls-proxy-secret ""})]
+    (with-redefs [auth/system-env (constantly nil)
+                  auth/verify-web-password? #(= "admin-password" %)
+                  settings/fetch-setting #(get @stored %)
+                  settings/update-settings! #(swap! stored merge %)]
+      (let [state (auth/save-mtls-settings! {:trusted-cert-sha256 (str/upper-case fingerprint)
+                                             :proxy-secret secret
+                                             :current-password "admin-password"})]
+        (is (= fingerprint (:mtls-trusted-cert-sha256 @stored)))
+        (is (= secret (:mtls-proxy-secret @stored)))
+        (is (true? (:enabled state)))
+        (is (true? (:secret-configured state)))
+        (is (not (contains? state :proxy-secret)) "The UI state never exposes the stored secret"))
+      (auth/save-mtls-settings! {:trusted-cert-sha256 ""
+                                 :proxy-secret ""
+                                 :current-password "admin-password"})
+      (is (= "" (:mtls-trusted-cert-sha256 @stored)) "An empty allowlist disables mTLS")
+      (is (= secret (:mtls-proxy-secret @stored)) "A blank secret field keeps the stored secret")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least 32"
+                            (auth/save-mtls-settings! {:trusted-cert-sha256 fingerprint
+                                                       :proxy-secret "short"
+                                                       :current-password "admin-password"})))
+      (is (= secret (:mtls-proxy-secret @stored)) "Invalid input saves neither field")
+      (auth/save-mtls-settings! {:trusted-cert-sha256 ""
+                                 :proxy-secret ""
+                                 :clear-proxy-secret "true"
+                                 :current-password "admin-password"})
+      (is (= "" (:mtls-proxy-secret @stored)) "The explicit delete control removes the secret"))
+    (auth/initialize-mtls!))
+  "The UI applies the same fail-closed validation as environment configuration")
+
+(deftest environment-managed-mtls-cannot-be-overwritten-in-the-ui
+  (with-redefs [auth/system-env #(get {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (apply str (repeat 32 "ab"))
+                                      "PLAUNA_MTLS_PROXY_SECRET" (apply str (repeat 32 "s"))} %)
+                auth/verify-web-password? (constantly true)
+                settings/update-settings! (fn [_] (throw (ex-info "must not save" {})))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"managed by environment variables"
+                          (auth/save-mtls-settings! {:trusted-cert-sha256 ""
+                                                     :current-password "admin-password"}))))
+  "Environment variables remain authoritative and make the UI read-only")
+
+(deftest ui-mtls-changes-require-the-current-admin-password
+  (let [saved? (atom false)]
+    (with-redefs [auth/system-env (constantly nil)
+                  auth/verify-web-password? (constantly false)
+                  settings/update-settings! (fn [_] (reset! saved? true))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Current admin password is incorrect"
+                            (auth/save-mtls-settings! {:trusted-cert-sha256 ""
+                                                       :current-password "wrong"})))
+      (is (false? @saved?))))
+  "An authenticated session alone cannot modify mTLS access")
+
+(deftest verified-login-certificate-can-be-added-without-a-browser-supplied-fingerprint
+  (let [existing-fingerprint (apply str (repeat 32 "ab"))
+        request-fingerprint  (apply str (repeat 32 "cd"))
+        secret               (apply str (repeat 32 "s"))
+        stored               (atom {:mtls-trusted-cert-sha256 existing-fingerprint
+                                    :mtls-proxy-secret secret})]
+    (try
+      (with-redefs [auth/system-env (constantly nil)
+                    auth/verify-web-password? #(= "admin-password" %)
+                    auth/verified-mtls-client-fingerprint (constantly request-fingerprint)
+                    settings/fetch-setting #(get @stored %)
+                    settings/update-settings! #(swap! stored merge %)]
+        (auth/add-verified-mtls-certificate! {:params {:fingerprint "attacker-controlled"}}
+                                             "admin-password")
+        (is (= #{existing-fingerprint request-fingerprint}
+               (set (str/split-lines (:mtls-trusted-cert-sha256 @stored)))))
+        (is (not (str/includes? (:mtls-trusted-cert-sha256 @stored) "attacker-controlled"))))
+      (finally
+        (auth/initialize-mtls!))))
+  "Certificate enrollment derives identity solely from the verified request")
+
+(deftest stored-ui-mtls-configuration-is-restored-at-startup
+  (let [fingerprint (apply str (repeat 32 "ab"))
+        secret      (apply str (repeat 32 "s"))]
+    (try
+      (with-redefs [auth/system-env (constantly nil)
+                    settings/fetch-setting #(get {:mtls-trusted-cert-sha256 fingerprint
+                                                  :mtls-proxy-secret secret} %)]
+        (auth/initialize-mtls!)
+        (is (true? (:enabled (auth/mtls-admin-state)))))
+      (finally
+        (auth/initialize-mtls!))))
+  "UI-managed mTLS settings survive a normal Plauna restart")

@@ -167,6 +167,64 @@
       (is (= "/login" (get-in response [:headers "Location"])))))
   "Failed or incomplete proxy assertions still require the Plauna password")
 
+(deftest mtls-admin-post-saves-and-activates-the-submitted-settings
+  (let [submitted (atom nil)]
+    (try
+      (with-redefs [auth/save-mtls-settings! (fn [params] (reset! submitted params) {:enabled true})]
+        (let [response ((server/make-routes {})
+                        {:request-method :post
+                         :uri "/admin/mtls"
+                         :params {:trusted-cert-sha256 "fingerprint"
+                                  :proxy-secret "secret"
+                                  :current-password "admin-password"
+                                  :redirect-url "/admin/mtls"}
+                         :session {:authenticated true}})]
+          (is (= "fingerprint" (:trusted-cert-sha256 @submitted)))
+          (is (= "secret" (:proxy-secret @submitted)))
+          (is (= "admin-password" (:current-password @submitted)))
+          (is (= 303 (:status response)))
+          (is (= "/admin/mtls" (get-in response [:headers "Location"])))))
+      (finally
+        (server/empty-global-messages))))
+  "Saving through the admin endpoint uses PRG and activates the settings immediately")
+
+(deftest password-login-can-enroll-the-verified-request-certificate
+  (let [enrollment (atom nil)]
+    (try
+      (with-redefs [auth/verify-web-password? #(= "admin-password" %)
+                    auth/add-verified-mtls-certificate!
+                    (fn [request password]
+                      (reset! enrollment [(get-in request [:headers "x-plauna-client-cert"])
+                                          password]))]
+        (let [request {:request-method :post
+                       :uri "/login"
+                       :params {:password "admin-password" :add-mtls-certificate "true"}
+                       :headers {"x-plauna-client-cert" "proxy-derived"}
+                       :session {}}
+              response ((server/make-routes {}) request)]
+          (is (= ["proxy-derived" "admin-password"] @enrollment))
+          (is (= 302 (:status response)))
+          (is (true? (get-in response [:session :authenticated])))))
+      (finally
+        (server/empty-global-messages))))
+  "Certificate enrollment is tied to the same successful admin-password login")
+
+(deftest failed-password-login-never-enrolls-a-certificate
+  (let [enrollment-called? (atom false)]
+    (with-redefs [auth/verify-web-password? (constantly false)
+                  auth/mtls-login-candidate (constantly {:fingerprint "verified" :can-add true})
+                  auth/add-verified-mtls-certificate! (fn [& _] (reset! enrollment-called? true))]
+      (let [response ((server/make-routes {})
+                      {:request-method :post
+                       :uri "/login"
+                       :params {:password "wrong" :add-mtls-certificate "true"}
+                       :headers {}
+                       :session {}})]
+        (is (= 200 (:status response)))
+        (is (str/includes? (:body response) "Invalid password."))
+        (is (false? @enrollment-called?)))))
+  "The login-page checkbox never bypasses admin-password verification")
+
 (deftest emails-parameters-tolerate-blank-numbers
   ;; The page-size field is a free-form number input; clearing it submits size= (empty string).
   ;; That must fall back to the default instead of throwing NumberFormatException and 400-ing

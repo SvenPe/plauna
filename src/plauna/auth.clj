@@ -6,11 +6,12 @@
    PLAUNA_PASSWORD environment variable > previously stored password > a freshly generated one
    (printed to the log once). The hash is persisted in the preferences table and cached in memory.
 
-   mTLS authentication is enabled by PLAUNA_MTLS_TRUSTED_CERT_SHA256. NGINX must verify the client
-   certificate and forward its escaped PEM value. A separate shared secret authenticates NGINX to
-   Plauna so clients cannot gain access by forging the forwarded headers."
+   mTLS authentication can be configured in the administration UI or through environment variables.
+   NGINX must verify the client certificate and forward its escaped PEM value. A separate shared
+   secret authenticates NGINX to Plauna so clients cannot gain access by forging the headers."
   (:require [clojure.string :as str]
             [plauna.database :as db]
+            [plauna.settings :as settings]
             [taoensso.telemere :as t])
   (:import (javax.crypto SecretKeyFactory)
            (javax.crypto.spec PBEKeySpec)
@@ -32,7 +33,8 @@
 ;; Runtime cache of the stored password hash (a "pbkdf2$iterations$salt$hash" string).
 (defonce password-hash (atom nil))
 
-;; Runtime-only mTLS proxy configuration. The proxy secret is intentionally never persisted.
+;; Active runtime mTLS configuration. UI-managed secrets are persisted in settings.json but never in
+;; the database, log output, rendered HTML or browser session.
 (defonce ^:private mtls-auth-config (atom nil))
 
 (defn ^:dynamic system-env [key] (System/getenv key))
@@ -116,21 +118,93 @@
         {:proxy-secret proxy-secret
          :fingerprints (set fingerprints)}))))
 
+(defn mtls-environment-managed?
+  "True when the certificate allowlist environment variable selects the environment as the complete
+   mTLS configuration source. In that case both mTLS values are read-only in the web UI."
+  []
+  (not (str/blank? (system-env "PLAUNA_MTLS_TRUSTED_CERT_SHA256"))))
+
+(defn- stored-mtls-values []
+  {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (settings/fetch-setting :mtls-trusted-cert-sha256)
+   "PLAUNA_MTLS_PROXY_SECRET"        (settings/fetch-setting :mtls-proxy-secret)})
+
+(defn- environment-mtls-values []
+  {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (system-env "PLAUNA_MTLS_TRUSTED_CERT_SHA256")
+   "PLAUNA_MTLS_PROXY_SECRET"        (system-env "PLAUNA_MTLS_PROXY_SECRET")})
+
+(defn- effective-mtls-values []
+  (if (mtls-environment-managed?)
+    (environment-mtls-values)
+    (stored-mtls-values)))
+
+(defn- activate-mtls-config! [config]
+  (reset! mtls-auth-config config)
+  (when config
+    (t/log! :info ["mTLS proxy authentication enabled for"
+                   (count (:fingerprints config))
+                   "certificate fingerprint(s)."])))
+
 (defn initialize-mtls!
-  "Load the optional mTLS proxy authentication configuration. Invalid opt-in configuration fails
-   closed: password authentication remains available, but forwarded certificates are not accepted."
+  "Load optional mTLS proxy authentication from the environment or settings.json. Environment
+   configuration has priority. Invalid opt-in configuration fails closed: password authentication
+   remains available, but forwarded certificates are not accepted."
   []
   (try
-    (let [config (mtls-config-from-env system-env)]
-      (reset! mtls-auth-config config)
-      (when config
-        (t/log! :info ["mTLS proxy authentication enabled for"
-                       (count (:fingerprints config))
-                       "certificate fingerprint(s)."])))
+    (activate-mtls-config! (mtls-config-from-env (effective-mtls-values)))
     (catch Exception e
       (reset! mtls-auth-config nil)
       (t/log! {:level :error :error e}
-              "mTLS proxy authentication is disabled because its environment configuration is invalid."))))
+              "mTLS proxy authentication is disabled because its configuration is invalid."))))
+
+(defn mtls-admin-state
+  "Return the non-secret mTLS state suitable for rendering in the administration UI."
+  []
+  (let [environment-managed (mtls-environment-managed?)
+        values              (effective-mtls-values)
+        raw-fingerprints    (or (get values "PLAUNA_MTLS_TRUSTED_CERT_SHA256") "")
+        proxy-secret        (get values "PLAUNA_MTLS_PROXY_SECRET")
+        canonical           (try
+                              (some->> (mtls-config-from-env values)
+                                       :fingerprints
+                                       sort
+                                       (str/join "\n"))
+                              (catch Exception _ nil))]
+    {:environment-managed environment-managed
+     :enabled             (some? @mtls-auth-config)
+     :secret-configured   (not (str/blank? proxy-secret))
+     :trusted-cert-sha256 (or canonical raw-fingerprints)}))
+
+(defn save-mtls-settings!
+  "Validate and atomically save mTLS values submitted by the administration UI. A blank secret keeps
+   the stored one; :clear-proxy-secret explicitly removes it. The current admin password is required
+   for every change because editing the allowlist grants future access. Returns non-secret UI state."
+  [{:keys [trusted-cert-sha256 proxy-secret clear-proxy-secret current-password]}]
+  (when-not (verify-web-password? current-password)
+    (throw (ex-info "Current admin password is incorrect." {})))
+  (when (mtls-environment-managed?)
+    (throw (ex-info "mTLS authentication is managed by environment variables and cannot be changed here."
+                    {})))
+  (let [existing-secret (settings/fetch-setting :mtls-proxy-secret)
+        clear-secret?   (or (true? clear-proxy-secret) (= "true" clear-proxy-secret))
+        new-secret      (cond
+                          clear-secret? ""
+                          (str/blank? proxy-secret) (or existing-secret "")
+                          :else proxy-secret)
+        raw-certs       (or trusted-cert-sha256 "")]
+    (when (and (str/blank? raw-certs)
+               (not (str/blank? proxy-secret))
+               (< (count proxy-secret) 32))
+      (throw (ex-info "The proxy secret must contain at least 32 characters." {})))
+    (let [config          (mtls-config-from-env
+                           {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" raw-certs
+                            "PLAUNA_MTLS_PROXY_SECRET" new-secret})
+          canonical-certs (if config
+                            (str/join "\n" (sort (:fingerprints config)))
+                            "")]
+      (settings/update-settings! {:mtls-trusted-cert-sha256 canonical-certs
+                                  :mtls-proxy-secret new-secret})
+      (activate-mtls-config! config)
+      (mtls-admin-state))))
 
 (defn- constant-time-string= [expected actual]
   (and (string? expected)
@@ -152,19 +226,55 @@
             (.formatHex (HexFormat/of) digest))))
       (catch Exception _ nil))))
 
+(defn verified-mtls-client-fingerprint-with-secret
+  "Return the forwarded certificate fingerprint only when the proxy secret matches and NGINX says
+   certificate validation succeeded. This intentionally does not consult the allowlist."
+  [proxy-secret request]
+  (let [headers (:headers request)]
+    (when (and (not (str/blank? proxy-secret))
+               (constant-time-string= proxy-secret (get headers "x-plauna-proxy-secret"))
+               (= "SUCCESS" (get headers "x-plauna-client-verify")))
+      (client-certificate-sha256 (get headers "x-plauna-client-cert")))))
+
+(defn verified-mtls-client-fingerprint
+  "Return the SHA-256 fingerprint of a CA-verified client certificate forwarded by the configured
+   trusted proxy, even when that certificate is not in Plauna's allowlist yet."
+  [request]
+  (let [proxy-secret (get (effective-mtls-values) "PLAUNA_MTLS_PROXY_SECRET")]
+    (when (<= 32 (count (or proxy-secret "")))
+      (verified-mtls-client-fingerprint-with-secret proxy-secret request))))
+
+(defn mtls-login-candidate
+  "Return safe login-page data for a verified but not-yet-allowlisted client certificate."
+  [request]
+  (when-let [fingerprint (verified-mtls-client-fingerprint request)]
+    (when-not (contains? (:fingerprints @mtls-auth-config) fingerprint)
+      {:fingerprint         fingerprint
+       :can-add             (not (mtls-environment-managed?))
+       :environment-managed (mtls-environment-managed?)})))
+
+(defn add-verified-mtls-certificate!
+  "Add the verified certificate on this request to the UI-managed allowlist. The fingerprint is
+   derived exclusively from trusted proxy headers and the current admin password is re-verified."
+  [request current-password]
+  (let [fingerprint (verified-mtls-client-fingerprint request)]
+    (when-not fingerprint
+      (throw (ex-info "No successfully verified client certificate was supplied by the trusted proxy."
+                      {})))
+    (let [existing (or (settings/fetch-setting :mtls-trusted-cert-sha256) "")]
+      (save-mtls-settings! {:trusted-cert-sha256 (str existing "\n" fingerprint)
+                            :proxy-secret ""
+                            :current-password current-password}))))
+
 (defn mtls-request-authorized-with-config?
   "True when a request carries the three headers supplied by the trusted NGINX configuration and
    the verified client certificate is in the configured SHA-256 allowlist."
   [config request]
-  (let [headers (:headers request)]
-    (boolean
-     (and config
-          (constant-time-string= (:proxy-secret config)
-                                 (get headers "x-plauna-proxy-secret"))
-          (= "SUCCESS" (get headers "x-plauna-client-verify"))
-          (when-let [fingerprint (client-certificate-sha256
-                                  (get headers "x-plauna-client-cert"))]
-            (contains? (:fingerprints config) fingerprint))))))
+  (boolean
+   (and config
+        (when-let [fingerprint (verified-mtls-client-fingerprint-with-secret
+                                (:proxy-secret config) request)]
+          (contains? (:fingerprints config) fingerprint)))))
 
 (defn mtls-request-authorized?
   "True when the request was authenticated with an explicitly allowed mTLS client certificate."

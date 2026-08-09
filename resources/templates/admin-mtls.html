@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2 class="uppercase text-lg my-8">mTLS Login</h2>
+
+{% if environment-managed %}
+<div role="alert" class="alert alert-warning alert-outline mb-6 max-w-3xl">
+  <span>
+    mTLS login is managed by the <code>PLAUNA_MTLS_TRUSTED_CERT_SHA256</code> and
+    <code>PLAUNA_MTLS_PROXY_SECRET</code> environment variables. Remove them and restart Plauna
+    before managing these values here.
+  </span>
+</div>
+{% endif %}
+
+<div class="alert {% if enabled %}alert-success{% else %}alert-info{% endif %} alert-outline mb-6 max-w-3xl" role="status">
+  <span>
+    Passwordless certificate login is currently <strong>{% if enabled %}enabled{% else %}disabled{% endif %}</strong>.
+    {% if secret-configured %}A proxy secret is configured.{% else %}No proxy secret is configured.{% endif %}
+  </span>
+</div>
+
+<form action="/admin/mtls" method="POST" class="flex flex-col gap-5 max-w-3xl">
+  <input type="hidden" name="redirect-url" value="/admin/mtls">
+
+  <div>
+    <label class="block mb-2 text-sm font-medium text-gray-900" for="trusted-cert-sha256">
+      Trusted client certificate SHA-256 fingerprints
+    </label>
+    <textarea id="trusted-cert-sha256" class="textarea w-full font-mono" name="trusted-cert-sha256"
+              rows="7" placeholder="AA:BB:...:FF (one per line)" {% if environment-managed %}disabled{% endif %}>{{trusted-cert-sha256}}</textarea>
+    <div class="text-xs text-gray-500 mt-1">
+      Separate fingerprints with new lines, commas, semicolons or whitespace. An empty list disables
+      mTLS login. Obtain a fingerprint with
+      <code>openssl x509 -in client.crt -noout -fingerprint -sha256</code>.
+    </div>
+  </div>
+
+  <div>
+    <label class="block mb-2 text-sm font-medium text-gray-900" for="proxy-secret">Proxy secret</label>
+    <input id="proxy-secret" class="input w-full font-mono" name="proxy-secret" type="password"
+           autocomplete="new-password" minlength="32"
+           placeholder="{% if secret-configured %}Leave blank to keep the current secret{% else %}At least 32 characters{% endif %}"
+           {% if environment-managed %}disabled{% endif %}>
+    <div class="text-xs text-gray-500 mt-1">
+      Configure the same secret in NGINX as <code>X-Plauna-Proxy-Secret</code>. The stored value is
+      never sent back to the browser. Generate a strong value with <code>openssl rand -hex 32</code>.
+    </div>
+  </div>
+
+  {% if secret-configured %}
+  {% if not environment-managed %}
+  <label class="label cursor-pointer justify-start gap-3">
+    <input class="checkbox" type="checkbox" name="clear-proxy-secret" value="true">
+    <span>Delete the stored proxy secret</span>
+  </label>
+  {% endif %}
+  {% endif %}
+
+  <div>
+    <label class="block mb-2 text-sm font-medium text-gray-900" for="current-password">
+      Current admin password
+    </label>
+    <input id="current-password" class="input w-full" name="current-password" type="password"
+           autocomplete="current-password" required
+           placeholder="Required to authorize every mTLS configuration change"
+           {% if environment-managed %}disabled{% endif %}>
+    <div class="text-xs text-gray-500 mt-1">
+      Plauna verifies the password again before changing either the certificate allowlist or proxy secret.
+    </div>
+  </div>
+
+  <div class="alert alert-warning alert-outline" role="alert">
+    <span>
+      Only NGINX should be able to reach Plauna's HTTP port. NGINX must overwrite
+      <code>X-Plauna-Client-Verify</code>, <code>X-Plauna-Client-Cert</code> and
+      <code>X-Plauna-Proxy-Secret</code> on every proxied request.
+    </span>
+  </div>
+
+  <button class="btn btn-primary self-start" type="submit" {% if environment-managed %}disabled{% endif %}>
+    Save mTLS configuration
+  </button>
+</form>
+
+{% endblock %}

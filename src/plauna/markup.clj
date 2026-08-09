@@ -54,6 +54,12 @@
 
 (defn password-page [data] (render "admin-password.html" (conj {:active-nav :admin} data)))
 
+(defn mtls-page
+  ([data] (render "admin-mtls.html" (assoc data :active-nav :admin)))
+  ([data messages]
+   (render "admin-mtls.html"
+           (assoc data :active-nav :admin :messages (mapv type->toast-role messages)))))
+
 (defn concat-string [contact]
   (if (nil? (:name contact))
     (:address contact)

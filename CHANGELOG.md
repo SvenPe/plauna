@@ -9,7 +9,12 @@ All notable changes to this project will be documented in this file.
 - Allow explicitly selected mTLS client certificates, verified by an NGINX reverse proxy, to bypass
   the web UI password and establish a normal signed Plauna session. The opt-in integration uses a
   SHA-256 certificate-fingerprint allowlist and requires a shared proxy secret so forwarded headers
-  cannot be spoofed by a client with direct access to Plauna.
+  cannot be spoofed by a client with direct access to Plauna. The allowlist and write-only proxy
+  secret can be managed and activated immediately from the administration UI; environment variables
+  remain available as a read-only higher-priority configuration source. Configuration changes
+  require the current admin password again. A CA-verified but not-yet-allowed certificate can be
+  enrolled directly during a successful password login without accepting its fingerprint from the
+  browser as input.
 
 ## [2026-07-10.0] - 2026-07-10
 

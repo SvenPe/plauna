@@ -19,6 +19,25 @@
         {% endif %}
         <form action="/login" method="POST" class="flex flex-col gap-4 w-full">
           <input class="input w-full" name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus required>
+          {% if mtls-candidate %}
+          <div class="alert alert-info alert-outline text-sm" role="status">
+            <span>
+              NGINX verified a client certificate for this request.<br>
+              SHA-256: <code class="break-all">{{mtls-candidate.fingerprint}}</code>
+            </span>
+          </div>
+          {% if mtls-candidate.can-add %}
+          <label class="label cursor-pointer items-start gap-3">
+            <input class="checkbox mt-1" type="checkbox" name="add-mtls-certificate" value="true">
+            <span>Trust this certificate for future passwordless logins</span>
+          </label>
+          {% else %}
+          <div class="text-xs text-gray-500">
+            The allowlist is managed by environment variables. Add this fingerprint to
+            <code>PLAUNA_MTLS_TRUSTED_CERT_SHA256</code> and restart Plauna.
+          </div>
+          {% endif %}
+          {% endif %}
           <button class="btn btn-primary w-full" type="submit">Sign in</button>
         </form>
       </div>

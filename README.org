@@ -229,7 +229,29 @@ Plauna can turn a client certificate already verified by an NGINX reverse proxy 
 signed Plauna session. Only certificates whose SHA-256 fingerprint is explicitly configured bypass
 the password. Requests without an allowed certificate continue to use the password login.
 
-Set these environment variables on Plauna:
+The allowlist and proxy secret can be managed under "Admin" -> "mTLS Login". Changes made there are
+validated, written atomically to =settings.json= and activated immediately without a restart. The
+proxy secret is write-only in the UI: an existing value is never sent back to the browser. Leave the
+field blank to retain it, enter a value of at least 32 characters to rotate it, or use the explicit
+delete checkbox. Clearing the fingerprint list disables new mTLS logins. Every change requires the
+current admin password again, including changes made from an already authenticated browser session.
+
+When NGINX successfully verifies a client certificate which is not in the UI-managed allowlist yet,
+Plauna shows its SHA-256 fingerprint on the password login page. Selecting "Trust this certificate
+for future passwordless logins" adds the fingerprint only after the submitted admin password has
+been verified. The fingerprint is always derived from NGINX's protected certificate header and is
+never accepted as a form parameter. With environment-managed configuration, the login page instead
+shows the fingerprint that must be added to =PLAUNA_MTLS_TRUSTED_CERT_SHA256=.
+
+The secret has to remain available to Plauna for request comparison and is therefore stored in plain
+text in =settings.json=. Protect the data volume and do not share that file. It already contains the
+similarly sensitive browser-session signing key.
+
+Alternatively, configure mTLS through environment variables. A non-empty
+=PLAUNA_MTLS_TRUSTED_CERT_SHA256= selects the environment as the complete, higher-priority source;
+both values then appear read-only in the UI until the variables are removed and Plauna is restarted.
+
+Set these environment variables on Plauna when using environment-managed configuration:
 
 #+begin_src
 PLAUNA_MTLS_TRUSTED_CERT_SHA256=AA:BB:...:FF,11:22:...:99

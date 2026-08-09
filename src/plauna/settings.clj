@@ -59,6 +59,13 @@
   (locking settings-lock
     (save-settings! (assoc (load-settings) (keyword (name k)) (coerce k v)))))
 
+(defn update-settings!
+  "Atomically merge several already-coerced values into settings.json. Used when related security
+   settings must never be observed or persisted as a half-updated pair."
+  [updates]
+  (locking settings-lock
+    (save-settings! (merge (load-settings) updates))))
+
 (defn- random-session-key
   "A 16-character (16-byte) random string, suitable as an AES-128 key for the session cookie store."
   []
