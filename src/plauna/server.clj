@@ -620,29 +620,19 @@
      (if (get-in request [:session :authenticated])
        (redirect "/")
        (success-html-with-body
-        (markup/login-page {:mtls-candidate (auth/mtls-login-candidate request)}))))
+        (markup/login-page {:login-name (auth/web-login-name)}))))
 
    (comp/POST "/login" request
-     (let [password       (-> request :params :password)
+     (let [login-name     (-> request :params :login-name)
+           password       (-> request :params :password)
            authenticated (or (get-in request [:session :authenticated])
-                             (auth/verify-web-password? password))]
+                             (auth/verify-web-credentials? login-name password))]
        (if authenticated
-         (do
-           (when (= "true" (get-in request [:params :add-mtls-certificate]))
-             (try
-               (auth/add-verified-mtls-certificate! request password)
-               (add-to-messages {:type :success
-                                 :content "The client certificate was added to the mTLS allowlist."})
-               (catch clojure.lang.ExceptionInfo e
-                 ;; Certificate enrollment is optional: a valid password still signs the user in.
-                 (add-to-messages {:type :alert
-                                   :content (str "Signed in, but the client certificate was not added: "
-                                                 (.getMessage e))}))))
-           (-> (redirect "/")
-               (assoc :session (assoc (:session request) :authenticated true))))
+         (-> (redirect "/")
+             (assoc :session (assoc (:session request) :authenticated true)))
          (success-html-with-body
-          (markup/login-page {:error "Invalid password."
-                              :mtls-candidate (auth/mtls-login-candidate request)})))))
+          (markup/login-page {:error "Invalid login name or password."
+                              :login-name (auth/web-login-name)})))))
 
    (comp/GET "/logout" {}
      (-> (redirect "/login") (assoc :session nil)))
@@ -730,7 +720,19 @@
                              :active-nav :admin}))))
 
    (comp/GET "/admin/password" {}
-     (success-html-with-body (markup/password-page {:env-managed (auth/password-from-env-var?)})))
+     (success-html-with-body
+      (markup/password-page {:env-managed (auth/password-from-env-var?)
+                             :login-name  (auth/web-login-name)})))
+
+   (comp/POST "/admin/login-name" request
+     (let [{:keys [current-password login-name]} (:params request)]
+       (if-not (auth/verify-web-password? current-password)
+         (redirect-request request {:type :alert :content "Current password is incorrect."})
+         (try
+           (auth/set-login-name! login-name)
+           (redirect-request request {:type :success :content "Login name changed successfully."})
+           (catch clojure.lang.ExceptionInfo e
+             (redirect-request request {:type :alert :content (.getMessage e)}))))))
 
    (comp/POST "/admin/password" request
      (let [{:keys [current-password new-password confirm-password]} (:params request)]
@@ -748,9 +750,10 @@
          (do (auth/set-password! new-password)
              (redirect-request request {:type :success :content "Password changed successfully."})))))
 
-   (comp/GET "/admin/mtls" {}
+   (comp/GET "/admin/mtls" request
      (let [messages @global-messages
-           state    (auth/mtls-admin-state)]
+           state    (assoc (auth/mtls-admin-state)
+                           :current-certificate (auth/mtls-admin-certificate-state request))]
        (reset! global-messages [])
        (success-html-with-body
         (if (seq messages)
@@ -759,7 +762,7 @@
 
    (comp/POST "/admin/mtls" request
      (try
-       (auth/save-mtls-settings! (:params request))
+       (auth/save-mtls-settings-from-request! request)
        (redirect-request request {:type :success :content "mTLS login configuration saved and activated."})
        (catch clojure.lang.ExceptionInfo e
          (redirect-request request {:type :alert :content (.getMessage e)}))))

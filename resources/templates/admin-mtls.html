@@ -21,6 +21,23 @@
   </span>
 </div>
 
+{% if current-certificate %}
+<div class="alert alert-info alert-outline mb-6 max-w-3xl" role="status">
+  <span>
+    NGINX verified the client certificate used for this request.<br>
+    SHA-256: <code class="break-all">{{current-certificate.fingerprint}}</code><br>
+    {% if current-certificate.trusted %}
+    This certificate is already trusted for passwordless login.
+    {% else %}
+    This certificate is not currently trusted.
+    {% if current-certificate.environment-managed %}
+    Add its fingerprint to <code>PLAUNA_MTLS_TRUSTED_CERT_SHA256</code> and restart Plauna.
+    {% endif %}
+    {% endif %}
+  </span>
+</div>
+{% endif %}
+
 <form action="/admin/mtls" method="POST" class="flex flex-col gap-5 max-w-3xl">
   <input type="hidden" name="redirect-url" value="/admin/mtls">
 
@@ -48,6 +65,18 @@
       never sent back to the browser. Generate a strong value with <code>openssl rand -hex 32</code>.
     </div>
   </div>
+
+  {% if current-certificate.can-add %}
+  <label class="label cursor-pointer justify-start items-start gap-3">
+    <input class="checkbox mt-1" type="checkbox" name="add-current-certificate" value="true">
+    <span>
+      Add the certificate used for this request to the trusted list
+      <span class="block text-xs text-gray-500 mt-1">
+        Its fingerprint is derived from NGINX's verified certificate header and cannot be supplied by the browser.
+      </span>
+    </span>
+  </label>
+  {% endif %}
 
   {% if secret-configured %}
   {% if not environment-managed %}

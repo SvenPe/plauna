@@ -32,7 +32,7 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Read e-mails directly from IMAP folders.
 
-- Password-protected web UI (password can be set via an environment variable, changed in the UI, or auto-generated on first launch).
+- Login-name-and-password-protected web UI (the login name defaults to =root=; the password can be set via an environment variable, changed in the UI, or auto-generated on first launch).
 
 - Per-category destination folders: choose exactly which IMAP folder each category's mail is moved to.
 
@@ -91,7 +91,7 @@ This produces =target/plauna-standalone.jar=. Run it with Java 21 or later (requ
 
 * Security
 
-The web UI is protected by a single password (see "Web UI Password Protection" below). There are no separate user accounts - Plauna is made to be used by self-hosters who own and use the service themselves.
+The web UI is protected by one configurable login name and password (see "Web UI Password Protection" below). There are no separate user accounts - Plauna is made to be used by self-hosters who own and use the service themselves.
 
 The password protects the UI, but Plauna still has no transport encryption of its own and is meant to run inside a trusted, isolated network.
 
@@ -185,7 +185,12 @@ When the same runtime value is provided more than once, Plauna uses the followin
 
 ** Web UI Password Protection
 
-The whole web UI is protected by a single password. When you open Plauna you are redirected to a login page. After logging in, a signed session cookie keeps you signed in until you log out (via the "Logout" link in the navigation bar) or the browser discards the cookie. The signing key is persisted in =settings.json=, so a normal Plauna restart does not invalidate the session.
+The whole web UI is protected by one login name and password. The login name defaults to =root= for
+new and existing installations and can be changed under "Admin" -> "Login Settings". When you open
+Plauna you are redirected to a login page. After logging in, a signed session cookie keeps you signed
+in until you log out (via the "Logout" link in the navigation bar) or the browser discards the cookie.
+The signing key is persisted in =settings.json=, so a normal Plauna restart does not invalidate the
+session.
 
 *** How the password is determined
 
@@ -200,15 +205,19 @@ No web UI password configured. A temporary password was generated:
 
     Xk7p... (a long random string)
 
-Log in with it and change it under Administration > Change Password,
+Log in as root and change it under Administration > Login Settings,
 or set the PLAUNA_PASSWORD environment variable.
 #+end_src
 
 The password is never stored in plain text; only a salted PBKDF2 hash is kept in the database.
 
-*** Changing the password
+*** Changing the login name or password
 
-Go to "Admin" -> "Change Password", enter your current password and the new one (at least 8 characters) twice. If =PLAUNA_PASSWORD= is set, the page warns you that your change will be reset to the environment variable's value on the next restart.
+Go to "Admin" -> "Login Settings". The login name and password have separate forms, and both changes
+require the current password again. Login names are case-sensitive. A new password must contain at
+least 8 characters and be entered twice. If =PLAUNA_PASSWORD= is set, the page warns you that a
+password change will be reset to the environment variable's value on the next restart. The login
+name remains the value selected in the UI.
 
 *** Docker example
 
@@ -236,12 +245,13 @@ field blank to retain it, enter a value of at least 32 characters to rotate it, 
 delete checkbox. Clearing the fingerprint list disables new mTLS logins. Every change requires the
 current admin password again, including changes made from an already authenticated browser session.
 
-When NGINX successfully verifies a client certificate which is not in the UI-managed allowlist yet,
-Plauna shows its SHA-256 fingerprint on the password login page. Selecting "Trust this certificate
-for future passwordless logins" adds the fingerprint only after the submitted admin password has
-been verified. The fingerprint is always derived from NGINX's protected certificate header and is
-never accepted as a form parameter. With environment-managed configuration, the login page instead
-shows the fingerprint that must be added to =PLAUNA_MTLS_TRUSTED_CERT_SHA256=.
+When an authenticated administrator opens "Admin" -> "mTLS Login" through NGINX with a verified
+client certificate, Plauna shows its SHA-256 fingerprint there. If it is not trusted yet, the
+administrator can add it to the UI-managed allowlist while saving the mTLS settings. The current
+password is required again. The fingerprint is always derived from NGINX's protected certificate
+header and is never accepted as a form parameter. With environment-managed configuration, the
+settings page instead shows the fingerprint that must be added to
+=PLAUNA_MTLS_TRUSTED_CERT_SHA256=.
 
 The secret has to remain available to Plauna for request comparison and is therefore stored in plain
 text in =settings.json=. Protect the data volume and do not share that file. It already contains the

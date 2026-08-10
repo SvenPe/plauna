@@ -13,8 +13,10 @@ All notable changes to this project will be documented in this file.
   secret can be managed and activated immediately from the administration UI; environment variables
   remain available as a read-only higher-priority configuration source. Configuration changes
   require the current admin password again. A CA-verified but not-yet-allowed certificate can be
-  enrolled directly during a successful password login without accepting its fingerprint from the
-  browser as input.
+  enrolled from the mTLS settings page without accepting its fingerprint from the browser as input.
+- Require a configurable login name in addition to the web UI password. Existing and new
+  installations default to `root`; administrators can change the case-sensitive name under Login
+  Settings after re-entering the current password.
 
 ## [2026-07-10.0] - 2026-07-10
 

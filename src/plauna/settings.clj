@@ -8,7 +8,8 @@
 (def ^:private settings-lock (Object.))
 
 (def ^:private defaults
-  {:log-level                    "info"
+  {:web-login-name               "root"
+   :log-level                    "info"
    :language-detection-threshold 0.8
    :categorization-threshold     0.65
    :categorization-algorithm     "naive-bayes"
@@ -60,8 +61,8 @@
     (save-settings! (assoc (load-settings) (keyword (name k)) (coerce k v)))))
 
 (defn update-settings!
-  "Atomically merge several already-coerced values into settings.json. Used when related security
-   settings must never be observed or persisted as a half-updated pair."
+  "Atomically merge several already-validated values into settings.json. Used for security settings
+   that must not be observed or persisted in a partially updated state."
   [updates]
   (locking settings-lock
     (save-settings! (merge (load-settings) updates))))

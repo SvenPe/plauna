@@ -73,10 +73,14 @@
 (deftest mtls-page-shows-fingerprints-but-never-renders-the-proxy-secret
   (with-redefs [client/disconnected-connections (fn [] [])]
     (let [secret "proxy-secret-must-not-reach-browser"
+          current-fingerprint (apply str (repeat 32 "cd"))
           html (markup/mtls-page {:enabled true
                                   :environment-managed false
                                   :secret-configured true
                                   :trusted-cert-sha256 "aabbcc"
+                                  :current-certificate {:fingerprint current-fingerprint
+                                                        :trusted false
+                                                        :can-add true}
                                   :proxy-secret secret
                                   :current-password secret})]
       (is (str/includes? html "name=\"trusted-cert-sha256\""))
@@ -85,23 +89,32 @@
       (is (str/includes? html "Delete the stored proxy secret"))
       (is (str/includes? html "name=\"current-password\""))
       (is (str/includes? html "required"))
+      (is (str/includes? html current-fingerprint))
+      (is (str/includes? html "name=\"add-current-certificate\""))
+      (is (not (str/includes? html "name=\"fingerprint\"")))
       (is (not (str/includes? html secret)))))
-  "The administration form treats the shared proxy secret as write-only")
+  "The administration form treats the secret as write-only and derives current certificate identity server-side")
 
-(deftest login-page-offers-enrollment-for-a-verified-mtls-certificate
+(deftest login-page-requires-the-configured-login-name-and-has-no-certificate-enrollment
   (let [fingerprint (apply str (repeat 32 "ab"))
-        html (markup/login-page {:mtls-candidate {:fingerprint fingerprint :can-add true}})
-        env-html (markup/login-page {:mtls-candidate {:fingerprint fingerprint
-                                                      :can-add false
-                                                      :environment-managed true}})]
-    (is (str/includes? html fingerprint))
-    (is (str/includes? html "name=\"add-mtls-certificate\""))
-    (is (str/includes? html "Trust this certificate for future passwordless logins"))
-    (is (not (str/includes? html "name=\"fingerprint\"")))
-    (is (not (str/includes? env-html "name=\"add-mtls-certificate\"")))
-    (is (str/includes? env-html "PLAUNA_MTLS_TRUSTED_CERT_SHA256"))
-    (is (str/includes? (markup/login-page {}) "name=\"password\"")))
-  "The browser can request enrollment but cannot choose which fingerprint is trusted")
+        html (markup/login-page {:login-name "root" :mtls-candidate {:fingerprint fingerprint}})]
+    (is (str/includes? html "name=\"login-name\""))
+    (is (str/includes? html "value=\"root\""))
+    (is (str/includes? html "autocomplete=\"username\""))
+    (is (str/includes? html "name=\"password\""))
+    (is (not (str/includes? html "add-mtls-certificate")))
+    (is (not (str/includes? html fingerprint))))
+  "Certificate enrollment is absent from login and the configured login name is required")
+
+(deftest login-settings-page-allows-changing-the-login-name
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/password-page {:login-name "root" :env-managed false})]
+      (is (str/includes? html "action=\"/admin/login-name\""))
+      (is (str/includes? html "name=\"login-name\""))
+      (is (str/includes? html "value=\"root\""))
+      (is (str/includes? html "Save login name"))
+      (is (str/includes? html "action=\"/admin/password\""))))
+  "Login name and password are managed together on the login settings page")
 
 (deftest statistics-page-loads-only-local-chart-scripts
   (with-redefs [client/disconnected-connections (fn [] [])]

@@ -1,6 +1,6 @@
 (ns plauna.auth
-  "Web UI authentication: password protection plus optional mTLS authentication through a trusted
-   reverse proxy.
+  "Web UI authentication: login-name-and-password protection plus optional mTLS authentication
+   through a trusted reverse proxy.
 
    The active password is established at startup by initialize! with the precedence:
    PLAUNA_PASSWORD environment variable > previously stored password > a freshly generated one
@@ -85,6 +85,43 @@
   [plaintext]
   (let [h @password-hash]
     (and (some? h) (verify-password plaintext h))))
+
+(defn- constant-time-string= [expected actual]
+  (and (string? expected)
+       (string? actual)
+       (MessageDigest/isEqual (.getBytes ^String expected StandardCharsets/UTF_8)
+                              (.getBytes ^String actual StandardCharsets/UTF_8))))
+
+(defn- normalized-login-name [value]
+  (let [login-name (some-> value str str/trim)]
+    (when (str/blank? login-name)
+      (throw (ex-info "The login name must not be empty." {})))
+    (when (> (count login-name) 128)
+      (throw (ex-info "The login name must not exceed 128 characters." {})))
+    (when (re-find #"\p{Cntrl}" login-name)
+      (throw (ex-info "The login name must not contain control characters." {})))
+    login-name))
+
+(defn web-login-name
+  "Return the configured web UI login name. Existing installations default to root. A malformed
+   value in settings.json fails safely back to that default rather than locking out the UI."
+  []
+  (try
+    (normalized-login-name (or (settings/fetch-setting :web-login-name) "root"))
+    (catch clojure.lang.ExceptionInfo _ "root")))
+
+(defn set-login-name!
+  "Validate and persist the web UI login name. Returns its canonical trimmed value."
+  [login-name]
+  (let [canonical (normalized-login-name login-name)]
+    (settings/update-settings! {:web-login-name canonical})
+    canonical))
+
+(defn verify-web-credentials?
+  "True only when both the configured login name and active web UI password match."
+  [login-name plaintext]
+  (and (constant-time-string= (web-login-name) login-name)
+       (verify-web-password? plaintext)))
 
 (defn password-from-env-var?
   "True if the password is being supplied via the PLAUNA_PASSWORD environment variable."
@@ -206,12 +243,6 @@
       (activate-mtls-config! config)
       (mtls-admin-state))))
 
-(defn- constant-time-string= [expected actual]
-  (and (string? expected)
-       (string? actual)
-       (MessageDigest/isEqual (.getBytes ^String expected StandardCharsets/UTF_8)
-                              (.getBytes ^String actual StandardCharsets/UTF_8))))
-
 (defn client-certificate-sha256
   "Decode an NGINX $ssl_client_escaped_cert header and return the certificate's canonical SHA-256
    fingerprint, or nil when the header does not contain one valid X.509 certificate."
@@ -244,27 +275,34 @@
     (when (<= 32 (count (or proxy-secret "")))
       (verified-mtls-client-fingerprint-with-secret proxy-secret request))))
 
-(defn mtls-login-candidate
-  "Return safe login-page data for a verified but not-yet-allowlisted client certificate."
+(defn mtls-admin-certificate-state
+  "Return safe administration-page data for a client certificate verified by the trusted proxy.
+   The fingerprint is derived from the request and is never accepted from browser form data."
   [request]
   (when-let [fingerprint (verified-mtls-client-fingerprint request)]
-    (when-not (contains? (:fingerprints @mtls-auth-config) fingerprint)
+    (let [trusted             (contains? (:fingerprints @mtls-auth-config) fingerprint)
+          environment-managed (mtls-environment-managed?)]
       {:fingerprint         fingerprint
-       :can-add             (not (mtls-environment-managed?))
-       :environment-managed (mtls-environment-managed?)})))
+       :trusted             trusted
+       :can-add             (and (not trusted) (not environment-managed))
+       :environment-managed environment-managed})))
 
-(defn add-verified-mtls-certificate!
-  "Add the verified certificate on this request to the UI-managed allowlist. The fingerprint is
-   derived exclusively from trusted proxy headers and the current admin password is re-verified."
-  [request current-password]
-  (let [fingerprint (verified-mtls-client-fingerprint request)]
-    (when-not fingerprint
-      (throw (ex-info "No successfully verified client certificate was supplied by the trusted proxy."
-                      {})))
-    (let [existing (or (settings/fetch-setting :mtls-trusted-cert-sha256) "")]
-      (save-mtls-settings! {:trusted-cert-sha256 (str existing "\n" fingerprint)
-                            :proxy-secret ""
-                            :current-password current-password}))))
+(defn save-mtls-settings-from-request!
+  "Save mTLS settings submitted from the administration page. When requested, append the current
+   proxy-verified certificate before the normal validation and atomic save. The fingerprint is
+   derived exclusively from trusted proxy headers, never from a form parameter."
+  [request]
+  (let [params       (:params request)
+        add-current? (= "true" (:add-current-certificate params))]
+    (if-not add-current?
+      (save-mtls-settings! params)
+      (let [fingerprint (verified-mtls-client-fingerprint request)]
+        (when-not fingerprint
+          (throw (ex-info "No successfully verified client certificate was supplied by the trusted proxy."
+                          {})))
+        (save-mtls-settings!
+         (assoc params :trusted-cert-sha256
+                (str (or (:trusted-cert-sha256 params) "") "\n" fingerprint)))))))
 
 (defn mtls-request-authorized-with-config?
   "True when a request carries the three headers supplied by the trusted NGINX configuration and
@@ -304,6 +342,6 @@
         (t/log! :warn (str "================================================================\n"
                            "No web UI password configured. A temporary password was generated:\n\n"
                            "    " pw "\n\n"
-                           "Log in with it and change it under Administration > Change Password,\n"
+                           "Log in as root and change it under Administration > Login Settings,\n"
                            "or set the PLAUNA_PASSWORD environment variable.\n"
                            "================================================================"))))))

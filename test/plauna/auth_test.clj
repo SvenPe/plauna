@@ -39,6 +39,27 @@
     (is (false? (auth/verify-web-password? nil))))
   "verify-web-password? checks the plaintext against the in-memory hash")
 
+(deftest web-login-name-defaults-to-root-and-is-configurable
+  (with-redefs [settings/fetch-setting (constantly nil)]
+    (is (= "root" (auth/web-login-name))))
+  (with-redefs [settings/fetch-setting (fn [key] (when (= key :web-login-name) "alice"))]
+    (is (= "alice" (auth/web-login-name))))
+  (let [saved (atom nil)]
+    (with-redefs [settings/update-settings! #(reset! saved %)]
+      (is (= "alice" (auth/set-login-name! "  alice  ")))
+      (is (= {:web-login-name "alice"} @saved))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not be empty"
+                            (auth/set-login-name! "  ")))))
+  "Existing installations use root until an administrator selects another login name")
+
+(deftest web-login-requires-both-name-and-password
+  (with-redefs [settings/fetch-setting (fn [key] (when (= key :web-login-name) "alice"))
+                auth/verify-web-password? #(= "the-secret" %)]
+    (is (true? (auth/verify-web-credentials? "alice" "the-secret")))
+    (is (false? (auth/verify-web-credentials? "root" "the-secret")))
+    (is (false? (auth/verify-web-credentials? "alice" "wrong"))))
+  "A valid password alone no longer authenticates when the login name differs")
+
 (deftest mtls-configuration-is-opt-in-and-normalizes-fingerprints
   (let [fingerprint (apply str (repeat 32 "ab"))
         with-colons (str/join ":" (map #(apply str %) (partition-all 2 fingerprint)))
@@ -95,17 +116,17 @@ bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
                    (assoc config :fingerprints #{"different"}) request)))))
   "All proxy assertions are required before passwordless access is granted")
 
-(deftest verified-but-unlisted-certificate-is-offered-as-a-login-candidate
+(deftest verified-certificate-state-is-available-only-in-mtls-administration
   (let [fingerprint (apply str (repeat 32 "ef"))]
     (with-redefs [auth/system-env (constantly nil)
                   auth/verified-mtls-client-fingerprint (constantly fingerprint)]
-      (is (= {:fingerprint fingerprint :can-add true :environment-managed false}
-             (auth/mtls-login-candidate {}))))
+      (is (= {:fingerprint fingerprint :trusted false :can-add true :environment-managed false}
+             (auth/mtls-admin-certificate-state {}))))
     (with-redefs [auth/system-env #(get {"PLAUNA_MTLS_TRUSTED_CERT_SHA256" (apply str (repeat 32 "ab"))} %)
                   auth/verified-mtls-client-fingerprint (constantly fingerprint)]
-      (is (= {:fingerprint fingerprint :can-add false :environment-managed true}
-             (auth/mtls-login-candidate {})))))
-  "A verified certificate can be enrolled in UI mode and is informational in environment mode")
+      (is (= {:fingerprint fingerprint :trusted false :can-add false :environment-managed true}
+             (auth/mtls-admin-certificate-state {})))))
+  "A verified certificate can be enrolled from settings in UI mode and is informational in environment mode")
 
 (deftest ui-mtls-settings-are-validated-saved-atomically-and-activated
   (let [fingerprint (apply str (repeat 32 "ab"))
@@ -162,7 +183,7 @@ bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
       (is (false? @saved?))))
   "An authenticated session alone cannot modify mTLS access")
 
-(deftest verified-login-certificate-can-be-added-without-a-browser-supplied-fingerprint
+(deftest verified-settings-certificate-can-be-added-without-a-browser-supplied-fingerprint
   (let [existing-fingerprint (apply str (repeat 32 "ab"))
         request-fingerprint  (apply str (repeat 32 "cd"))
         secret               (apply str (repeat 32 "s"))
@@ -174,14 +195,18 @@ bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
                     auth/verified-mtls-client-fingerprint (constantly request-fingerprint)
                     settings/fetch-setting #(get @stored %)
                     settings/update-settings! #(swap! stored merge %)]
-        (auth/add-verified-mtls-certificate! {:params {:fingerprint "attacker-controlled"}}
-                                             "admin-password")
+        (auth/save-mtls-settings-from-request!
+         {:params {:trusted-cert-sha256 existing-fingerprint
+                   :proxy-secret ""
+                   :current-password "admin-password"
+                   :add-current-certificate "true"
+                   :fingerprint "attacker-controlled"}})
         (is (= #{existing-fingerprint request-fingerprint}
                (set (str/split-lines (:mtls-trusted-cert-sha256 @stored)))))
         (is (not (str/includes? (:mtls-trusted-cert-sha256 @stored) "attacker-controlled"))))
       (finally
         (auth/initialize-mtls!))))
-  "Certificate enrollment derives identity solely from the verified request")
+  "Certificate enrollment in settings derives identity solely from the verified request")
 
 (deftest stored-ui-mtls-configuration-is-restored-at-startup
   (let [fingerprint (apply str (repeat 32 "ab"))
