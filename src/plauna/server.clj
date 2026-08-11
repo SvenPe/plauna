@@ -944,8 +944,8 @@
      (let [messages @global-messages]
        (empty-global-messages)
        (if (seq messages)
-         (response (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)) messages))
-         (response (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)))))))
+         (success-html-with-body (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)) messages))
+         (success-html-with-body (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)))))))
 
    (comp/POST "/admin/connections" request
      (let [params (:params request)

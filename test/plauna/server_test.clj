@@ -140,6 +140,17 @@
     (is (= "/login" (get-in response [:headers "Location"])) "Redirected to the login page"))
   "Unauthenticated requests to protected paths are redirected to /login")
 
+(deftest connections-page-is-served-as-html
+  (with-redefs [db/get-connections (constantly [])]
+    (let [response ((server/make-routes {})
+                    {:request-method :get
+                     :uri "/admin/connections"})]
+      (is (= 200 (:status response)))
+      (is (= "text/html; charset=UTF-8"
+             (get-in response [:headers "Content-Type"])))
+      (is (string? (:body response)))))
+  "Browsers must render the IMAP connections page instead of downloading an untyped response")
+
 (deftest wrap-authentication-allows-authenticated
   (let [handler (server/wrap-authentication ok-handler)
         response (handler {:uri "/emails" :session {:authenticated true}})]
