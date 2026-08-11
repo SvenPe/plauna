@@ -965,9 +965,7 @@
 
    (comp/GET "/admin/new-connection" []
      (let [providers (without-provider-secrets (db/get-auth-providers))]
-       {:status 200
-        :header html-headers
-        :body   (markup/new-connection providers)}))
+       (success-html-with-body (markup/new-connection providers))))
 
    (comp/DELETE "/admin/auth-providers/:id" request
      (let [params (:params request)

@@ -151,6 +151,18 @@
       (is (string? (:body response)))))
   "Browsers must render the IMAP connections page instead of downloading an untyped response")
 
+(deftest new-connection-page-is-served-as-html
+  (with-redefs [db/get-connections (constantly [])
+                db/get-auth-providers (constantly [])]
+    (let [response ((server/make-routes {})
+                    {:request-method :get
+                     :uri "/admin/new-connection"})]
+      (is (= 200 (:status response)))
+      (is (= "text/html; charset=UTF-8"
+             (get-in response [:headers "Content-Type"])))
+      (is (string? (:body response)))))
+  "Safari must render the new-connection form instead of downloading an untyped response")
+
 (deftest wrap-authentication-allows-authenticated
   (let [handler (server/wrap-authentication ok-handler)
         response (handler {:uri "/emails" :session {:authenticated true}})]
