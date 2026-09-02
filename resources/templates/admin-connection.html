@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 
+{% block head-extra %}
+{% if parse-running? %}
+<!-- A folder parse is running in the background: reload so the finished summary and its review link appear. -->
+<meta http-equiv="refresh" content="10">
+{% endif %}
+{% endblock %}
+
 {% block content %}
 
 <h3 class="uppercase text-lg my-8">IMAP Connection for {{host}} - {{user}}</h3>
@@ -91,6 +98,13 @@
         <label for="move">Move e-mails after categorization</label>
         <input class="checkbox" name="move" type="checkbox">
       </div>
+      <div class="form-field">
+        <label for="batch-size">Batch size</label>
+        <div class="form-control">
+          <input class="input" id="batch-size" name="batch-size" type="number" min="1" step="1" value="100" placeholder="Leave blank for the whole folder">
+        </div>
+        <p class="text-sm opacity-70">Stop after this many new e-mails have been saved and categorized. E-mails that are already stored are skipped and do not count, so running the same parse again continues with the next batch. Leave blank to process the whole folder in one go.</p>
+      </div>
       <label for="assigned-category">Assign following category for all e-mails in folder. Leave blank for automatic category detection.</label>
         <div class="form-control">
           <select class="select" name="assigned-category">
@@ -109,6 +123,45 @@
     {% include "admin-provider.html" %}
   </div>
 </div>
+
+{% if parse-batches|not-empty %}
+<div class="my-8">
+  <h4 class="text-lg">Recent Folder Parse Runs</h4>
+  {% if parse-running? %}<p class="text-sm opacity-70">A run is in progress; this page reloads every 10 seconds until it has finished.</p>{% endif %}
+  <div class="overflow-x-auto">
+    <table class="table table-zebra table-sm">
+      <thead>
+        <tr>
+          <th>Started</th>
+          <th>Folder</th>
+          <th>Status</th>
+          <th class="text-right">Batch size</th>
+          <th class="text-right">New</th>
+          <th class="text-right">Skipped</th>
+          <th class="text-right">Errors</th>
+          <th class="text-right">Not examined</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for batch in parse-batches %}
+        <tr>
+          <td>{{batch.started}}</td>
+          <td>{{batch.folder}}</td>
+          <td>{% if batch.status = "running" %}<span class="badge badge-warning">running</span>{% else %}{% if batch.status = "aborted" %}<span class="badge badge-error">aborted</span>{% else %}<span class="badge badge-success">finished</span>{% endif %}{% endif %}</td>
+          <td class="text-right">{{batch.batch-size|default:"all"}}</td>
+          <td class="text-right">{{batch.processed}}</td>
+          <td class="text-right">{{batch.skipped}}</td>
+          <td class="text-right">{{batch.errors}}</td>
+          <td class="text-right">{{batch.remaining}}</td>
+          <td>{% if batch.processed > 0 %}<a class="link link-primary" href="{{batch.emails-url}}">Review e-mails</a>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
   <script>
     document.addEventListener('DOMContentLoaded', () => {

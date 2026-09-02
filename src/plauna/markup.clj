@@ -231,9 +231,22 @@
   ([connections] (render "admin-connections.html" {:configs connections :active-nav :admin}))
   ([connections messages] (render "admin-connections.html" {:configs connections :active-nav :admin :messages (mapv type->toast-role messages)})))
 
+(defn- format-parse-batch
+  "Human-readable timestamps for a folder parse run row on the connection page."
+  [batch]
+  (assoc batch
+         :started (some-> (:started-at batch) timestamp->date str (str/replace "T" " ") (subs 0 16))
+         :finished (some-> (:finished-at batch) timestamp->date str (str/replace "T" " ") (subs 0 16))))
+
+(defn- connection-context [config folders categories]
+  (merge config {:folders folders
+                 :active-nav :admin
+                 :categories (cons nil categories)
+                 :parse-batches (mapv format-parse-batch (:parse-batches config))}))
+
 (defn connection
-  ([config folders categories] (render "admin-connection.html" (merge config {:folders folders :active-nav :admin :categories (cons nil categories)})))
-  ([config folders messages categories] (render "admin-connection.html" (merge config {:folders folders :messages (mapv type->toast-role messages) :active-nav :admin :categories (cons nil categories)}))))
+  ([config folders categories] (render "admin-connection.html" (connection-context config folders categories)))
+  ([config folders messages categories] (render "admin-connection.html" (assoc (connection-context config folders categories) :messages (mapv type->toast-role messages)))))
 
 (defn preferences-page
   ([data] (preferences-page data nil))

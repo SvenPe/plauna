@@ -430,3 +430,38 @@
       (is (= [[:contacts participants]
               [:communications participants]]
              @calls)))))
+
+(deftest parse-batch-size-accepts-only-positive-integers
+  (is (= 100 (server/parse-batch-size "100")))
+  (is (= 5 (server/parse-batch-size " 5 ")))
+  (is (nil? (server/parse-batch-size "")) "Blank means the whole folder")
+  (is (nil? (server/parse-batch-size nil)))
+  (is (nil? (server/parse-batch-size "abc")))
+  (is (nil? (server/parse-batch-size "0")))
+  (is (nil? (server/parse-batch-size "-3"))))
+
+(deftest folder-parse-summary-message-explains-the-next-step
+  (let [full-batch (server/folder-parse-summary-message {:folder "Old" :processed 100 :skipped 250 :errors 0 :remaining 1234 :batch-size 100})
+        finished (server/folder-parse-summary-message {:folder "Old" :processed 12 :skipped 88 :errors 0 :remaining 0 :batch-size 100})
+        with-errors (server/folder-parse-summary-message {:folder "Old" :processed 1 :skipped 0 :errors 2 :remaining 0 :batch-size nil})]
+    (is (= :success (:type full-batch)))
+    (is (str/includes? (:content full-batch) "100 new e-mail(s)"))
+    (is (str/includes? (:content full-batch) "250 already stored"))
+    (is (str/includes? (:content full-batch) "1234 older e-mail(s) were not examined"))
+    (is (str/includes? (:content full-batch) "run the parse again"))
+    (is (str/includes? (:content finished) "examined completely"))
+    (is (= :info (:type with-errors)))
+    (is (str/includes? (:content with-errors) "2 could not be read"))
+    (is (not (str/includes? (:content with-errors) "examined completely")) "No batch size: the batch note is left out")))
+
+(deftest folder-parse-summary-message-links-to-the-batch-review
+  (let [with-emails (server/folder-parse-summary-message {:folder "Old" :processed 3 :skipped 0 :errors 0 :remaining 0 :batch-size 100 :batch-id "run-1"})
+        nothing-new (server/folder-parse-summary-message {:folder "Old" :processed 0 :skipped 50 :errors 0 :remaining 0 :batch-size 100 :batch-id "run-2"})]
+    (is (= "/emails?batch=run-1" (:link with-emails)))
+    (is (= "Review this batch" (:link-text with-emails)))
+    (is (nil? (:link nothing-new)) "A run that saved nothing has nothing to review")))
+
+(deftest emails-template-accepts-the-batch-parameter
+  (let [parse-fn (server/template->request-parameters server/emails-template)]
+    (is (= "run-1" (:batch (parse-fn {:batch "run-1"}))))
+    (is (nil? (:batch (parse-fn {}))))))

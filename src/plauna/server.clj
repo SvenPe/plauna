@@ -490,7 +490,8 @@
                       :category-ids-exclude {:default nil :type-fn vectorize}
                       :category-ids-none {:default nil :type-fn identity}
                       :date-from {:default nil :type-fn identity}
-                      :date-to {:default nil :type-fn identity}})
+                      :date-to {:default nil :type-fn identity}
+                      :batch {:default nil :type-fn identity}})
 
 (defn template->request-parameters [template]
   (fn [rp] (reduce (fn [acc [k v]] (if (contains? rp k)
@@ -567,6 +568,63 @@
   (connect-control-response context request id))
 
 (defn empty-global-messages [] (reset! global-messages []))
+
+(defn parse-batch-size
+  "Parse the optional batch-size field of the folder parse form. Blank, non-numeric or non-positive
+   input means 'no limit' (process the whole folder), matching the behaviour before the field existed."
+  [value]
+  (let [parsed (try (Integer/parseInt (st/trim (str value))) (catch NumberFormatException _ nil))]
+    (when (and parsed (pos? parsed)) parsed)))
+
+(defn batch-emails-url [batch-id] (str "/emails?batch=" batch-id))
+
+(defn folder-parse-summary-message
+  "Turn the summary of a finished folder parse into a toast for the next page load. The remaining count
+   tells the user whether another run of the same batch is needed; the link opens the e-mails this run
+   saved so their detected categories can be checked right away."
+  [{:keys [folder processed skipped errors remaining batch-size batch-id]}]
+  (let [remaining-text (cond
+                         (pos? remaining) (str " " remaining " older e-mail(s) were not examined because the batch of " batch-size " was full - run the parse again to continue.")
+                         (some? batch-size) " The folder has been examined completely; there is nothing left for another batch."
+                         :else "")]
+    (cond-> {:type (if (pos? errors) :info :success)
+             :content (str "Finished parsing " folder ": " processed " new e-mail(s) saved and categorized, "
+                           skipped " already stored e-mail(s) skipped"
+                           (when (pos? errors) (str ", " errors " could not be read (see the logs)"))
+                           "." remaining-text)}
+      (and (some? batch-id) (pos? processed)) (assoc :link (batch-emails-url batch-id)
+                                                     :link-text "Review this batch"))))
+
+(defn- start-folder-parse!
+  "Register a parse run, start it and return the number of messages in the folder. The run's summary
+   is stored when the background thread finishes and surfaced as a toast with a review link."
+  [context id folder move? batch-size assigned-category]
+  (let [batch-id (.toString (UUID/randomUUID))
+        conn-data (client/connection-data-from-id id)]
+    (db/create-parse-batch! {:id batch-id :connection-id id :folder folder :batch-size batch-size})
+    (try
+      (app/read-emails-from-folder conn-data folder
+                                   {:move? move?
+                                    :batch-size batch-size
+                                    :batch-id batch-id
+                                    :assigned-category (:name assigned-category)
+                                    :assigned-category-id (:id assigned-category)
+                                    :on-complete (fn [summary]
+                                                   (db/finish-parse-batch! batch-id summary)
+                                                   (add-to-messages (folder-parse-summary-message (assoc summary :batch-id batch-id))))}
+                                   context)
+      (catch Exception e
+        ;; Opening the folder failed before any thread started: close the run so it is not shown as running.
+        (db/finish-parse-batch! batch-id {})
+        (throw e)))))
+
+(defn connection-parse-batches
+  "The recent folder parse runs of a connection for the connection page, plus whether one is running."
+  [id]
+  (let [batches (mapv (fn [batch] (assoc batch :emails-url (batch-emails-url (:id batch))))
+                      (db/parse-batches-for-connection id 10))]
+    {:parse-batches batches
+     :parse-running? (boolean (some #(= "running" (:status %)) batches))}))
 
 (defn recategorize-email-response
   "Handle an inline category change. A missing IMAP message is reported separately so the browser
@@ -988,7 +1046,7 @@
        (db/update-auth-provider (auth-provider-update-from-params params existing))))
 
    (comp/GET "/admin/connections/:id" [id]
-     (let [conn-info (connection-information id)
+     (let [conn-info (merge (connection-information id) (connection-parse-batches id))
            providers (without-provider-secrets (db/get-auth-providers))
            categories (db/get-categories)]
        (if (seq @global-messages)
@@ -1012,10 +1070,14 @@
              (= "parse" operation) (let [params (:params request)
                                          folder (:folder params)
                                          move (some? (:move params))
+                                         batch-size (parse-batch-size (:batch-size params))
                                          assigned-category (when-not (st/blank? (:assigned-category params)) (db/category-by-id (:assigned-category params)))
-                                         conn-data (client/connection-data-from-id id)
-                                         message-count (app/read-emails-from-folder conn-data folder {:move? move :assigned-category (:name assigned-category) :assigned-category-id (:id assigned-category)} context)]
-                                     (swap! global-messages (fn [mess] (conj mess {:type :success :content (str "Started parsing " folder " asynchronously. There are " message-count " emails in the folder. Move folders after parsing: " move)})))
+                                         message-count (start-folder-parse! context id folder move batch-size assigned-category)]
+                                     (swap! global-messages (fn [mess] (conj mess {:type :success :content (str "Started parsing " folder " asynchronously. There are " message-count " emails in the folder. "
+                                                                                                                (if batch-size
+                                                                                                                  (str "Batch size: " batch-size " new e-mails; already stored e-mails are skipped and do not count. ")
+                                                                                                                  "Batch size: unlimited (whole folder). ")
+                                                                                                                "Move folders after parsing: " move)})))
                                      (redirect-request request)))))
 
    (comp/POST "/metadata/languages" request

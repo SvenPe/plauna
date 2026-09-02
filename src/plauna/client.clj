@@ -712,4 +712,9 @@
       (set-message-as-peek message)
       (t/log! :debug ["Reading message number" n "from" (.getName ^IMAPFolder folder)])
       {:email (message->email message)
-       :message message})))
+       :message message}))
+  (nth-message-id-from-folder [_ n folder]
+    ;; getMessageID only loads the envelope, not the body, so this stays cheap for known messages.
+    (let [^IMAPMessage message (.getMessage ^IMAPFolder folder n)]
+      (set-message-as-peek message)
+      (.getMessageID message))))

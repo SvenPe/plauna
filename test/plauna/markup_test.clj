@@ -180,3 +180,27 @@
       (is (str/includes? html "data-applied-checked=\"false\""))
       (is (not (str/includes? html "onchange=\"document.getElementById('page-form').submit()\"")))))
   "Column-filter edits stay local until Apply and active filters remain visible above the table")
+
+(deftest connection-page-lists-parse-runs-with-review-links
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/connection
+                {:id "connection-1" :host "imap.example.com" :user "me@example.com"
+                 :parse-batches [{:id "run-1" :folder "Old" :status "finished" :batch-size 100
+                                  :processed 100 :skipped 20 :errors 0 :remaining 300
+                                  :started-at 1756800000 :finished-at 1756800600
+                                  :emails-url "/emails?batch=run-1"}
+                                 {:id "run-2" :folder "Old" :status "running" :batch-size 100
+                                  :processed 0 :skipped 0 :errors 0 :remaining 0
+                                  :started-at 1756801000 :finished-at nil
+                                  :emails-url "/emails?batch=run-2"}]
+                 :parse-running? true}
+                []
+                [])]
+      (is (str/includes? html "Recent Folder Parse Runs"))
+      (is (str/includes? html "href=\"/emails?batch=run-1\""))
+      (is (not (str/includes? html "href=\"/emails?batch=run-2\"")) "A run without new e-mails offers no review link")
+      (is (str/includes? html "http-equiv=\"refresh\"") "The page reloads while a run is in progress")))
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/connection {:id "connection-1" :host "h" :user "u" :parse-batches [] :parse-running? false} [] [])]
+      (is (not (str/includes? html "Recent Folder Parse Runs")))
+      (is (not (str/includes? html "http-equiv=\"refresh\""))))))

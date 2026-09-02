@@ -156,3 +156,37 @@
       (is (= #{cat-a} reachable) "Only the category reachable through the sender-scoped where-clause is returned")
       (is (contains? unscoped cat-a))
       (is (contains? unscoped cat-b) "Without a scoping where-clause, every category is reachable"))))
+
+(deftest parse-batch-round-trip
+  (db/create-parse-batch! {:id "batch-1" :connection-id "conn-1" :folder "Old" :batch-size 100})
+  (db/save-headers [{:mime-type "text/plain" :subject "in batch" :message-id "batch-mail-1" :date 0 :in-reply-to nil}
+                    {:mime-type "text/plain" :subject "in batch too" :message-id "batch-mail-2" :date 0 :in-reply-to nil}])
+  (db/record-parse-batch-email! "batch-1" "batch-mail-1")
+  (db/record-parse-batch-email! "batch-1" "batch-mail-1")
+  (db/record-parse-batch-email! "batch-1" "batch-mail-2")
+  (let [running (db/parse-batch "batch-1")]
+    (is (= "running" (:status running)))
+    (is (some? (:started-at running)))
+    (is (nil? (:finished-at running))))
+  (is (= 2 (db/parse-batch-email-count "batch-1")) "Recording the same e-mail twice stores it once")
+  (db/finish-parse-batch! "batch-1" {:processed 2 :skipped 5 :errors 1 :remaining 40})
+  (let [finished (db/parse-batch "batch-1")]
+    (is (= "finished" (:status finished)))
+    (is (= [2 5 1 40] ((juxt :processed :skipped :errors :remaining) finished)))
+    (is (some? (:finished-at finished))))
+  (is (= ["batch-1"] (mapv :id (db/parse-batches-for-connection "conn-1" 10))))
+  (is (empty? (db/parse-batches-for-connection "other-conn" 10)))
+  ;; The e-mail list's batch filter is a subquery on parse_batch_emails.
+  (is (= ["batch-mail-1" "batch-mail-2"]
+         (sort (map :message-id (db/fetch-headers {:entity :enriched-email :strict false}
+                                                   {:where [:in :headers.message-id {:select [:parse-batch-emails.message-id]
+                                                                                     :from [:parse-batch-emails]
+                                                                                     :where [:= :parse-batch-emails.batch-id "batch-1"]}]}))))))
+
+(deftest abort-running-parse-batches-marks-only-running-runs
+  (db/create-parse-batch! {:id "batch-running" :connection-id "conn-2" :folder "A" :batch-size nil})
+  (db/create-parse-batch! {:id "batch-done" :connection-id "conn-2" :folder "B" :batch-size 10})
+  (db/finish-parse-batch! "batch-done" {:processed 1})
+  (db/abort-running-parse-batches!)
+  (is (= "aborted" (:status (db/parse-batch "batch-running"))))
+  (is (= "finished" (:status (db/parse-batch "batch-done")))))

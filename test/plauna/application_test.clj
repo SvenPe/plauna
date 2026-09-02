@@ -362,6 +362,7 @@
                    {:message-count 3 :connection-id "test-connection" :folder :test-folder})
                  (close-folder-for-bulk-read [_ _] nil)
                  (current-folder-name [_ folder] (str folder))
+                 (nth-message-id-from-folder [_ _ _] nil)
                  (nth-email-from-folder [_ n _]
                    (swap! read-attempts conj n)
                    (if (= n 2)
@@ -393,6 +394,7 @@
                    {:message-count 10 :connection-id "test-connection" :folder :test-folder})
                  (close-folder-for-bulk-read [_ _] nil)
                  (current-folder-name [_ folder] (str folder))
+                 (nth-message-id-from-folder [_ _ _] nil)
                  (nth-email-from-folder [_ n _]
                    (swap! read-attempts conj n)
                    {:email {:header {:subject (str "email-" n)}} :message n}))
@@ -414,6 +416,149 @@
     (is (= [10 9 8] @read-attempts))
     (is (= ["email-10" "email-9" "email-8"] @saved-subjects)))
   "With :limit N, only the N most recent messages (highest sequence numbers) are processed — the reconnect back-fill's bounded catch-up.")
+
+(defn- batch-test-client
+  "A folder of message-count messages whose Message-IDs are id-<n>. Full reads are recorded in
+   full-reads; Message-ID lookups in id-reads."
+  [message-count full-reads id-reads]
+  (reify int/EmailClient
+    (open-folder-for-bulk-read [_ _ _]
+      {:message-count message-count :connection-id "test-connection" :folder :test-folder})
+    (close-folder-for-bulk-read [_ _] nil)
+    (current-folder-name [_ folder] (str folder))
+    (nth-message-id-from-folder [_ n _]
+      (swap! id-reads conj n)
+      (str "id-" n))
+    (nth-email-from-folder [_ n _]
+      (swap! full-reads conj n)
+      {:email {:header {:message-id (str "id-" n) :subject (str "email-" n)}} :message n})))
+
+(defn- await-summary [summary]
+  (deref summary 2000 ::timeout))
+
+(deftest read-emails-from-folder-batch-size-stops-after-n-new-emails
+  (let [full-reads (atom [])
+        id-reads (atom [])
+        saved (atom [])
+        recorded-folders (atom [])
+        summary (promise)
+        client (batch-test-client 10 full-reads id-reads)
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category "test"})))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ email] (swap! saved conj (-> email :header :message-id)))
+             (update-email-folder [_ message-id folder] (swap! recorded-folders conj [message-id folder])))]
+    (is (= 10 (app/read-emails-from-folder {} "Old" {:move? false :batch-size 3 :on-complete #(deliver summary %)}
+                                           {:client client :analyzer analyzer :db db})))
+    (let [result (await-summary summary)]
+      (is (= [10 9 8] @full-reads) "Only the first three (newest) unknown messages are read in full")
+      (is (= ["id-10" "id-9" "id-8"] @saved))
+      (is (= [["id-10" ":test-folder"] ["id-9" ":test-folder"] ["id-8" ":test-folder"]] @recorded-folders)
+          "Without move, the e-mails stay in their folder and that folder is recorded")
+      (is (= {:folder "Old" :message-count 10 :batch-size 3 :processed 3 :skipped 0 :errors 0 :examined 3 :remaining 7}
+             result))))
+  "With :batch-size N the parse stops after N newly saved e-mails and reports how many were left unexamined.")
+
+(deftest read-emails-from-folder-records-newly-saved-emails-under-the-batch-id
+  (let [full-reads (atom [])
+        id-reads (atom [])
+        recorded (atom [])
+        summary (promise)
+        client (batch-test-client 5 full-reads id-reads)
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        db (reify int/DB
+             (email-exists? [_ message-id] (= "id-4" message-id))
+             (save-email [_ _] nil)
+             (record-parse-batch-email [_ batch-id message-id] (swap! recorded conj [batch-id message-id]))
+             (update-email-folder [_ _ _] nil))]
+    (app/read-emails-from-folder {} "Old" {:move? false :batch-size 2 :batch-id "run-1" :on-complete #(deliver summary %)}
+                                 {:client client :analyzer analyzer :db db})
+    (await-summary summary)
+    (is (= [["run-1" "id-5"] ["run-1" "id-3"]] @recorded)
+        "Only e-mails this run saved are recorded; the known one is skipped and the batch stops after two"))
+  "The batch id collects exactly the newly saved e-mails so the run can be reviewed afterwards.")
+
+(deftest fetch-emails-applies-batch-filter
+  (let [captured (atom nil)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
+             (fetch-parse-batch [_ id] (when (= "run-1" id) {:id id :folder "Old" :processed 100}))
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))
+        result (app/fetch-emails {:db db} {:batch "run-1" :size 20})]
+    (is (= [:in :headers.message-id {:select [:parse-batch-emails.message-id]
+                                     :from [:parse-batch-emails]
+                                     :where [:= :parse-batch-emails.batch-id "run-1"]}]
+           (:where @captured)))
+    (is (true? (get-in result [:parameters :batch-active?])))
+    (is (true? (get-in result [:parameters :any-filter-active?])))
+    (is (= "run-1" (get-in result [:parameters :batch])))
+    (is (= "Batch: Old (100 new)" (get-in result [:parameters :batch-filter-label])))))
+
+(deftest fetch-emails-ignores-blank-batch
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})
+        result (app/fetch-emails {:db db} {:batch "" :size 20})]
+    (is (nil? (:where @captured)))
+    (is (false? (get-in result [:parameters :batch-active?])))
+    (is (nil? (get-in result [:parameters :batch])))))
+
+(deftest read-emails-from-folder-batch-size-skips-known-emails-without-counting-them
+  (let [full-reads (atom [])
+        id-reads (atom [])
+        saved (atom [])
+        summary (promise)
+        client (batch-test-client 10 full-reads id-reads)
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        ;; The previous batch already stored the four newest messages.
+        known #{"id-10" "id-9" "id-8" "id-7"}
+        db (reify int/DB
+             (email-exists? [_ message-id] (contains? known message-id))
+             (save-email [_ email] (swap! saved conj (-> email :header :message-id)))
+             (update-email-folder [_ _ _] nil))]
+    (app/read-emails-from-folder {} "Old" {:move? false :batch-size 3 :on-complete #(deliver summary %)}
+                                 {:client client :analyzer analyzer :db db})
+    (let [result (await-summary summary)]
+      (is (= [10 9 8 7 6 5 4] @id-reads) "Every visited message is identified by its Message-ID first")
+      (is (= [6 5 4] @full-reads) "Known messages are never downloaded in full")
+      (is (= ["id-6" "id-5" "id-4"] @saved) "The batch continues where the previous one stopped")
+      (is (= {:processed 3 :skipped 4 :errors 0 :examined 7 :remaining 3}
+             (select-keys result [:processed :skipped :errors :examined :remaining])))))
+  "Already stored e-mails are skipped cheaply and do not use up the batch, so repeated runs walk through the folder.")
+
+(deftest read-emails-from-folder-without-batch-size-processes-everything
+  (let [full-reads (atom [])
+        id-reads (atom [])
+        summary (promise)
+        client (batch-test-client 4 full-reads id-reads)
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        db (reify int/DB
+             (email-exists? [_ message-id] (= "id-2" message-id))
+             (save-email [_ _] nil)
+             (update-email-folder [_ _ _] nil))]
+    (app/read-emails-from-folder {} "Old" {:move? false :on-complete #(deliver summary %)}
+                                 {:client client :analyzer analyzer :db db})
+    (let [result (await-summary summary)]
+      (is (= [4 3 1] @full-reads))
+      (is (= {:processed 3 :skipped 1 :errors 0 :examined 4 :remaining 0 :batch-size nil}
+             (select-keys result [:processed :skipped :errors :examined :remaining :batch-size])))))
+  "Without a batch size the whole folder is examined, as before.")
+
+(deftest read-emails-from-folder-empty-folder-reports-completion
+  (let [summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 0 :connection-id "c" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil))]
+    (is (= 0 (app/read-emails-from-folder {} "Empty" {:batch-size 100 :on-complete #(deliver summary %)} {:client client})))
+    (is (= {:folder "Empty" :message-count 0 :batch-size 100 :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0}
+           (await-summary summary)))))
 
 (deftest fetch-emails-applies-date-filter
   (let [captured (atom nil)

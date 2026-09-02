@@ -362,6 +362,59 @@
                                                   :from   :metadata
                                                   :where  [:= :message-id message-id]}) builder-function)))
 
+(defn- epoch-seconds [] (quot (System/currentTimeMillis) 1000))
+
+(defn create-parse-batch!
+  "Register a manual folder parse run before it starts, so its e-mails can be collected under one id."
+  [{:keys [id connection-id folder batch-size]}]
+  (jdbc/execute! (ds) (honey/format {:insert-into :parse-batches
+                                     :values [{:id id :connection-id connection-id :folder folder
+                                               :batch-size batch-size :status "running"
+                                               :started-at (epoch-seconds)}]})))
+
+(defn record-parse-batch-email!
+  "Remember that message-id was newly saved by the batch. Re-recording the same pair is a no-op."
+  [batch-id message-id]
+  (jdbc/execute! (ds) (insert->insert-ignore
+                       (honey/format {:insert-into :parse-batch-emails
+                                      :values [{:batch-id batch-id :message-id message-id}]}))))
+
+(defn finish-parse-batch!
+  "Store the final counts of a run and mark it finished."
+  [id {:keys [processed skipped errors remaining]}]
+  (jdbc/execute! (ds) (honey/format {:update :parse-batches
+                                     :set {:status "finished" :finished-at (epoch-seconds)
+                                           :processed (or processed 0) :skipped (or skipped 0)
+                                           :errors (or errors 0) :remaining (or remaining 0)}
+                                     :where [:= :id id]})))
+
+(defn abort-running-parse-batches!
+  "Called at startup: a run that was still 'running' when Plauna stopped can never finish, so mark it
+   aborted instead of showing it as running forever."
+  []
+  (jdbc/execute! (ds) (honey/format {:update :parse-batches
+                                     :set {:status "aborted" :finished-at (epoch-seconds)}
+                                     :where [:= :status "running"]})))
+
+(defn parse-batch [id]
+  (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-batches] :where [:= :id id]}) builder-function-kebab))
+
+(defn parse-batches-for-connection
+  "The most recent runs of a connection, newest first."
+  [connection-id limit]
+  (jdbc/execute! (ds) (honey/format {:select [:*] :from [:parse-batches]
+                                     :where [:= :connection-id connection-id]
+                                     :order-by [[:started-at :desc] [:id :desc]]
+                                     :limit limit}) builder-function-kebab))
+
+(defn parse-batch-email-count
+  "How many e-mails of a batch are still in the database (the e-mail list shows exactly these)."
+  [batch-id]
+  (:count (jdbc/execute-one! (ds) (honey/format {:select [[[:count :headers.message-id] :count]]
+                                                 :from [:parse-batch-emails]
+                                                 :join [:headers [:= :headers.message-id :parse-batch-emails.message-id]]
+                                                 :where [:= :parse-batch-emails.batch-id batch-id]}) builder-function)))
+
 (defn get-categories []
   (jdbc/execute! (ds) (honey/format {:select [:*] :from :categories}) builder-function))
 
@@ -794,6 +847,8 @@
   (update-category [_ id destination-folder color] (update-category id destination-folder color))
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (email-exists? [_ message-id] (email-exists? message-id))
+  (record-parse-batch-email [_ batch-id message-id] (record-parse-batch-email! batch-id message-id))
+  (fetch-parse-batch [_ id] (parse-batch id))
   (save-email [_ email]
     ;; One transaction per email, and failures propagate: a partially-saved email whose header
     ;; already exists would otherwise be skipped by every future backfill (see save-emails-in-buffer).

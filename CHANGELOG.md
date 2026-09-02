@@ -17,6 +17,17 @@ All notable changes to this project will be documented in this file.
 - Require a configurable login name in addition to the web UI password. Existing and new
   installations default to `root`; administrators can change the case-sensitive name under Login
   Settings after re-entering the current password.
+- Parse IMAP folders in batches: the "Parse E-mails from Folders" form has a "Batch size" field
+  (default 100) that stops a run after that many newly saved e-mails. Already stored e-mails are
+  recognised by their Message-ID alone, skipped without downloading the body again and do not count
+  towards the batch, so repeating the same parse continues with the next batch. When a run finishes,
+  a message reports how many e-mails were saved, skipped, failed and how many older e-mails remain
+  unexamined. Leaving the field blank processes the whole folder as before.
+- Review a folder parse run right after it finishes: each run is stored with its counts and the
+  e-mails it saved, listed under "Recent Folder Parse Runs" on the connection page (which reloads
+  while a run is in progress), and both the finished message and the table link to the E-mails page
+  filtered to exactly those e-mails. The batch filter is a removable chip that combines with the
+  other filters. Runs interrupted by a restart are marked as aborted.
 
 ## [2026-07-10.0] - 2026-07-10
 

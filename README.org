@@ -30,7 +30,7 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Upload data from mbox archives.
 
-- Read e-mails directly from IMAP folders.
+- Read e-mails directly from IMAP folders, optionally in place (without moving them) and in batches of a configurable size, so a large archive folder can be categorized step by step.
 
 - Login-name-and-password-protected web UI (the login name defaults to =root=; the password can be set via an environment variable, changed in the UI, or auto-generated on first launch).
 
@@ -347,6 +347,12 @@ When you start Plauna, it starts a web server on the port which you specified (d
 1. Go to "Admin". Under "Parse E-mails from Mbox", select an mbox file and click "Upload". You can see your e-mails under the "E-mails" tab shortly afterwards.
 
 2. Go to "Admin" → "IMAP Connections", open an account, select a folder under "Parse E-mails from Folders", decide whether the messages should be moved after categorization, and click "Parse E-mails". You may also assign one category to the whole folder instead of using automatic category detection.
+
+   Leave "Move e-mails after categorization" unchecked to categorize the messages in place: they stay in the selected folder (their location is recorded so a later recategorization can still find them), only Plauna's database learns their category.
+
+   The "Batch size" field (default 100) limits one run to that many /new/ e-mails. Plauna walks the folder from the newest message to the oldest, identifies each message by its Message-ID first and skips e-mails that are already stored without downloading them again - skipped e-mails do not use up the batch. Once the batch is full, a message reports how many e-mails were saved, how many were skipped and how many older e-mails are still unexamined. Simply run the same parse again to continue with the next batch. Leave the field blank to process the whole folder in one go.
+
+   Every run is listed under "Recent Folder Parse Runs" on the connection page, which reloads itself while a run is in progress. As soon as a run has finished, both the summary message and the table offer a "Review" link that opens the E-mails page filtered to exactly the e-mails this run saved, so their detected categories can be checked and corrected inline while they are still fresh. The batch filter appears as a removable chip and combines with the other filters, e.g. with "E-mails without A Category Only" to see which e-mails of the batch the model could not assign. A run that was still in progress when Plauna was stopped is shown as aborted; its e-mails are kept, and running the parse again continues after them.
 
 3. Just leave Plauna running and watch it save your e-mails. Beware: Depending on how many e-mails you receive on any given day, this method may be very slow.
 

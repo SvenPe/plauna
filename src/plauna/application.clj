@@ -230,6 +230,23 @@
 
       :else nil)))
 
+(defn- batch->where
+  "Restrict the list to the e-mails newly saved by one folder parse run (see read-emails-from-folder's
+   :batch-id). Fully qualified column names: the :message-id shorthand is rewritten to headers.message_id
+   by the database layer, which would break inside this subquery."
+  [batch-id]
+  (when-not (str/blank? batch-id)
+    [:in :headers.message-id {:select [:parse-batch-emails.message-id]
+                              :from [:parse-batch-emails]
+                              :where [:= :parse-batch-emails.batch-id batch-id]}]))
+
+(defn- batch-filter-label
+  "Chip text for an active batch filter; falls back to the bare id when the run is unknown."
+  [db batch-id]
+  (let [batch (when-not (str/blank? batch-id) (int/fetch-parse-batch db batch-id))]
+    (cond (nil? batch) (str "Batch: " batch-id)
+          :else (str "Batch: " (:folder batch) " (" (:processed batch) " new)"))))
+
 (defn- success-result [result-type data] (conj {:result result-type} data))
 
 (defn- error-result [exception alert-content] {:result :error :exception exception :message {:type :alert :content alert-content}})
@@ -339,6 +356,7 @@
   (let [date-filter-active? (some? date-filter)]
     (combine-wheres
      [date-filter
+      (batch->where (:batch parameters))
       (filter->where (:filter parameters))
       (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
       (when-not (= excluding :subject) (subject-values->where subject-selection))
@@ -385,7 +403,9 @@
         subject-list (annotate-checked-by (int/fetch-distinct-subjects db (other-where :subject category-selection subject-selection from-selection to-selection)) subject-selection :subject)
         sender-list (annotate-checked-by (int/fetch-distinct-senders db (other-where :from category-selection subject-selection from-selection to-selection)) from-selection :contact_key)
         recipient-list (annotate-checked-by (int/fetch-distinct-recipients db (other-where :to category-selection subject-selection from-selection to-selection)) to-selection :contact_key)
+        batch-where (batch->where (:batch parameters))
         where (combine-wheres [date-filter
+                               batch-where
                                (filter->where (:filter parameters))
                                (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
                                (subject-values->where subject-selection)
@@ -404,9 +424,13 @@
           category-active? (selection-filter-active? category-selection)
           search-active? (not (str/blank? (:search-text parameters)))
           date-active? (some? date-filter)
+          batch-active? (some? batch-where)
           metadata-active? (contains? #{"enriched-only" "without-category"} (:filter parameters))]
       {:data (:data result)
        :parameters {:filter (:filter parameters)
+                  :batch (when batch-active? (:batch parameters))
+                  :batch-active? batch-active?
+                  :batch-filter-label (when batch-active? (batch-filter-label db (:batch parameters)))
                   :total-pages (page/calculate-pages-total (:total result) (:size page-req))
                   :size (:size page-req)
                   :page (:page result)
@@ -441,7 +465,7 @@
                   :search-active? search-active?
                   :date-active? date-active?
                   :metadata-active? metadata-active?
-                  :any-filter-active? (boolean (or search-active? date-active? metadata-active?
+                  :any-filter-active? (boolean (or search-active? date-active? metadata-active? batch-active?
                                                    subject-active? from-active? to-active? category-active?))}
        :optional {:categories cat-list :category-filter-options category-filter-options
                   :subjects subject-list :senders sender-list :recipients recipient-list}})))
@@ -520,73 +544,133 @@
           (record-current-folder!)
           :na))))
 
-(defn- incoming-email-workflow [email-message connection-id folder {:keys [move? assigned-category assigned-category-id]} {:keys [analyzer db] :as context}]
+(defn- incoming-email-workflow
+  "Save, categorize and (optionally) move one freshly read message. Returns {:status :skipped} when the
+   message is already stored, otherwise {:status :processed :move <move-message result>}."
+  [email-message connection-id folder {:keys [move? assigned-category assigned-category-id]} {:keys [analyzer db] :as context}]
   (let [message-id (-> email-message :email :header :message-id)]
     (if (int/email-exists? db message-id)
-      (t/log! :info ["Email" message-id "already in database — skipping re-categorization"])
+      (do (t/log! :info ["Email" message-id "already in database — skipping re-categorization"])
+          {:status :skipped})
       (if (some? assigned-category)
         (let [language-result (int/detect-language analyzer (:email email-message))
               enriched-email (core-email/construct-enriched-email (:email email-message) {:language (:code language-result) :language-confidence (:confidence language-result)} {:category assigned-category :category-id assigned-category-id :category-confidence 1})]
           (int/save-email db enriched-email)
           (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
-          (move-message move? folder connection-id email-message assigned-category context))
+          {:status :processed :move (move-message move? folder connection-id email-message assigned-category context)})
         (let [enriched-email (int/enrich-email analyzer (:email email-message))
               category (:category (:metadata enriched-email))]
           (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was categorized as" category])
           (int/save-email db enriched-email)
           (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
-          (move-message move? folder connection-id email-message category context))))))
+          {:status :processed :move (move-message move? folder connection-id email-message category context)})))))
 
 (defn handle-incoming-imap-email
   "Handle incoming emails synchronously on a single thread. Returns a result."
   [parsed-email {:keys [connection-id origin-folder message] :as options} context]
   (try (let [process-result (incoming-email-workflow {:email parsed-email :message message} connection-id origin-folder options context)]
-         (success-result :ok {:move process-result}))
+         (success-result :ok {:move (:move process-result)}))
        (catch Exception e (error-result e "Error encountered when processing incoming email"))))
 
-(defn- process-nth-email-from-folder [client n folder-name folder options context messages-result]
+(defn- process-nth-email-from-folder
+  "Process message number n of a folder opened for bulk reading. Returns :processed, :skipped or :error.
+   The Message-ID is read on its own first: an already stored message is recognised from that one
+   small header fetch, so re-scanning a folder that is mostly known does not download every body again."
+  [client n folder-name folder options {:keys [db] :as context} messages-result]
   (try
-    (let [email-message (int/nth-email-from-folder client n folder)]
-      (incoming-email-workflow email-message (:connection-id messages-result) folder options context))
+    (let [known-message-id (int/nth-message-id-from-folder client n folder)]
+      (if (and (some? known-message-id) (int/email-exists? db known-message-id))
+        (do (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping"])
+            :skipped)
+        (let [email-message (int/nth-email-from-folder client n folder)
+              {:keys [status]} (incoming-email-workflow email-message (:connection-id messages-result) folder options context)]
+          ;; Membership is recorded only for e-mails this run actually saved, so the batch view shows
+          ;; exactly what needs reviewing.
+          (when (and (= :processed status) (some? (:batch-id options)))
+            (int/record-parse-batch-email db (:batch-id options) (-> email-message :email :header :message-id)))
+          status)))
     (catch Exception e
       (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
-      (error-result e "Error encountered when reading email from folder"))))
+      :error)))
+
+(defn- empty-folder-summary [folder-name message-count batch-size]
+  {:folder folder-name :message-count message-count :batch-size batch-size
+   :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0})
+
+(defn- process-folder-messages!
+  "Walk the sequence numbers of a folder from newest to oldest and process each message, stopping
+   early once batch-size messages were newly saved. Returns the summary map."
+  [client folder-name folder options context bulk sequence-numbers summary]
+  (let [batch-size (:batch-size options)]
+    (loop [remaining-numbers sequence-numbers
+           summary summary]
+      (cond
+        (empty? remaining-numbers)
+        (assoc summary :remaining 0)
+
+        (and (some? batch-size) (>= (:processed summary) batch-size))
+        (assoc summary :remaining (count remaining-numbers))
+
+        :else
+        (let [n (first remaining-numbers)
+              outcome (process-nth-email-from-folder client n folder-name folder options context bulk)
+              counter (case outcome :processed :processed :skipped :skipped :errors)]
+          (recur (rest remaining-numbers)
+                 (-> summary (update counter inc) (update :examined inc))))))))
 
 (defn read-emails-from-folder
   "Read emails from a folder and process them. Returns the number of messages in the folder.
    Emails are read over a DEDICATED IMAP connection (separate from the IDLE monitor, so the two never
    contend for the same folder/connection) and processed on another thread.
 
-   options may include :limit N to process only the N most recent messages (the highest sequence
-   numbers) instead of the whole folder. The reconnect back-fill uses this so a large mailbox isn't
-   fully re-scanned every time; already-saved messages are skipped either way (see
-   incoming-email-workflow), so a bounded scan still catches up every genuinely-missed message within
-   the window."
+   options may include:
+   - :limit N to process only the N most recent messages (the highest sequence numbers) instead of the
+     whole folder. The reconnect back-fill uses this so a large mailbox isn't fully re-scanned every
+     time; already-saved messages are skipped either way (see incoming-email-workflow), so a bounded
+     scan still catches up every genuinely-missed message within the window.
+   - :batch-size N to stop after N messages were NEWLY saved and categorized. Already stored messages
+     do not count towards the batch, so repeating the same parse works through a large folder in
+     batches of N: each run skips what earlier runs stored and continues with the next N unknown
+     messages.
+   - :batch-id, an identifier under which every NEWLY saved e-mail is recorded (int/record-parse-batch-email)
+     so the run can be reviewed afterwards as a filtered e-mail list.
+   - :on-complete, a function called with a summary map once the background thread has finished:
+     {:folder :message-count :batch-size :processed :skipped :errors :examined :remaining} where
+     :remaining is the number of (older) messages that were not examined because the batch was full."
   [connection-data folder-name options {:keys [client] :as context}]
   (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
         folder (:folder bulk)
         message-count (:message-count bulk)
         limit (:limit options)
+        batch-size (:batch-size options)
+        on-complete (or (:on-complete options) (fn [_] nil))
         ;; Lowest sequence number to process. With :limit, take only the top N (most recent) messages;
         ;; without it, everything down to 1. (Sequence numbers are 1-based; higher = more recent.)
         lowest (if limit (max 1 (- (inc message-count) limit)) 1)
-        to-process (inc (- message-count lowest))]
+        to-process (inc (- message-count lowest))
+        summary (empty-folder-summary folder-name message-count batch-size)]
     (if (> message-count 0)
       (do
-        (t/log! :info ["There are" message-count "emails in" folder-name "-" to-process "will get processed asynchronously"])
+        (t/log! :info ["There are" message-count "emails in" folder-name "-" to-process "will get processed asynchronously"
+                       (if batch-size (str "(stopping after " batch-size " newly saved emails)") "")])
         ;; Use async/thread (a real thread), not async/go: each email does blocking JDBC and IMAP work,
         ;; and a long blocking loop inside a go block would tie up a shared core.async dispatch thread.
         (async/thread
-          (try
-            ;; Iterate sequence numbers high -> low. When move? is enabled a processed message is moved
-            ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
-            ;; Going downward means the numbers we have not processed yet are never affected, so no
-            ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
-            (doseq [n (range message-count (dec lowest) -1)]
-              (process-nth-email-from-folder client n folder-name folder options context bulk))
-            (finally
-              (int/close-folder-for-bulk-read client bulk)))))
+          (let [result (try
+                         ;; Iterate sequence numbers high -> low. When move? is enabled a processed message is moved
+                         ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
+                         ;; Going downward means the numbers we have not processed yet are never affected, so no
+                         ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
+                         (process-folder-messages! client folder-name folder options context bulk
+                                                   (range message-count (dec lowest) -1) summary)
+                         (finally
+                           (int/close-folder-for-bulk-read client bulk)))]
+            (t/log! :info ["Finished parsing" folder-name "-" (:processed result) "new," (:skipped result) "already stored,"
+                           (:errors result) "failed," (:remaining result) "not examined"])
+            (try (on-complete result)
+                 (catch Exception e (t/log! {:level :error :error e} "The parse completion callback failed"))))))
       (do
         (int/close-folder-for-bulk-read client bulk)
-        (t/log! :info ["There are no emails in the folder. Doing nothing."])))
+        (t/log! :info ["There are no emails in the folder. Doing nothing."])
+        (on-complete summary)))
     message-count))

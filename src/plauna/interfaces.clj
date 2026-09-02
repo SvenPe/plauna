@@ -15,6 +15,8 @@
   (update-category [this id destination-folder color] "Set the IMAP folder that emails of this category should be moved to (a blank value restores the default 'Categories/<Name>' behaviour) and its display color.")
   (update-email-folder [this message-id folder] "Record the IMAP folder a message currently lives in.")
   (email-exists? [this message-id] "Return true if a header with this message-id is already in the database.")
+  (record-parse-batch-email [this batch-id message-id] "Remember that message-id was newly saved by the folder parse run batch-id.")
+  (fetch-parse-batch [this id] "Get one folder parse run by id, or nil.")
   (save-email [this email]))
 
 (defprotocol EmailClient
@@ -29,6 +31,7 @@
      failures such as a disconnected store.")
   (move-email-to-category [this connection-id original-message original-folder category])
   (nth-email-from-folder [this n folder])
+  (nth-message-id-from-folder [this n folder] "Return only the Message-ID of message number n in a folder (a cheap header fetch, without the body), or nil when the message has none.")
   (current-folder-name [this folder] "Return the full IMAP name of a folder object.")
   (open-folder-for-bulk-read [this connection-data folder-name] "Open folder-name on a dedicated Store connection, isolated from the IDLE monitor. Returns a handle {:folder :message-count :connection-id ...}.")
   (close-folder-for-bulk-read [this bulk-handle] "Close the dedicated connection opened by open-folder-for-bulk-read."))

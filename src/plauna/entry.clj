@@ -117,6 +117,8 @@
                    :fulltext-min-token-length (db/fulltext-min-token-length)
                    :analyzer (BasicAnalyzer.)}]
       (db/create-db)
+      ;; A folder parse that was still running when Plauna last stopped cannot resume; do not show it as running.
+      (db/abort-running-parse-batches!)
       (let [db-vals (into {} (map #(vector % (db/fetch-preference %))
                                   [:log-level :language-detection-threshold
                                    :categorization-threshold :client-health-check-interval
