@@ -3,6 +3,7 @@
             [honey.sql :as honey]
             [plauna.interfaces :as int]
             [taoensso.telemere :as t]
+            [plauna.core.email :as core-email]
             [plauna.application :as app]))
 
 (t/set-ns-filter! {:disallow "plauna.*"})
@@ -973,3 +974,42 @@
     (is (= {:batch-id "run-1" :total 4 :uncategorized 1 :moved 1 :not-found 1 :failed 2} summary))
     (is (= 4 (count @progress)) "Progress is reported after every attempted move")
     (is (= summary (last @progress)))))
+
+(deftest move-email-prefers-the-recorded-connection
+  (let [used (atom nil)
+        client (reify int/EmailClient
+                 (connections [_] {"masked" {:config {:id "masked"}} "real" {:config {:id "real"}}})
+                 (connection-id-for-email [_ _ _] "masked")
+                 (move-email-between-categories [_ connection-id _ _ _ _] (reset! used connection-id) true))
+        email {:header {:message-id "m-1"} :metadata {:category "old" :connection-id "real"}}
+        test-result (app/move-email-to-category email "new" {:client client})]
+    (is (= :ok (:result test-result)))
+    (is (= "real" @used) "The account recorded with the e-mail wins over the recipient-address guess")))
+
+(deftest move-email-falls-back-to-guessing-when-the-recorded-connection-is-gone
+  (let [used (atom nil)
+        client (reify int/EmailClient
+                 (connections [_] {"masked" {:config {:id "masked"}}})
+                 (connection-id-for-email [_ _ _] "masked")
+                 (move-email-between-categories [_ connection-id _ _ _ _] (reset! used connection-id) true))
+        email {:header {:message-id "m-1"} :metadata {:category "old" :connection-id "deleted-account"}}
+        test-result (app/move-email-to-category email "new" {:client client})]
+    (is (= :ok (:result test-result)))
+    (is (= "masked" @used) "A recorded account that is no longer active is ignored")))
+
+(deftest incoming-email-records-the-connection-it-arrived-on
+  (let [saved (atom [])
+        analyzer (reify int/Analyzer
+                   (enrich-email [_ email] (core-email/construct-enriched-email email {:language "eng" :language-confidence 0.9} {:category "test" :category-id 1 :category-confidence 0.8}))
+                   (detect-language [_ _] {:code "eng" :confidence 0.9}))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ email] (swap! saved conj email))
+             (update-email-folder [_ _ _] nil))
+        client (reify int/EmailClient (current-folder-name [_ folder] (str folder)))
+        context {:analyzer analyzer :db db :client client}]
+    (app/handle-incoming-imap-email {:header {:message-id "auto-1"}} {:connection-id "conn-1" :origin-folder :inbox :move? false} context)
+    (app/handle-incoming-imap-email {:header {:message-id "assigned-1"}} {:connection-id "conn-1" :origin-folder :inbox :move? false :assigned-category "test" :assigned-category-id 1} context)
+    (is (= ["conn-1" "conn-1"] (mapv #(-> % :metadata :connection-id) @saved))
+        "Both the automatic and the assigned-category path store the account id")
+    (is (= "test" (-> @saved first :metadata :category)) "The rest of the metadata is untouched")))

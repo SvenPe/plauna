@@ -134,7 +134,10 @@
              " language = excluded.language,"
              " language_confidence = excluded.language_confidence,"
              " category = excluded.category,"
-             " category_confidence = excluded.category_confidence")))
+             " category_confidence = excluded.category_confidence,"
+             ;; Never blank a known account with a NULL from a source that does not know it (mbox import,
+             ;; re-enrichment).
+             " connection_id = COALESCE(excluded.connection_id, metadata.connection_id)")))
 
 (defn email-exists? [message-id]
   (some? (jdbc/execute-one! (ds)
@@ -205,13 +208,13 @@
      (if (mariadb?)
        (doseq [m metadata]
          (jdbc/execute! conn
-           ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence)"
-            (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m)]))
+           ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence, connection_id) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence), connection_id = COALESCE(VALUES(connection_id), connection_id)"
+            (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m) (:connection-id m)]))
        (jdbc/execute! conn
                       (->> (builder/for-insert-multi
                             :metadata
-                            [:message_id :language :language_confidence :category :category_confidence]
-                            (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence) metadata) {})
+                            [:message_id :language :language_confidence :category :category_confidence :connection_id]
+                            (mapv (juxt :message-id :language :language-confidence :category-id :category-confidence :connection-id) metadata) {})
                            (insert->metadata-upsert))
                       {:batch true})))))
 
@@ -354,6 +357,21 @@
   (jdbc/execute! (ds) (honey/format {:update :metadata
                                      :set    {:folder folder}
                                      :where  [:= :message-id message-id]})))
+
+(defn update-email-connection
+  "Record the IMAP account a message is known to live in."
+  [message-id connection-id]
+  (when (some? connection-id)
+    (jdbc/execute! (ds) (honey/format {:update :metadata
+                                       :set    {:connection-id connection-id}
+                                       :where  [:= :message-id message-id]}))))
+
+(defn email-connection-id
+  "Return the recorded IMAP account id for a message, or nil if none was recorded."
+  [message-id]
+  (:connection_id (jdbc/execute-one! (ds) (honey/format {:select [:connection-id]
+                                                         :from   :metadata
+                                                         :where  [:= :message-id message-id]}) builder-function)))
 
 (defn email-folder
   "Return the recorded IMAP folder for a message, or nil if none was recorded."
@@ -592,13 +610,13 @@
 
 (defn fetch-headers [entity-clause sql-clause] (jdbc/execute! (ds) (data->sql entity-clause sql-clause) builder-function-kebab))
 
-(defn fetch-metadata [message-id] (jdbc/execute-one! (ds) ["SELECT message_id, language, language_modified, language_confidence, metadata.category AS category_id, category_modified, category_confidence, categories.name AS category FROM metadata LEFT JOIN categories ON metadata.category = categories.id WHERE metadata.message_id = ?" message-id] builder-function-kebab))
+(defn fetch-metadata [message-id] (jdbc/execute-one! (ds) ["SELECT message_id, language, language_modified, language_confidence, metadata.category AS category_id, category_modified, category_confidence, categories.name AS category, connection_id FROM metadata LEFT JOIN categories ON metadata.category = categories.id WHERE metadata.message_id = ?" message-id] builder-function-kebab))
 
 (defn fetch-bodies [message-id] (jdbc/execute! (ds) ["SELECT * FROM bodies WHERE message_id = ?" message-id] builder-function-kebab))
 
 (defn fetch-participants [message-id] (jdbc/execute! (ds) ["SELECT * FROM communications LEFT JOIN contacts ON contacts.contact_key = communications.contact_key WHERE message_id = ? " message-id] builder-function-kebab))
 
-(defn db->metadata [db-metadata] (apply core.email/->Metadata ((juxt :message-id :language :language-modified :language-confidence :category :category-id :category-modified :category-confidence) db-metadata)))
+(defn db->metadata [db-metadata] (apply core.email/->Metadata ((juxt :message-id :language :language-modified :language-confidence :category :category-id :category-modified :category-confidence :connection-id) db-metadata)))
 
 (defn related-data-to-header [header]
   (let [message-id (:message-id header)
@@ -612,7 +630,7 @@
 (defn fetch-metadata-for [message-ids]
   (when (seq message-ids)
     (jdbc/execute! (ds)
-                   (into [(str "SELECT message_id, language, language_modified, language_confidence, metadata.category AS category_id, category_modified, category_confidence, categories.name AS category FROM metadata LEFT JOIN categories ON metadata.category = categories.id WHERE metadata.message_id IN (" (in-clause-placeholders (count message-ids)) ")")]
+                   (into [(str "SELECT message_id, language, language_modified, language_confidence, metadata.category AS category_id, category_modified, category_confidence, categories.name AS category, connection_id FROM metadata LEFT JOIN categories ON metadata.category = categories.id WHERE metadata.message_id IN (" (in-clause-placeholders (count message-ids)) ")")]
                          message-ids)
                    builder-function-kebab)))
 

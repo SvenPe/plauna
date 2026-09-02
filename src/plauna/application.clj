@@ -491,10 +491,17 @@
       (int/create-category-directories! client connection-data [category-name]))))
 
 (defn move-email-to-category
-  "Email address of the recipient is usually the 'username' in the connection data. It may be different, if the user is using some kind of email masking service. If the email and the username match, we know where to look for. If not, we have to loop over the connections and try to find the email by id before moving it to its new directory. This all pressupposes that the message-id is really unique."
+  "Prefer the account recorded with the e-mail's metadata (see incoming-email-workflow). Without it,
+   fall back to guessing: the recipient address is usually the connection's user name, unless a mail
+   masking service is used, in which case every active connection is tried in turn. This all
+   presupposes that the message-id is really unique."
   [email category {:keys [client] :as context}]
   (let [connections (vals (int/connections client))
-        connection-id-guess (int/connection-id-for-email client connections email)
+        active-ids (set (map #(get-in % [:config :id]) connections))
+        recorded-id (-> email :metadata :connection-id)
+        connection-id-guess (if (contains? active-ids recorded-id)
+                              recorded-id
+                              (int/connection-id-for-email client connections email))
         message-id (-> email :header :message-id)
         old-category (-> email :metadata :category)]
     (try
@@ -554,11 +561,13 @@
           {:status :skipped})
       (if (some? assigned-category)
         (let [language-result (int/detect-language analyzer (:email email-message))
-              enriched-email (core-email/construct-enriched-email (:email email-message) {:language (:code language-result) :language-confidence (:confidence language-result)} {:category assigned-category :category-id assigned-category-id :category-confidence 1})]
+              enriched-email (core-email/construct-enriched-email (:email email-message) {:language (:code language-result) :language-confidence (:confidence language-result)} {:category assigned-category :category-id assigned-category-id :category-confidence 1} connection-id)]
           (int/save-email db enriched-email)
           (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully saved to the database"])
           {:status :processed :move (move-message move? folder connection-id email-message assigned-category context)})
-        (let [enriched-email (int/enrich-email analyzer (:email email-message))
+        (let [enriched-email (cond-> (int/enrich-email analyzer (:email email-message))
+                               ;; Remember the account the e-mail arrived on, so a later move needs no guessing.
+                               (some? connection-id) (assoc-in [:metadata :connection-id] connection-id))
               category (:category (:metadata enriched-email))]
           (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was categorized as" category])
           (int/save-email db enriched-email)

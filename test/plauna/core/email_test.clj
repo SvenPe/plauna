@@ -66,3 +66,11 @@
   (let [mock-data (create-email-with-fake-body [["image/jpg" "binary-data"] ["image/pn" "binary-data"]])
         result (core.email/body-part-for-mime-type "text/plain" mock-data)]
     (is (= nil result))))
+
+(deftest construct-enriched-email-records-the-connection
+  (let [email {:header {:message-id "m-1"} :body [] :participants []}
+        without (core.email/construct-enriched-email email {:language "eng"} {:category "a"})
+        with (core.email/construct-enriched-email email {:language "eng"} {:category "a"} "conn-1")]
+    (is (nil? (-> without :metadata :connection-id)))
+    (is (= "conn-1" (-> with :metadata :connection-id)))
+    (is (= "a" (-> with :metadata :category)))))

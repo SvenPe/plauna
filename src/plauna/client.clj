@@ -13,7 +13,7 @@
    (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException)
    (jakarta.mail.internet InternetAddress)
    (org.eclipse.angus.mail.imap IMAPFolder IMAPMessage)
-   (jakarta.mail.event MessageCountAdapter MessageCountEvent MessageCountListener)
+   (jakarta.mail.event ConnectionAdapter ConnectionEvent MessageCountAdapter MessageCountEvent MessageCountListener)
    (jakarta.mail.search MessageIDTerm)
    (java.lang AutoCloseable)
    (java.util Properties UUID)
@@ -408,6 +408,7 @@
                           "using a dedicated IMAP connection"])
           (.moveMessages source-folder (into-array Message found-messages) target-folder)
           (db/update-email-folder message-id target-folder-name)
+          (db/update-email-connection message-id (:id connection-config))
           true)
         (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName move-store)])
             :not-found)))))
@@ -432,6 +433,7 @@
               ;; Even though nothing moves, record the resolved folder so a previously-unrecorded
               ;; (legacy) email gets a concrete location and stays findable for future moves.
               (db/update-email-folder message-id target-folder-name)
+              (db/update-email-connection message-id id)
               true)
           ;; Never open move folders on the Store used by IdleManager. Closing either folder after the
           ;; move could otherwise close the monitored INBOX and create a gap in real-time delivery.
@@ -471,6 +473,65 @@
 
 ;; Public Interface
 
+(declare restore-connection-if-needed!)
+
+(defonce ^:private intentional-closes
+  ;; Ids whose store was closed on purpose (disconnect, delete). JavaMail delivers connection events
+  ;; asynchronously, so the CLOSED event of an intentional close arrives after the close call has
+  ;; returned; the id stays in this set until the account is connected again.
+  (atom #{}))
+
+(defonce ^:private recoveries-in-progress (atom #{}))
+
+(def store-close-recovery-delay-seconds
+  "Grace period between an unexpected store close and the reconnect attempt, so the store has finished
+   its own cleanup and a short network blip can settle."
+  3)
+
+(defn unexpected-store-close?
+  "True when a CLOSED/DISCONNECTED event from store belongs to the currently registered connection
+   for id and nobody asked for that close. Events from a store that has since been replaced by a
+   reconnect are ignored by identity."
+  [id store]
+  (let [connection-data (connection-data-from-id id)]
+    (boolean (and (some? connection-data)
+                  (identical? store (:store connection-data))
+                  (not (contains? @intentional-closes id))))))
+
+(defn- recover-dropped-connection!
+  "Schedule the same repair the periodic health check performs, but right away (after a short grace
+   period) instead of waiting for the next interval. At most one recovery runs per connection."
+  [id context]
+  (let [[before _] (swap-vals! recoveries-in-progress conj id)]
+    (when-not (contains? before id)
+      (t/log! :warn ["The IMAP store of connection" id "closed unexpectedly. Reconnecting in" store-close-recovery-delay-seconds "seconds."])
+      (try
+        (.schedule ^ScheduledExecutorService executor-service
+                   ^Runnable (fn []
+                               (try
+                                 (when-let [connection-data (connection-data-from-id id)]
+                                   (when-not (contains? @intentional-closes id)
+                                     (restore-connection-if-needed! connection-data context)))
+                                 (catch Exception e
+                                   (t/log! {:level :error :error e} ["Recovering connection" id "after an unexpected store close failed."]))
+                                 (finally (swap! recoveries-in-progress disj id))))
+                   (long store-close-recovery-delay-seconds) TimeUnit/SECONDS)
+        (catch java.util.concurrent.RejectedExecutionException _
+          ;; Shutting down: the executor is gone and so is the need to recover.
+          (swap! recoveries-in-progress disj id))))))
+
+(defn- store-connection-listener
+  "React to the server dropping the store without waiting for the next health check. An unexpected
+   drop surfaces as CLOSED (IMAPStore's cleanup) or DISCONNECTED; both are handled the same way."
+  [id context]
+  (proxy [ConnectionAdapter] []
+    (disconnected [^ConnectionEvent event]
+      (when (unexpected-store-close? id (.getSource event))
+        (recover-dropped-connection! id context)))
+    (closed [^ConnectionEvent event]
+      (when (unexpected-store-close? id (.getSource event))
+        (recover-dropped-connection! id context)))))
+
 (defn construct-connection-data [connection-config context]
   (let [idle-manager (IdleManager. (config->session connection-config) (Executors/newCachedThreadPool))
         store (login connection-config)
@@ -479,6 +540,9 @@
         folder (open-folder-in-store store folder-name-to-monitor)
         listener (message-count-listener id folder folder-name-to-monitor context)
         connection-data (->ConnectionData connection-config store folder idle-manager (capabilities store) listener)]
+    ;; A fresh, deliberately opened store: earlier intentional closes of this account are history.
+    (swap! intentional-closes disj id)
+    (.addConnectionListener ^Store store (store-connection-listener id context))
     (add-to-connections connection-data)
     connection-data))
 
@@ -507,7 +571,12 @@
       (catch Exception e
         (t/log! {:level :error :error e} ["Could not back-fill missed messages from" folder-name])))))
 
-(defn disconnect [^AutoCloseable connection-data] (.close connection-data))
+(defn disconnect [^AutoCloseable connection-data]
+  ;; Mark the close as intentional BEFORE closing: the store's CLOSED event is delivered
+  ;; asynchronously and must not be mistaken for a dropped connection.
+  (when-let [id (get-in connection-data [:config :id])]
+    (swap! intentional-closes conj id))
+  (.close connection-data))
 
 (defn remove-connection!
   "Close a connection's live resources (monitor, folder, store) and drop it from the runtime
@@ -574,33 +643,38 @@
     (t/log! :info "Could not create directories on the IMAP server: The store is not connected."))
   connection-data)
 
-(defn schedule-health-checks [^ConnectionData connection-data context]
+(defn restore-connection-if-needed!
+  "Reconnect a dropped store, back-fill mail missed meanwhile, reopen the monitored folder and resume
+   IDLE. Shared by the periodic health check and the store's connection listener."
+  [^ConnectionData connection-data context]
   (let [^Store store (:store connection-data)
         ^Folder folder (:folder connection-data)
-        config (:config connection-data)
+        config (:config connection-data)]
+    (try
+      (t/log! :debug ["Checking if the connection for" (:user config) "is open"])
+      (if (.isConnected store)
+        (t/log! :debug "Store is still connected.")
+        (do
+          (t/log! :warn "Connection lost. Reconnecting to email server...")
+          (reconnect connection-data)
+          ;; The monitor was down for a while, so mail may have arrived without an IDLE push.
+          ;; Back-fill it now that we're back (only if the reconnect actually restored the store).
+          (when (.isConnected store)
+            (backfill-monitored-folder! connection-data context))))
+      (t/log! :debug ["Checking if the folder " (:folder config) "is open"])
+      (if (.isOpen folder)
+        (t/log! :debug "Folder is still open.")
+        (do (t/log! :info "Folder is closed. Opening it again.")
+            (.open folder Folder/READ_WRITE)))
+      (t/log! :debug "Idling and waiting for messages after a health check.")
+      (start-idling-for-id (:id config))
+      (catch Exception e
+        (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state.")))))
+
+(defn schedule-health-checks [^ConnectionData connection-data context]
+  (let [config (:config connection-data)
         scheduled-future (.scheduleAtFixedRate ^ScheduledExecutorService executor-service
-                                               #(do
-                                                  (try
-                                                    (t/log! :debug ["Checking if the connection for" (:user config) "is open"])
-                                                    (if (.isConnected store)
-                                                      (t/log! :debug "Store is still connected.")
-                                                      (do
-                                                        (t/log! :warn "Connection lost. Reconnecting to email server...")
-                                                        (reconnect connection-data)
-                                                        ;; The monitor was down for at least one interval, so mail may have
-                                                        ;; arrived without an IDLE push. Back-fill it now that we're back
-                                                        ;; (only if the reconnect actually restored the store).
-                                                        (when (.isConnected store)
-                                                          (backfill-monitored-folder! connection-data context))))
-                                                    (t/log! :debug ["Checking if the folder " (:folder config) "is open"])
-                                                    (if (.isOpen folder)
-                                                      (t/log! :debug "Folder is still open.")
-                                                      (do (t/log! :info "Folder is closed. Opening it again.")
-                                                          (.open folder Folder/READ_WRITE)))
-                                                    (t/log! :debug "Idling and waiting for messages after a health check.")
-                                                    (start-idling-for-id (:id config))
-                                                    (catch Exception e
-                                                      (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state."))))
+                                               #(restore-connection-if-needed! connection-data context)
                                                120 (p/client-health-check-interval) TimeUnit/SECONDS)]
     (swap-new-period-check (:id config) scheduled-future)
     connection-data))
@@ -647,8 +721,12 @@
    monitor is left undisturbed."
   [message-id]
   (let [recorded (db/email-folder message-id)
+        recorded-connection (db/email-connection-id message-id)
         candidate-folders (fn [^ConnectionData cd]
-                            (distinct (remove s/blank? [recorded (-> cd :config :folder) "INBOX"])))]
+                            (distinct (remove s/blank? [recorded (-> cd :config :folder) "INBOX"])))
+        ;; Look in the account the e-mail is known to belong to before trying the others.
+        ordered-connections (sort-by (fn [^ConnectionData cd] (if (= recorded-connection (-> cd :config :id)) 0 1))
+                                     (vals @connections))]
     (some (fn [^ConnectionData cd]
             (when (connected? cd)
               (some (fn [folder-name]
@@ -663,7 +741,7 @@
                               (message->email msg))
                             (finally (close-folder-for-bulk-read bulk))))))
                     (candidate-folders cd))))
-          (vals @connections))))
+          ordered-connections)))
 
 (defmulti connect (fn [config _] (:auth-type config)))
 

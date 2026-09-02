@@ -12,7 +12,7 @@
 
 (defrecord Email [^Header header body participants])
 
-(defrecord Metadata [message-id language language-modified language-confidence category category-id category-modified category-confidence])
+(defrecord Metadata [message-id language language-modified language-confidence category category-id category-modified category-confidence connection-id])
 
 (defrecord EnrichedEmail [^Header header body participants ^Metadata metadata])
 
@@ -35,18 +35,24 @@
         header (construct-header raw-header)]
     (->Email header body-parts participants)))
 
-(defn construct-enriched-email [email language-metadata category-metadata]
-  (->EnrichedEmail (:header email)
-                   (:body email)
-                   (:participants email)
-                   (->Metadata (-> email :header :message-id)
-                               (:language language-metadata)
-                               (get language-metadata :language-modified nil)
-                               (:language-confidence language-metadata)
-                               (:category category-metadata)
-                               (:category-id category-metadata)
-                               (get category-metadata :category-modified nil)
-                               (:category-confidence category-metadata))))
+(defn construct-enriched-email
+  "connection-id (optional) records the IMAP account the e-mail was read from, so a later move can go
+   straight to that account."
+  ([email language-metadata category-metadata]
+   (construct-enriched-email email language-metadata category-metadata nil))
+  ([email language-metadata category-metadata connection-id]
+   (->EnrichedEmail (:header email)
+                    (:body email)
+                    (:participants email)
+                    (->Metadata (-> email :header :message-id)
+                                (:language language-metadata)
+                                (get language-metadata :language-modified nil)
+                                (:language-confidence language-metadata)
+                                (:category category-metadata)
+                                (:category-id category-metadata)
+                                (get category-metadata :category-modified nil)
+                                (:category-confidence category-metadata)
+                                connection-id))))
 
 (defn iterate-over-all-pages [call-with-pagination fun query sql-query mutates?]
   (let [data-with-current-page (call-with-pagination query sql-query)

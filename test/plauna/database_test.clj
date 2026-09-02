@@ -190,3 +190,18 @@
   (db/abort-running-parse-batches!)
   (is (= "aborted" (:status (db/parse-batch "batch-running"))))
   (is (= "finished" (:status (db/parse-batch "batch-done")))))
+
+(deftest metadata-keeps-a-known-connection-id
+  (db/save-headers [{:mime-type "text/plain" :subject "conn" :message-id "conn-rt" :date 0 :in-reply-to nil}])
+  (db/update-metadata-batch [{:message-id "conn-rt" :language "eng" :language-confidence 0.9 :category-id nil :category-confidence 0 :connection-id "conn-1"}])
+  (is (= "conn-1" (:connection-id (db/fetch-metadata "conn-rt"))))
+  (is (= "conn-1" (db/email-connection-id "conn-rt")))
+  ;; A later save that does not know the account (mbox import, re-enrichment) must not blank it.
+  (db/update-metadata-batch [{:message-id "conn-rt" :language "deu" :language-confidence 0.8 :category-id nil :category-confidence 0 :connection-id nil}])
+  (let [metadata (db/fetch-metadata "conn-rt")]
+    (is (= "deu" (:language metadata)) "Other columns are still updated")
+    (is (= "conn-1" (:connection-id metadata)) "A NULL never overwrites a known account"))
+  (db/update-email-connection "conn-rt" "conn-2")
+  (is (= "conn-2" (db/email-connection-id "conn-rt")))
+  (is (= "conn-2" (:connection-id (first (db/fetch-metadata-for ["conn-rt"])))) "The batch fetch exposes the account too")
+  (is (nil? (db/email-connection-id "no-such-message"))))

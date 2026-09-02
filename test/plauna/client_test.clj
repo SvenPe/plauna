@@ -197,6 +197,7 @@
                   client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
                   db/email-folder (fn [_] nil)
                   db/update-email-folder (fn [message-id folder] (reset! recorded [message-id folder]))
+                  db/update-email-connection (fn [_ _] nil)
                   client/inbox-or-default-category-folder-name (fn [_ _ _] "INBOX")
                   client/inbox-or-category-folder-name (fn [_ _ _] "INBOX")]
       (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "n/a" "keep" {})))
@@ -209,6 +210,7 @@
                 client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
                 db/email-folder (fn [_] nil)
                 db/update-email-folder (fn [_ _] nil)
+                db/update-email-connection (fn [_ _] nil)
                 client/inbox-or-default-category-folder-name (fn [_ _ _] "Archive/Projects")
                 client/inbox-or-category-folder-name (fn [_ _ _] "Archive/Projects")]
     (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
@@ -223,6 +225,7 @@
                 client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
                 db/email-folder (fn [_] nil)
                 db/update-email-folder (fn [_ _] nil)
+                db/update-email-connection (fn [_ _] nil)
                 ;; default resolver (correct for legacy emails) and the custom-destination resolver
                 ;; return DIFFERENT values; the target resolves to the same value as the default resolver.
                 client/inbox-or-default-category-folder-name (fn [_ _ _] "Categories/Work")
@@ -235,6 +238,7 @@
                 client/connection-data-from-id (fn [_] {:store nil :config {:id 1 :folder "INBOX"}})
                 db/email-folder (fn [_] "Recorded/Folder")
                 db/update-email-folder (fn [_ _] nil)
+                db/update-email-connection (fn [_ _] nil)
                 ;; category-derived resolution would give a *different* source ("Derived/Work").
                 client/inbox-or-category-folder-name (fn [_ folder-name _] (if (= folder-name "projects") "Recorded/Folder" "Derived/Work"))]
     (is (true? (client/move-messages-by-id-between-category-folders "fake" "msg-id" "work" "projects" {}))))
@@ -264,3 +268,20 @@
       (is (= [connection-config "INBOX" "Categories/Work" "msg-id"] @move-call)
           "The actual move is delegated without opening a folder on the monitored Store")))
   "Recategorization resolves names from the live connection but performs the move on a dedicated Store")
+
+(deftest unexpected-store-close-is-recognised-only-for-the-live-store
+  (let [store (Object.)
+        other-store (Object.)
+        connection-data (->ConnectionData {:id "listener-test"} store nil nil nil nil)
+        intentional #'client/intentional-closes]
+    (try
+      (swap! client/connections assoc "listener-test" connection-data)
+      (swap! @intentional disj "listener-test")
+      (is (true? (client/unexpected-store-close? "listener-test" store)) "The live store closing without a request is a dropped connection")
+      (is (false? (client/unexpected-store-close? "listener-test" other-store)) "A stale store replaced by a reconnect is ignored")
+      (is (false? (client/unexpected-store-close? "unknown" store)) "A deleted connection has nothing to recover")
+      (swap! @intentional conj "listener-test")
+      (is (false? (client/unexpected-store-close? "listener-test" store)) "A user-requested disconnect is not a dropped connection")
+      (finally
+        (swap! client/connections dissoc "listener-test")
+        (swap! @intentional disj "listener-test")))))

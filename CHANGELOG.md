@@ -32,6 +32,13 @@ All notable changes to this project will be documented in this file.
   categorization" offers "Move to category folders" on the connection page and on the batch's e-mail
   list. The categorized e-mails of the batch are moved in the background and a summary reports how
   many were moved, not found or left in place because they have no category.
+- Remember the IMAP account each e-mail was read from (`metadata.connection_id`, back-filled from
+  parse runs and, with a single configured account, from that account). Moves and re-fetches use it
+  directly instead of guessing the account from the recipient address and trying every connection.
+  Adopted from upstream Plauna.
+- React to the IMAP server closing the connection right away: a connection listener on the store
+  schedules the same reconnect-and-catch-up the periodic health check performs, a few seconds after
+  the drop, instead of waiting for the next health-check interval. Adopted from upstream Plauna.
 - Model training runs in the background and shows a live progress page with a progress bar, the
   collection count and the per-language MaxEnt iteration, instead of blocking the request until the
   reverse proxy reports a 504 gateway time-out. Manual training, the model switch and the daily
