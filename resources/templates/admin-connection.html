@@ -128,6 +128,7 @@
 <div class="my-8">
   <h4 class="text-lg">Recent Folder Parse Runs</h4>
   {% if parse-running? %}<p class="text-sm opacity-70">A run is in progress; this page reloads every 10 seconds until it has finished.</p>{% endif %}
+  <p class="text-sm opacity-70">"Move to category folders" moves the categorized e-mails of a batch that was parsed without "Move e-mails after categorization" into their category folders now. E-mails without a category stay where they are.</p>
   <div class="overflow-x-auto">
     <table class="table table-zebra table-sm">
       <thead>
@@ -154,7 +155,22 @@
           <td class="text-right">{{batch.skipped}}</td>
           <td class="text-right">{{batch.errors}}</td>
           <td class="text-right">{{batch.remaining}}</td>
-          <td>{% if batch.processed > 0 %}<a class="link link-primary" href="{{batch.emails-url}}">Review e-mails</a>{% endif %}</td>
+          <td class="whitespace-nowrap">
+            {% if batch.processed > 0 %}
+            <a class="link link-primary" href="{{batch.emails-url}}">Review e-mails</a>
+            {% if batch.move.status = "running" %}
+            <span class="badge badge-warning ml-2">moving {{batch.move.moved}} / {{batch.move.total}}</span>
+            {% else %}
+            {% if batch.move.status = "finished" %}<span class="badge badge-ghost ml-2" title="{{batch.move.not-found}} not found, {{batch.move.failed}} failed">moved {{batch.move.moved}} / {{batch.move.total}}</span>{% endif %}
+            {% ifunequal batch.status "running" %}
+            <form action="{{batch.move-url}}" method="post" class="inline ml-2" onsubmit="return confirm('Move every categorized e-mail of this batch into its category folder on the IMAP server?')">
+              <input type="hidden" name="redirect-url" value="/admin/connections/{{id}}" />
+              <button class="btn btn-outline btn-xs" type="submit">Move to category folders</button>
+            </form>
+            {% endifunequal %}
+            {% endif %}
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

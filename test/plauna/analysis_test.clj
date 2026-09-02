@@ -77,3 +77,21 @@
       (finally
         (io/delete-file training-file true)
         (io/delete-file model-file true)))))
+
+(deftest maxent-training-reports-iteration-progress
+  (let [training-file (java.io.File/createTempFile "plauna-training-" ".train")
+        events (atom [])]
+    (try
+      (spit training-file (str "1 sender-domain:shop.example subject:invoice body:payment\n"
+                               "2 sender-domain:friends.example subject:dinner body:tomorrow\n"))
+      (let [trained (analysis/train-data [{:language "eng" :file training-file}] "maxent" #(swap! events conj %))]
+        (is (= 1 (count trained)))
+        (is (some? (:model (first trained))))
+        (is (= {:language "eng" :language-index 1 :languages 1 :iteration 0 :iterations analysis/training-iterations}
+               (first @events))
+            "Training announces the language before the first iteration")
+        (is (some #(and (pos? (:iteration %)) (= "eng" (:language %))) @events)
+            "MaxEnt reports finished iterations")
+        (is (:done? (last @events)) "The final event marks the end of training"))
+      (finally
+        (io/delete-file training-file true)))))

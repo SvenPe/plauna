@@ -593,6 +593,36 @@
       (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
       :error)))
 
+(defn move-parse-batch-emails!
+  "Move every e-mail of a parse batch that has a category into that category's IMAP folder: the fix for
+   a batch that was parsed with 'move' unchecked. E-mails without a category stay where they are.
+   progress-fn is called with the running summary after every attempted move; the final summary
+   {:batch-id :total :uncategorized :moved :not-found :failed} is returned."
+  [{:keys [db client] :as context} batch-id connection-id progress-fn]
+  (let [emails (int/fetch-emails db {:entity :enriched-email :strict true :with-bodies false} {:where (batch->where batch-id)})
+        categorized (filter #(some? (-> % :metadata :category)) emails)]
+    (reduce (fn [summary email]
+              (let [message-id (-> email :header :message-id)
+                    category (-> email :metadata :category)
+                    result (try
+                             ;; The recorded folder (see move-message) is the source; the category argument
+                             ;; only matters for legacy e-mails without one.
+                             (int/move-email-between-categories client connection-id message-id category category context)
+                             (catch Exception e
+                               (t/log! {:level :error :error e} ["Moving" message-id "of batch" batch-id "failed"])
+                               false))
+                    outcome (cond (true? result) :moved
+                                  (= :not-found result) :not-found
+                                  :else :failed)
+                    updated (update summary outcome inc)]
+                (progress-fn updated)
+                updated))
+            {:batch-id batch-id
+             :total (count categorized)
+             :uncategorized (- (count emails) (count categorized))
+             :moved 0 :not-found 0 :failed 0}
+            categorized)))
+
 (defn- empty-folder-summary [folder-name message-count batch-size]
   {:folder folder-name :message-count message-count :batch-size batch-size
    :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0})

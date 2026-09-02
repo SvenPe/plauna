@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h3 class="uppercase text-lg my-8">Model Training</h3>
+
+<div class="card card-border max-w-2xl">
+  <div class="card-body">
+    <p id="training-label" class="font-semibold">Loading…</p>
+    <progress id="training-bar" class="progress progress-primary w-full" value="0" max="100"></progress>
+    <p id="training-percent" class="text-sm"></p>
+    <p id="training-detail" class="text-sm opacity-70"></p>
+    <div id="training-result" class="alert mt-4" role="alert" hidden>
+      <span id="training-result-text"></span>
+    </div>
+    <div class="card-actions mt-4">
+      <a id="training-back" class="btn btn-outline" href="{{back}}">Back</a>
+    </div>
+    <p class="text-xs opacity-60 mt-2">Training continues in the background even if you leave this page; the result is shown as a message on your next page load.</p>
+  </div>
+</div>
+
+<script>
+  (function () {
+    var bar = document.getElementById('training-bar');
+    var label = document.getElementById('training-label');
+    var percent = document.getElementById('training-percent');
+    var detail = document.getElementById('training-detail');
+    var result = document.getElementById('training-result');
+    var resultText = document.getElementById('training-result-text');
+
+    function describe(state) {
+      if (state.status === 'idle') { return 'No training run has been started.'; }
+      if (state.phase === 'starting') { return 'Preparing the training run…'; }
+      if (state.phase === 'collecting') {
+        return 'Collecting training data: ' + (state['emails-written'] || 0) + ' of ' + (state['emails-total'] || 0) + ' categorized e-mails';
+      }
+      if (state.phase === 'training') {
+        var text = 'Training the ' + (state.language || '') + ' model (' + (state['language-index'] || 0) + ' of ' + (state.languages || 0) + ')';
+        if (state.iteration) { text += ': iteration ' + state.iteration + ' of at most ' + state.iterations; }
+        return text;
+      }
+      if (state.phase === 'finished') { return 'Finished.'; }
+      return '';
+    }
+
+    function render(state) {
+      var running = state.status === 'running';
+      bar.value = state.percent || 0;
+      label.textContent = (state.label || 'Training') + (running ? ' in progress' : (state.status === 'finished' ? ' finished' : ''));
+      percent.textContent = (state.percent || 0) + ' %';
+      detail.textContent = describe(state);
+      if (state.status === 'finished' && state.result) {
+        result.hidden = false;
+        result.className = 'alert mt-4 ' + (state.result.type === 'success' ? 'alert-success' : (state.result.type === 'alert' ? 'alert-error' : 'alert-info'));
+        resultText.textContent = state.result.content || '';
+      } else {
+        result.hidden = true;
+      }
+      return running;
+    }
+
+    function poll() {
+      fetch('/training/status', {cache: 'no-store'})
+        .then(function (response) { return response.json(); })
+        .then(function (state) { if (render(state)) { setTimeout(poll, 1000); } })
+        .catch(function () { detail.textContent = 'Could not read the training status. Retrying…'; setTimeout(poll, 3000); });
+    }
+
+    poll();
+  })();
+</script>
+
+{% endblock %}

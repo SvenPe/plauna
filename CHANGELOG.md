@@ -28,6 +28,14 @@ All notable changes to this project will be documented in this file.
   while a run is in progress), and both the finished message and the table link to the E-mails page
   filtered to exactly those e-mails. The batch filter is a removable chip that combines with the
   other filters. Runs interrupted by a restart are marked as aborted.
+- Move a parse batch to its category folders afterwards: a run parsed without "Move e-mails after
+  categorization" offers "Move to category folders" on the connection page and on the batch's e-mail
+  list. The categorized e-mails of the batch are moved in the background and a summary reports how
+  many were moved, not found or left in place because they have no category.
+- Model training runs in the background and shows a live progress page with a progress bar, the
+  collection count and the per-language MaxEnt iteration, instead of blocking the request until the
+  reverse proxy reports a 504 gateway time-out. Manual training, the model switch and the daily
+  automatic run share one slot, so only one training runs at a time.
 
 ## [2026-07-10.0] - 2026-07-10
 

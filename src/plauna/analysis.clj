@@ -12,11 +12,13 @@
             [plauna.interfaces :as int])
   (:import
    (opennlp.tools.util.normalizer AggregateCharSequenceNormalizer NumberCharSequenceNormalizer ShrinkCharSequenceNormalizer CharSequenceNormalizer)
-   (opennlp.tools.util MarkableFileInputStreamFactory PlainTextByLineStream TrainingParameters)
-   (opennlp.tools.doccat DocumentSampleStream DocumentCategorizerME DoccatFactory DoccatModel)
+   (opennlp.tools.util MarkableFileInputStreamFactory ObjectStream PlainTextByLineStream TrainingConfiguration TrainingParameters)
+   (opennlp.tools.doccat DocumentSampleStream DocumentCategorizerME DocumentCategorizerEventStream DoccatFactory DoccatModel)
+   (opennlp.tools.ml EventTrainer TrainerFactory)
    (opennlp.tools.ml.maxent GISTrainer)
    (opennlp.tools.ml.naivebayes NaiveBayesTrainer)
-   (java.util Locale)
+   (opennlp.tools.monitoring TrainingProgressMonitor)
+   (java.util HashMap Locale)
    (java.util.regex Pattern)
    (java.io File OutputStream)))
 
@@ -176,11 +178,16 @@
    ""
    data))
 
+(def training-iterations
+  "Upper bound of optimisation iterations per model. MaxEnt may stop earlier once it converges;
+   Naive Bayes needs a single pass and never reports iterations."
+  1000)
+
 (defn training-parameters
   ([] (training-parameters (p/categorization-model)))
   ([model]
    (doto (new TrainingParameters)
-     (.put TrainingParameters/ITERATIONS_PARAM 1000)
+     (.put TrainingParameters/ITERATIONS_PARAM (int training-iterations))
      (.put TrainingParameters/CUTOFF_PARAM 0)
      (.put TrainingParameters/ALGORITHM_PARAM (categorization-algorithm model)))))
 
@@ -191,16 +198,48 @@
 (defn serialize-and-write-model! [^DoccatModel model ^OutputStream os]
   (when (some? model) (.serialize model os)))
 
+(defn- progress-monitor
+  "Bridge OpenNLP's per-iteration callbacks to progress-fn, which receives
+   {:iteration i :iterations n} after every iteration and additionally :done? true once training ends."
+  ^TrainingProgressMonitor [progress-fn]
+  (let [finished (atom false)]
+    (reify TrainingProgressMonitor
+      (finishedIteration [_ iteration _ _ _ _]
+        (progress-fn {:iteration iteration :iterations training-iterations}))
+      (finishedTraining [_ iteration _]
+        (reset! finished true)
+        (progress-fn {:iteration iteration :iterations training-iterations :done? true}))
+      (isTrainingFinished [_] @finished)
+      (display [_ _] nil))))
+
+(defn train-model
+  "The equivalent of DocumentCategorizerME/train that also reports iteration progress: OpenNLP only
+   accepts a progress monitor through TrainingConfiguration, which the convenience method does not
+   expose, so the trainer is assembled here from the same parts."
+  ^DoccatModel [^String language ^File file model progress-fn]
+  (let [parameters (training-parameters model)
+        manifest (HashMap.)
+        factory (DoccatFactory.)
+        ^EventTrainer trainer (TrainerFactory/getEventTrainer parameters manifest
+                                                              (TrainingConfiguration. (progress-monitor progress-fn) nil))
+        ^ObjectStream events (DocumentCategorizerEventStream. (training-data-stream file) (.getFeatureGenerators factory))
+        maxent-model (.train trainer events)]
+    (DoccatModel. language maxent-model manifest factory)))
+
 (defn train-data
+  "Train one model per training file. progress-fn (optional) is called with
+   {:language :language-index :languages :iteration :iterations} as training advances."
   ([training-files] (train-data training-files (p/categorization-model)))
-  ([training-files model]
-   (mapv (fn [tf]
-           {:model (DocumentCategorizerME/train (:language tf)
-                                                (training-data-stream (:file tf))
-                                                (training-parameters model)
-                                                (DoccatFactory.))
-            :language (:language tf)})
-         training-files)))
+  ([training-files model] (train-data training-files model (fn [_] nil)))
+  ([training-files model progress-fn]
+   (let [total (count training-files)]
+     (vec (map-indexed
+           (fn [index tf]
+             (let [position {:language (:language tf) :language-index (inc index) :languages total}]
+               (progress-fn (assoc position :iteration 0 :iterations training-iterations))
+               {:model (train-model (:language tf) (:file tf) model #(progress-fn (merge position %)))
+                :language (:language tf)}))
+           training-files)))))
 
 (defn categorize-tokens [tokens ^File model-file]
   (if (and (.exists model-file) (seq tokens))

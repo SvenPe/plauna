@@ -204,3 +204,33 @@
     (let [html (markup/connection {:id "connection-1" :host "h" :user "u" :parse-batches [] :parse-running? false} [] [])]
       (is (not (str/includes? html "Recent Folder Parse Runs")))
       (is (not (str/includes? html "http-equiv=\"refresh\""))))))
+
+(deftest training-progress-page-polls-the-status-endpoint
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/training-progress-page "/admin/preferences")]
+      (is (str/includes? html "/training/status"))
+      (is (str/includes? html "href=\"/admin/preferences\""))
+      (is (str/includes? html "<progress")))))
+
+(deftest connection-page-offers-to-move-a-finished-batch
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/connection
+                {:id "connection-1" :host "h" :user "u"
+                 :parse-batches [{:id "run-1" :folder "Old" :status "finished" :batch-size 100
+                                  :processed 100 :skipped 0 :errors 0 :remaining 0
+                                  :started-at 1756800000 :finished-at 1756800600
+                                  :emails-url "/emails?batch=run-1" :move-url "/parse-batches/run-1/move"
+                                  :move {:status "running" :moved 12 :total 90}}]
+                 :parse-running? true}
+                [] [])]
+      (is (str/includes? html "moving 12 / 90"))
+      (is (not (str/includes? html "action=\"/parse-batches/run-1/move\"")) "No second move can be started while one runs"))
+    (let [html (markup/connection
+                {:id "connection-1" :host "h" :user "u"
+                 :parse-batches [{:id "run-1" :folder "Old" :status "finished" :batch-size 100
+                                  :processed 100 :skipped 0 :errors 0 :remaining 0
+                                  :started-at 1756800000 :finished-at 1756800600
+                                  :emails-url "/emails?batch=run-1" :move-url "/parse-batches/run-1/move"}]
+                 :parse-running? false}
+                [] [])]
+      (is (str/includes? html "action=\"/parse-batches/run-1/move\"")))))

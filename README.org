@@ -352,6 +352,8 @@ When you start Plauna, it starts a web server on the port which you specified (d
 
    The "Batch size" field (default 100) limits one run to that many /new/ e-mails. Plauna walks the folder from the newest message to the oldest, identifies each message by its Message-ID first and skips e-mails that are already stored without downloading them again - skipped e-mails do not use up the batch. Once the batch is full, a message reports how many e-mails were saved, how many were skipped and how many older e-mails are still unexamined. Simply run the same parse again to continue with the next batch. Leave the field blank to process the whole folder in one go.
 
+   Forgot to tick "Move e-mails after categorization"? Every finished run offers "Move to category folders" (on the connection page and, while reviewing the batch, on the E-mails page). It moves the categorized e-mails of that batch into their category folders in the background and reports how many were moved; e-mails without a category stay where they are, and you can run it again after correcting categories.
+
    Every run is listed under "Recent Folder Parse Runs" on the connection page, which reloads itself while a run is in progress. As soon as a run has finished, both the summary message and the table offer a "Review" link that opens the E-mails page filtered to exactly the e-mails this run saved, so their detected categories can be checked and corrected inline while they are still fresh. The batch filter appears as a removable chip and combines with the other filters, e.g. with "E-mails without A Category Only" to see which e-mails of the batch the model could not assign. A run that was still in progress when Plauna was stopped is shown as aborted; its e-mails are kept, and running the parse again continues after them.
 
 3. Just leave Plauna running and watch it save your e-mails. Beware: Depending on how many e-mails you receive on any given day, this method may be very slow.
@@ -423,6 +425,8 @@ On MariaDB, body search requires every entered word, supports prefix matching an
 *** Data Training
 
 Under the "E-mails" tab, click "Train with Existing Data" to retrain the currently selected model with categorized e-mails. *Important:* You must have more than one category represented for each language you want to train.
+
+Training runs in the background. The browser is taken to a progress page that shows a progress bar with the current phase: collecting the categorized e-mails (with a running count) and then training one model per language, including the MaxEnt iteration count. When the run has finished, the result is shown on that page; if you navigate away, it appears as a message on the next page load instead. Only one training run can be active at a time, and the daily automatic run waits when a manual one is in progress. Because the request itself returns immediately, a reverse proxy in front of Plauna no longer reports a gateway time-out for long training runs. Switching the model under "Admin" → "Preferences" uses the same progress page.
 
 You must have selected at least one language in "Admin" -> "Languages" in order to start training on your e-mails.
 

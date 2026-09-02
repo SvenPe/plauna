@@ -938,3 +938,38 @@
         (is (some #{"receiver" ":receiver"} flat) "To filter present")
         (is (some #{:headers.date} flat) "Date filter present"))))
   "All filters (metadata, content search, subject, from, to, category, date) combine with AND")
+
+(deftest move-parse-batch-emails-moves-only-categorized-emails
+  (let [moves (atom [])
+        progress (atom [])
+        emails [{:header {:message-id "m-1"} :metadata {:category "invoices"}}
+                {:header {:message-id "m-2"} :metadata {:category nil}}
+                {:header {:message-id "m-3"} :metadata {:category "friends"}}
+                {:header {:message-id "m-4"} :metadata {:category "invoices"}}
+                {:header {:message-id "m-5"} :metadata {:category "friends"}}]
+        db (reify int/DB
+             (fetch-emails [_ entity customization]
+               (is (= {:entity :enriched-email :strict true :with-bodies false} entity))
+               (is (= [:in :headers.message-id {:select [:parse-batch-emails.message-id]
+                                                :from [:parse-batch-emails]
+                                                :where [:= :parse-batch-emails.batch-id "run-1"]}]
+                      (:where customization)))
+               emails))
+        client (reify int/EmailClient
+                 (move-email-between-categories [_ connection-id message-id old-category new-category _]
+                   (swap! moves conj [connection-id message-id old-category new-category])
+                   (case message-id
+                     "m-3" :not-found
+                     "m-4" (throw (ex-info "imap down" {}))
+                     "m-5" false
+                     true)))
+        summary (app/move-parse-batch-emails! {:db db :client client} "run-1" "conn-1" #(swap! progress conj %))]
+    (is (= [["conn-1" "m-1" "invoices" "invoices"]
+            ["conn-1" "m-3" "friends" "friends"]
+            ["conn-1" "m-4" "invoices" "invoices"]
+            ["conn-1" "m-5" "friends" "friends"]]
+           @moves)
+        "The uncategorized e-mail is never moved; every categorized one is attempted despite failures")
+    (is (= {:batch-id "run-1" :total 4 :uncategorized 1 :moved 1 :not-found 1 :failed 2} summary))
+    (is (= 4 (count @progress)) "Progress is reported after every attempted move")
+    (is (= summary (last @progress)))))

@@ -1,5 +1,5 @@
 (ns plauna.server
-  (:require [cheshire.core :refer [parse-string]]
+  (:require [cheshire.core :refer [generate-string parse-string]]
             [clojure.core.async :as async]
             [clojure.data :as cd]
             [clojure.java.io :as io]
@@ -53,6 +53,16 @@
 (def html-headers {"Content-Type" "text/html; charset=UTF-8"})
 
 (defonce global-messages (atom []))
+
+(defonce training-progress
+  ;; The state of the current (or last) model training run, polled by the progress page. Training runs
+  ;; on a background thread because a full run takes minutes and a synchronous response would be cut
+  ;; off by any reverse proxy's read timeout.
+  (atom {:status :idle}))
+
+(defonce batch-moves
+  ;; Transient state of "move this parse batch to its category folders" jobs, keyed by batch id.
+  (atom {}))
 
 (defn add-to-messages [message] (swap! global-messages (fn [messages] (conj messages message))))
 
@@ -154,16 +164,32 @@
 (defn languages-to-use-in-training []
   (map :language (db/get-activated-language-preferences)))
 
+(defn- categorized-email-count
+  "How many categorized e-mails exist in the given languages: the size of the collection phase."
+  [languages]
+  (if (seq languages)
+    (or (:count (first (db/query-db {:select [[[:count :*] :count]]
+                                     :from [:metadata]
+                                     :where [:and [:<> :category nil] [:in :language (vec languages)]]})))
+        0)
+    0))
+
+(defn- report-training-progress! [progress]
+  (swap! training-progress merge progress))
+
 (defn write-all-categorized-emails-to-training-files []
   (files/delete-files-with-type :train)
-  (doseq [language (languages-to-use-in-training)
-          :let [entity-query {:entity :enriched-email :page {:size 100 :page 1}}
-                sql-query {:where [:and [:<> :category nil] [:= :language language]]}
-                write-func (fn [data]
-                             (let [formatted (analysis/format-training-data data)]
-                               (when (seq formatted)
-                                 (files/write-to-training-file language formatted))))]]
-    (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false)))
+  (let [languages (languages-to-use-in-training)]
+    (report-training-progress! {:phase :collecting :emails-written 0 :emails-total (categorized-email-count languages)})
+    (doseq [language languages
+            :let [entity-query {:entity :enriched-email :page {:size 100 :page 1}}
+                  sql-query {:where [:and [:<> :category nil] [:= :language language]]}
+                  write-func (fn [data]
+                               (let [formatted (analysis/format-training-data data)]
+                                 (when (seq formatted)
+                                   (files/write-to-training-file language formatted)))
+                               (swap! training-progress update :emails-written (fnil + 0) (count data)))]]
+      (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false))))
 
 (defn train-categorization-model!
   "Build the requested model family from the current categorized e-mails. Model files are kept per
@@ -176,8 +202,9 @@
     (if (seq (languages-to-use-in-training))
       (do (write-all-categorized-emails-to-training-files)
           (let [training-files (vec (files/training-files))]
+            (report-training-progress! {:phase :training :languages (count training-files) :language-index 0 :iteration 0 :iterations analysis/training-iterations})
             (if (seq training-files)
-              (doseq [training-model (analysis/train-data training-files model)]
+              (doseq [training-model (analysis/train-data training-files model report-training-progress!)]
                 (files/write-model-file-atomically!
                  (:language training-model)
                  model
@@ -187,6 +214,83 @@
 
 (defn write-emails-to-training-files-and-train []
   (train-categorization-model! (p/categorization-model)))
+
+(defn training-percent
+  "Overall progress of a training run as 0-100. Collecting the training data is the first quarter;
+   the remaining three quarters are split evenly across the languages and, within a language,
+   advance linearly with the iterations (Naive Bayes reports none and jumps per language)."
+  [{:keys [status phase emails-written emails-total language-index languages iteration iterations]}]
+  (let [fraction (fn [part whole] (if (and whole (pos? whole)) (min 1.0 (/ (double (or part 0)) whole)) 0.0))
+        value (case phase
+                :collecting (* 25 (fraction emails-written emails-total))
+                :training (let [language-count (max 1 (or languages 1))
+                                completed (max 0 (dec (or language-index 1)))]
+                            (+ 25 (* 75 (/ (+ completed (fraction iteration iterations)) language-count))))
+                :finished 100
+                0)]
+    (if (= :finished status) 100 (int (Math/round (double value))))))
+
+(defn training-running? [] (= :running (:status @training-progress)))
+
+(defn- claim-training-run!
+  "Atomically mark a training run as started. Returns false when another run is still in progress."
+  [label]
+  (let [[before _] (swap-vals! training-progress
+                               (fn [state]
+                                 (if (= :running (:status state))
+                                   state
+                                   {:status :running :label label :phase :starting
+                                    :started-at (System/currentTimeMillis) :emails-written 0 :emails-total 0})))]
+    (not= :running (:status before))))
+
+(def training-busy-message {:type :info :content "A model training run is already in progress. Please wait for it to finish."})
+
+(def training-success-message {:type :success :content "Training finished. The updated model is now used for categorization."})
+
+(defn- execute-training-job!
+  "Run a claimed training job to completion and publish its outcome. job-fn returns a message map
+   (:type :alert/:info/:success) or nil for a plain success."
+  [job-fn]
+  (let [result (try
+                 (or (job-fn) training-success-message)
+                 (catch Throwable e
+                   (t/log! {:level :error :error e} "Model training failed.")
+                   {:type :alert :content "Training failed. The existing model remains active."}))]
+    (swap! training-progress assoc :status :finished :phase :finished :finished-at (System/currentTimeMillis) :result result)
+    result))
+
+(defn run-training-job!
+  "Synchronously run job-fn as the current training run (used by the automatic scheduler). Returns its
+   result message, or training-busy-message when another run holds the slot."
+  [label job-fn]
+  (if (claim-training-run! label)
+    (execute-training-job! job-fn)
+    training-busy-message))
+
+(defn start-training-job!
+  "Run job-fn as the current training run on a background thread. Returns true when the run was
+   started and false when another run is already in progress."
+  [label job-fn]
+  (if (claim-training-run! label)
+    (do (async/thread (execute-training-job! job-fn)) true)
+    false))
+
+(defn manual-training-job
+  "Retrain the active model; a successful run is recorded for the daily schedule."
+  []
+  (if-let [result (write-emails-to-training-files-and-train)]
+    result
+    (do (p/record-successful-training! (Instant/now)) nil)))
+
+(defn training-status
+  "The progress page's JSON view of the current run."
+  []
+  (let [state @training-progress]
+    (-> (select-keys state [:status :label :phase :language :language-index :languages :iteration :iterations
+                            :emails-written :emails-total :started-at :finished-at :result])
+        (assoc :percent (training-percent state)))))
+
+(defn training-progress-url [back] (str "/training/progress?back=" (java.net.URLEncoder/encode (str back) "UTF-8")))
 
 (def model-switch-confirmation "Start training")
 
@@ -235,15 +339,15 @@
 
 (defn- run-automatic-training! []
   ;; Never let an exception escape the scheduled task: ScheduledExecutorService would otherwise
-  ;; silently suppress every subsequent run.
+  ;; silently suppress every subsequent run. run-training-job! turns failures into an :alert result.
   (try
     (t/log! :info "Starting automatic model training.")
-    (if-let [result (write-emails-to-training-files-and-train)]
-      (do (t/log! :warn ["Automatic model training was skipped:" (:content result)])
-          false)
-      (do (p/record-successful-training! (Instant/now))
-          (t/log! :info "Automatic model training completed.")
-          true))
+    (let [result (run-training-job! "Automatic training" manual-training-job)]
+      (if (= :success (:type result))
+        (do (t/log! :info "Automatic model training completed.")
+            true)
+        (do (t/log! :warn ["Automatic model training did not complete:" (:content result) "Plauna will try again at the next scheduled time."])
+            false)))
     (catch Throwable e
       (t/log! {:level :error :error e}
               "Automatic model training failed. Plauna will try again at the next scheduled time.")
@@ -618,13 +722,53 @@
         (db/finish-parse-batch! batch-id {})
         (throw e)))))
 
+(defn batch-move-url [batch-id] (str "/parse-batches/" batch-id "/move"))
+
+(defn batch-move-summary-message
+  "Toast for a finished 'move batch to category folders' job."
+  [{:keys [folder moved total not-found failed uncategorized]}]
+  {:type (if (pos? (+ not-found failed)) :info :success)
+   :content (str "Moved " moved " of " total " categorized e-mail(s) of the " folder " batch into their category folders."
+                 (when (pos? not-found) (str " " not-found " were not found on the server."))
+                 (when (pos? failed) (str " " failed " could not be moved (see the logs)."))
+                 (when (pos? uncategorized) (str " " uncategorized " e-mail(s) without a category were left in place.")))})
+
+(defn start-batch-move!
+  "Move the categorized e-mails of a parse batch into their category folders on a background thread,
+   publishing progress in batch-moves and a toast on completion. Returns false when a move for the
+   batch is already running."
+  [context {:keys [id folder connection-id]}]
+  (let [[before _] (swap-vals! batch-moves
+                               (fn [moves]
+                                 (if (= "running" (get-in moves [id :status]))
+                                   moves
+                                   (assoc moves id {:status "running" :moved 0 :total 0 :not-found 0 :failed 0}))))]
+    (if (= "running" (get-in before [id :status]))
+      false
+      (do (async/thread
+            (let [summary (try
+                            (app/move-parse-batch-emails! context id connection-id
+                                                          (fn [progress] (swap! batch-moves update id merge progress)))
+                            (catch Throwable e
+                              (t/log! {:level :error :error e} ["Moving parse batch" id "failed"])
+                              {:total 0 :moved 0 :not-found 0 :failed 0 :uncategorized 0 :error true}))]
+              (swap! batch-moves update id merge summary {:status "finished"})
+              (add-to-messages (if (:error summary)
+                                 {:type :alert :content (str "Moving the " folder " batch failed. Please see the logs.")}
+                                 (batch-move-summary-message (assoc summary :folder folder))))))
+          true))))
+
 (defn connection-parse-batches
   "The recent folder parse runs of a connection for the connection page, plus whether one is running."
   [id]
-  (let [batches (mapv (fn [batch] (assoc batch :emails-url (batch-emails-url (:id batch))))
+  (let [moves @batch-moves
+        batches (mapv (fn [batch] (assoc batch
+                                         :emails-url (batch-emails-url (:id batch))
+                                         :move-url (batch-move-url (:id batch))
+                                         :move (get moves (:id batch))))
                       (db/parse-batches-for-connection id 10))]
     {:parse-batches batches
-     :parse-running? (boolean (some #(= "running" (:status %)) batches))}))
+     :parse-running? (boolean (some #(or (= "running" (:status %)) (= "running" (get-in % [:move :status]))) batches))}))
 
 (defn recategorize-email-response
   "Handle an inline category change. A missing IMAP message is reported separately so the browser
@@ -889,7 +1033,11 @@
              (redirect-request request)))))
 
    (comp/POST "/admin/preferences/model" request
-     (redirect-request request (switch-categorization-model! (:params request))))
+     ;; The switch may train a complete model set, so it runs like a manual training run.
+     (let [params (:params request)]
+       (if (start-training-job! "Model switch" #(switch-categorization-model! params))
+         (redirect (training-progress-url "/admin/preferences") 303)
+         (redirect-request request training-busy-message))))
 
    (comp/POST "/admin/languages" {params :params}
      (let [langs-to-use (if (vector? (:use params)) (:use params) [(:use params)])]
@@ -964,15 +1112,20 @@
      (redirect-to-referer request))
 
    (comp/POST "/training" request
-     (let [result (try
-                    (write-emails-to-training-files-and-train)
-                    (catch Throwable e
-                      (t/log! {:level :error :error e} "Manual categorization training failed.")
-                      {:type :alert :content "Training failed. The existing model remains active."}))]
-       (if (some? result)
-         (swap! global-messages conj result)
-         (p/record-successful-training! (Instant/now)))
-       (redirect-to-referer request)))
+     ;; Training runs in the background; the browser is sent to a progress page that polls
+     ;; /training/status. A synchronous response used to exceed reverse proxy timeouts (504).
+     (let [back (or (same-origin-referer request) "/emails")]
+       (start-training-job! "Manual training" manual-training-job)
+       (redirect (training-progress-url back) 303)))
+
+   (comp/GET "/training/progress" request
+     (let [back (safe-redirect-path (get-in request [:params :back]) "/emails")]
+       (success-html-with-body (markup/training-progress-page back))))
+
+   (comp/GET "/training/status" _
+     {:status 200
+      :headers {"Content-Type" "application/json; charset=UTF-8" "Cache-Control" "no-store"}
+      :body (generate-string (training-status))})
 
    (comp/POST "/training/new" request
      (let [n (get (:route-params request) :new 20)]
@@ -981,8 +1134,24 @@
 
    (comp/GET "/emails" {params :params}
      (let [parse-fn (template->request-parameters emails-template)
-           result (app/fetch-emails context (parse-fn params))]
-       (success-html-with-body (result-with-messages (markup/list-emails (:data result) (:parameters result) (:optional result)) global-messages))))
+           result (app/fetch-emails context (parse-fn params))
+           batch-id (get-in result [:parameters :batch])
+           options (cond-> (:optional result)
+                     (some? batch-id) (assoc :batch-move-url (batch-move-url batch-id)))]
+       (success-html-with-body (result-with-messages (markup/list-emails (:data result) (:parameters result) options) global-messages))))
+
+   (comp/POST "/parse-batches/:id/move" request
+     (let [batch-id (:id (:route-params request))
+           batch (db/parse-batch batch-id)]
+       (cond
+         (nil? batch)
+         (redirect-request request {:type :alert :content "Unknown parse batch."})
+
+         (not (start-batch-move! context batch))
+         (redirect-request request {:type :info :content "This batch is already being moved."})
+
+         :else
+         (redirect (str "/admin/connections/" (:connection-id batch)) 303))))
 
    (comp/GET "/emails/:id" [id]
      (let [decoded-id (new String ^"[B" (base64-decode id))

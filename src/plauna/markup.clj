@@ -248,6 +248,11 @@
   ([config folders categories] (render "admin-connection.html" (connection-context config folders categories)))
   ([config folders messages categories] (render "admin-connection.html" (assoc (connection-context config folders categories) :messages (mapv type->toast-role messages)))))
 
+(defn training-progress-page
+  "The live progress view of a model training run; back is the same-origin path to return to."
+  [back]
+  (render "training-progress.html" {:active-nav :emails :back back}))
+
 (defn preferences-page
   ([data] (preferences-page data nil))
   ([data messages]

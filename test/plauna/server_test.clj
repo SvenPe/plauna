@@ -465,3 +465,52 @@
   (let [parse-fn (server/template->request-parameters server/emails-template)]
     (is (= "run-1" (:batch (parse-fn {:batch "run-1"}))))
     (is (nil? (:batch (parse-fn {}))))))
+
+(deftest training-percent-moves-through-collection-and-per-language-training
+  (is (= 0 (server/training-percent {:status :running :phase :starting})))
+  (is (= 0 (server/training-percent {:status :running :phase :collecting :emails-written 0 :emails-total 200})))
+  (is (= 13 (server/training-percent {:status :running :phase :collecting :emails-written 100 :emails-total 200})))
+  (is (= 25 (server/training-percent {:status :running :phase :training :languages 2 :language-index 1 :iteration 0 :iterations 1000})))
+  (is (= 44 (server/training-percent {:status :running :phase :training :languages 2 :language-index 1 :iteration 500 :iterations 1000})))
+  (is (= 63 (server/training-percent {:status :running :phase :training :languages 2 :language-index 2 :iteration 0 :iterations 1000})))
+  (is (= 100 (server/training-percent {:status :finished :phase :finished})))
+  (is (= 25 (server/training-percent {:status :running :phase :training :languages 0 :language-index 0 :iteration nil :iterations nil}))
+      "Missing counts never divide by zero"))
+
+(deftest only-one-training-job-runs-at-a-time
+  (let [release (promise)
+        finished (promise)]
+    (reset! server/training-progress {:status :idle})
+    (is (true? (server/start-training-job! "Manual training" (fn [] @release (deliver finished true) nil))))
+    (is (true? (server/training-running?)))
+    (is (false? (server/start-training-job! "Manual training" (fn [] nil))) "A second start is refused while the first runs")
+    (is (= server/training-busy-message (server/run-training-job! "Automatic training" (fn [] nil)))
+        "The scheduler also waits instead of running concurrently")
+    (deliver release true)
+    (is (true? (deref finished 2000 false)))
+    (let [deadline (+ (System/currentTimeMillis) 2000)]
+      (while (and (server/training-running?) (< (System/currentTimeMillis) deadline)) (Thread/sleep 10)))
+    (let [status (server/training-status)]
+      (is (= :finished (:status status)))
+      (is (= 100 (:percent status)))
+      (is (= server/training-success-message (:result status)) "A nil job result is reported as success"))
+    (is (true? (server/start-training-job! "Manual training" (fn [] {:type :alert :content "nothing to train"}))) "A finished slot can be claimed again")
+    (let [deadline (+ (System/currentTimeMillis) 2000)]
+      (while (and (server/training-running?) (< (System/currentTimeMillis) deadline)) (Thread/sleep 10)))
+    (is (= {:type :alert :content "nothing to train"} (:result (server/training-status))))))
+
+(deftest failing-training-job-is-reported-not-thrown
+  (reset! server/training-progress {:status :idle})
+  (let [result (server/run-training-job! "Manual training" (fn [] (throw (ex-info "boom" {}))))]
+    (is (= :alert (:type result)))
+    (is (= :finished (:status @server/training-progress)))))
+
+(deftest batch-move-summary-message-explains-the-outcome
+  (let [clean (server/batch-move-summary-message {:folder "Old" :moved 90 :total 90 :not-found 0 :failed 0 :uncategorized 10})
+        partial (server/batch-move-summary-message {:folder "Old" :moved 80 :total 90 :not-found 7 :failed 3 :uncategorized 0})]
+    (is (= :success (:type clean)))
+    (is (str/includes? (:content clean) "Moved 90 of 90"))
+    (is (str/includes? (:content clean) "10 e-mail(s) without a category were left in place"))
+    (is (= :info (:type partial)))
+    (is (str/includes? (:content partial) "7 were not found"))
+    (is (str/includes? (:content partial) "3 could not be moved"))))

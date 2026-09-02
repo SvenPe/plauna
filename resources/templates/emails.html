@@ -68,6 +68,12 @@
   <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('batch')" title="Remove parse batch filter">
     {{page.batch-filter-label}} <span aria-hidden="true">×</span>
   </button>
+  {% if batch-move-url %}
+  <form action="{{batch-move-url}}" method="post" class="inline" onsubmit="return confirm('Move every categorized e-mail of this batch into its category folder on the IMAP server?')">
+    <input type="hidden" name="redirect-url" value="/emails?batch={{page.batch}}" />
+    <button class="btn btn-outline btn-xs" type="submit" title="For a batch that was parsed without 'Move e-mails after categorization'">Move batch to category folders</button>
+  </form>
+  {% endif %}
   {% endif %}
   {% if page.search-active? %}
   <button type="button" class="badge badge-primary gap-1" onclick="clearAppliedFilter('search')" title="Remove body search">
