@@ -10,8 +10,8 @@
   (:import
    (plauna.core.email Header Body-Part Participant Email)
    (clojure.lang PersistentVector)
-   (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException)
-   (jakarta.mail.internet InternetAddress)
+   (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException MessagingException)
+   (jakarta.mail.internet InternetAddress MailDateFormat MimeMessage MimeUtility)
    (org.eclipse.angus.mail.imap IMAPFolder IMAPMessage)
    (jakarta.mail.event ConnectionAdapter ConnectionEvent MessageCountAdapter MessageCountEvent MessageCountListener)
    (jakarta.mail.search MessageIDTerm)
@@ -212,17 +212,20 @@
                 (mime-type (.getContentType message))
                 (when sent (quot (.getTime sent) 1000)))))
 
-(defmulti create-body-part (fn [body-part _] (type body-part)))
+;; Body parts receive the Message-ID explicitly instead of asking the message again: getMessageID
+;; needs the IMAP ENVELOPE, which is exactly what is unavailable for the messages handled by the
+;; raw-header fallback below (see envelope-or-raw-headers).
+(defmulti create-body-part (fn [body-part _ _] (type body-part)))
 
-(defmethod create-body-part String [content ^IMAPMessage message]
-  (new Body-Part (.getMessageID message) (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) content (.getFileName message) (.getDisposition message)))
+(defmethod create-body-part String [content ^IMAPMessage message message-id]
+  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) content (.getFileName message) (.getDisposition message)))
 
-(defmethod create-body-part BodyPart [^BodyPart bodypart ^IMAPMessage message]
+(defmethod create-body-part BodyPart [^BodyPart bodypart ^IMAPMessage message message-id]
   (let [content-type (.getContentType bodypart)
         content (.getContent bodypart)]
     (if (instance? Multipart content)
-      (create-body-part content message)
-      (new Body-Part (.getMessageID message) (charset content-type) (mime-type content-type) (first (.getHeader bodypart "Content-transfer-encoding"))
+      (create-body-part content message message-id)
+      (new Body-Part message-id (charset content-type) (mime-type content-type) (first (.getHeader bodypart "Content-transfer-encoding"))
            ;; Only persist textual content (as a String). For attachments (PDFs, images, ...) JavaMail
            ;; returns the content as an InputStream; storing that bloats the DB and, on MariaDB, fails the
            ;; insert outright (leaving a header with no body parts). Attachments are intentionally not
@@ -230,13 +233,13 @@
            (when (and (text? content-type) (string? content)) content)
            (.getFileName bodypart) (disposition (.getDisposition bodypart))))))
 
-(defmethod create-body-part :default [_ ^IMAPMessage message]
+(defmethod create-body-part :default [_ ^IMAPMessage message message-id]
   ;; A non-multipart message whose body is neither a String nor a recognised part (e.g. a bare
   ;; attachment): keep its metadata but do not store the (binary) content.
-  (new Body-Part (.getMessageID message) (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) nil (.getFileName message) (.getDisposition message)))
+  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) nil (.getFileName message) (.getDisposition message)))
 
-(defmethod create-body-part Multipart [^Multipart multipart ^IMAPMessage message]
-  (mapv (fn [i] (create-body-part (.getBodyPart multipart i) message))
+(defmethod create-body-part Multipart [^Multipart multipart ^IMAPMessage message message-id]
+  (mapv (fn [i] (create-body-part (.getBodyPart multipart i) message message-id))
         (range 0 (.getCount multipart))))
 
 (defn- realize-body-parts [body-parts]
@@ -262,11 +265,83 @@
         bcc-participants (mapv (fn [address] (create-participant address :bcc message-id)) (.getRecipients message Message$RecipientType/BCC))]
     (filterv some? (flatten [sender-participant recipient-participants cc-participants bcc-participants]))))
 
+;; Raw-header fallback. IMAPMessage answers getMessageID/getSubject/getSentDate/getSender/getRecipients
+;; from the server's ENVELOPE. For a message with malformed address headers some servers return an
+;; ENVELOPE that angus-mail cannot parse, and every one of those accessors then fails with
+;; "Failed to load IMAP envelope" - forever, on every backfill. The raw header block (getHeader) is
+;; fetched separately and parses fine, so these helpers rebuild the same data from it, leniently.
+
+(defn raw-header
+  "The first value of a header, or nil."
+  [^MimeMessage message ^String name]
+  (first (.getHeader message name)))
+
+(defn decode-header-text
+  "Decode RFC 2047 encoded words; return the text unchanged if it is not decodable."
+  [text]
+  (when (some? text)
+    (try (MimeUtility/decodeText text) (catch Exception _ text))))
+
+(defn header-date-seconds
+  "Parse an RFC 5322 Date header into epoch seconds, or nil if it is missing or unparseable."
+  [text]
+  (when-not (s/blank? text)
+    (try (quot (.getTime (.parse (MailDateFormat.) (s/trim text))) 1000)
+         (catch Exception _ nil))))
+
+(defn- valid-address? [^InternetAddress address]
+  (try (.validate address) true (catch Exception _ false)))
+
+(defn header-addresses
+  "Every syntactically valid address of a header, parsed leniently. Invalid entries (and a header that
+   cannot be parsed at all) are dropped instead of failing the whole message."
+  [^MimeMessage message ^String name]
+  (let [values (.getHeader message name)]
+    (if (empty? values)
+      []
+      (try (filterv valid-address? (InternetAddress/parseHeader (s/join ", " values) false))
+           (catch Exception e
+             (t/log! :debug ["Ignoring unparseable" name "header:" (.getMessage e)])
+             [])))))
+
+(defn header-from-raw-headers [^MimeMessage message]
+  (new Header (raw-header message "Message-ID")
+              (raw-header message "In-Reply-To")
+              (decode-header-text (raw-header message "Subject"))
+              (mime-type (.getContentType message))
+              (header-date-seconds (raw-header message "Date"))))
+
+(defn participants-from-raw-headers [^MimeMessage message message-id]
+  (let [from (or (first (header-addresses message "From")) (first (header-addresses message "Sender")))
+        sender-participant (when from (create-participant from :sender message-id))
+        recipients (mapv #(create-participant % :receiver message-id) (header-addresses message "To"))
+        cc (mapv #(create-participant % :cc message-id) (header-addresses message "Cc"))
+        bcc (mapv #(create-participant % :bcc message-id) (header-addresses message "Bcc"))]
+    (filterv some? (flatten [sender-participant recipients cc bcc]))))
+
+(defn- envelope-or-raw-headers
+  "The [header participants] of a message: from the IMAP ENVELOPE when the server delivers a usable
+   one, otherwise rebuilt from the raw header block."
+  [^IMAPMessage message]
+  (try
+    [(create-header message) (create-participants message)]
+    (catch MessagingException e
+      (t/log! :info ["The IMAP envelope of message" (.getMessageNumber message) "could not be loaded (" (.getMessage e) "). Reading its raw headers instead."])
+      (let [header (header-from-raw-headers message)]
+        [header (participants-from-raw-headers message (:message-id header))]))))
+
+(defn message-id-of
+  "The Message-ID of an IMAP message, from the ENVELOPE or, when that cannot be loaded, the raw header."
+  [^IMAPMessage message]
+  (try (.getMessageID message)
+       (catch MessagingException _ (raw-header message "Message-ID"))))
+
 (defn message->email [^IMAPMessage message]
-  (new Email
-       (create-header message)
-       (realize-body-parts (create-body-part (.getContent message) message))
-       (create-participants message)))
+  (let [[header participants] (envelope-or-raw-headers message)]
+    (new Email
+         header
+         (realize-body-parts (create-body-part (.getContent message) message (:message-id header)))
+         participants)))
 
 ;; Calls
 
@@ -792,7 +867,8 @@
       {:email (message->email message)
        :message message}))
   (nth-message-id-from-folder [_ n folder]
-    ;; getMessageID only loads the envelope, not the body, so this stays cheap for known messages.
+    ;; Only the envelope (or, as a fallback, the header block) is loaded, not the body, so this stays
+    ;; cheap for known messages.
     (let [^IMAPMessage message (.getMessage ^IMAPFolder folder n)]
       (set-message-as-peek message)
-      (.getMessageID message))))
+      (message-id-of message))))

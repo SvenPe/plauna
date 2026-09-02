@@ -5,7 +5,9 @@
             [plauna.core.email :as core-email :refer [->Email ->Participant]]
             [taoensso.telemere :as t])
   (:import (java.util Properties)
-           (jakarta.mail Session)))
+           (java.io ByteArrayInputStream)
+           (jakarta.mail Session)
+           (jakarta.mail.internet MimeMessage)))
 
 (t/set-ns-filter! {:disallow "plauna.*"})
 
@@ -285,3 +287,38 @@
       (finally
         (swap! client/connections dissoc "listener-test")
         (swap! @intentional disj "listener-test")))))
+
+(defn- mime-message [^String raw]
+  (MimeMessage. (Session/getInstance (Properties.)) (ByteArrayInputStream. (.getBytes raw "UTF-8"))))
+
+(deftest raw-header-fallback-rebuilds-header-and-participants
+  (let [message (mime-message (str "Message-ID: <broken-envelope@example.com>\r\n"
+                                   "In-Reply-To: <parent@example.com>\r\n"
+                                   "Subject: =?UTF-8?Q?Rechnung_f=C3=BCr_M=C3=A4rz?=\r\n"
+                                   "Date: Tue, 2 Sep 2026 10:00:00 +0200\r\n"
+                                   "From: \"Shop\" <shop@example.com>\r\n"
+                                   "To: me@example.com, Other <other@example.com>\r\n"
+                                   "Cc: this is not an address\r\n"
+                                   "Content-Type: text/plain; charset=utf-8\r\n"
+                                   "\r\n"
+                                   "Hello\r\n"))
+        header (client/header-from-raw-headers message)
+        participants (client/participants-from-raw-headers message (:message-id header))]
+    (is (= "<broken-envelope@example.com>" (:message-id header)))
+    (is (= "<parent@example.com>" (:in-reply-to header)))
+    (is (= "Rechnung für März" (:subject header)) "Encoded words are decoded")
+    (is (= "text/plain" (:mime-type header)))
+    (is (= 1788336000 (:date header)) "The Date header (10:00 +02:00) is parsed to epoch seconds, 08:00 UTC")
+    (is (= [[:sender "shop@example.com" "Shop"] [:receiver "me@example.com" nil] [:receiver "other@example.com" "Other"]]
+           (mapv (juxt :type :address :name) participants))
+        "From and To are parsed leniently; the unparseable Cc header is dropped instead of failing")
+    (is (every? #(= "<broken-envelope@example.com>" (:message-id %)) participants))))
+
+(deftest raw-header-fallback-tolerates-missing-headers
+  (let [message (mime-message "Content-Type: text/plain\r\n\r\nbody\r\n")
+        header (client/header-from-raw-headers message)]
+    (is (nil? (:message-id header)))
+    (is (nil? (:subject header)))
+    (is (nil? (:date header)))
+    (is (= [] (client/participants-from-raw-headers message nil)))
+    (is (nil? (client/header-date-seconds "not a date")))))

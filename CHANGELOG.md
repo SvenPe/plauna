@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### 🐛 Bug Fixes
+
+- Read e-mails whose IMAP ENVELOPE the server delivers in a form the mail library cannot parse
+  (typically malformed address headers, reported as "Failed to load IMAP envelope"). Such messages
+  failed on every backfill and folder parse; Plauna now rebuilds Message-ID, subject, date and
+  participants from the raw header block instead, parsing addresses leniently.
+
 ### ✨ Features
 
 - Allow explicitly selected mTLS client certificates, verified by an NGINX reverse proxy, to bypass
