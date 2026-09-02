@@ -6,11 +6,12 @@
    [clojure.string :as s]
    [taoensso.telemere :as t]
    [plauna.interfaces :as int]
-   [plauna.application :as app])
+   [plauna.application :as app]
+   [clojure.core.async :as async])
   (:import
    (plauna.core.email Header Body-Part Participant Email)
    (clojure.lang PersistentVector)
-   (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException MessagingException)
+   (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException MessagingException FetchProfile FetchProfile$Item)
    (jakarta.mail.internet InternetAddress MailDateFormat MimeMessage MimeUtility)
    (org.eclipse.angus.mail.imap IMAPFolder IMAPMessage)
    (jakarta.mail.event ConnectionAdapter ConnectionEvent MessageCountAdapter MessageCountEvent MessageCountListener)
@@ -465,6 +466,23 @@
 
 (defn- set-messages-as-peek [messages] (doseq [message messages] (set-message-as-peek message)))
 
+(defn- move-message-between-open-folders!
+  "Search message-id in source-folder and move it to target-folder; both folders are already open on
+   the same Store. Records the new location. Returns true or :not-found."
+  [connection-id ^IMAPFolder source-folder ^IMAPFolder target-folder ^String source-folder-name ^String target-folder-name message-id]
+  (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
+    (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
+    (if (some? (seq found-messages))
+      (do
+        (set-messages-as-peek found-messages)
+        (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name "using a dedicated IMAP connection"])
+        (.moveMessages source-folder (into-array Message found-messages) target-folder)
+        (db/update-email-folder message-id target-folder-name)
+        (db/update-email-connection message-id connection-id)
+        true)
+      (do (t/log! :info ["No messages found in" source-folder-name "for" message-id])
+          :not-found))))
+
 (defn move-message-on-dedicated-store!
   "Move message-id between two folders using a short-lived Store that is independent of IdleManager.
    The Store and both folders are always closed after the attempt."
@@ -474,19 +492,29 @@
   (with-open [^Store move-store (login connection-config)
               ^IMAPFolder target-folder (open-folder-in-store move-store target-folder-name)
               ^IMAPFolder source-folder (open-folder-in-store move-store source-folder-name)]
-    (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
-      (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
-      (if (some? (seq found-messages))
-        (do
-          (set-messages-as-peek found-messages)
-          (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name
-                          "using a dedicated IMAP connection"])
-          (.moveMessages source-folder (into-array Message found-messages) target-folder)
-          (db/update-email-folder message-id target-folder-name)
-          (db/update-email-connection message-id (:id connection-config))
-          true)
-        (do (t/log! :info ["No messages found in" source-folder-name "in store" (.getURLName move-store)])
-            :not-found)))))
+    (move-message-between-open-folders! (:id connection-config) source-folder target-folder source-folder-name target-folder-name message-id)))
+
+(defn- resolve-move-folders
+  "[source-folder-name target-folder-name] for moving message-id into category target-name on the
+   connection. The recorded folder is the source; without one the e-mail predates folder tracking and
+   lives under the DEFAULT folder of source-name, never a (newer, possibly-changed) custom destination."
+  [^ConnectionData connection-data message-id ^String source-name ^String target-name]
+  (let [^Store monitored-store (:store connection-data)
+        connection-config (:config connection-data)
+        recorded-folder (db/email-folder message-id)]
+    [(if (s/blank? recorded-folder)
+       (inbox-or-default-category-folder-name monitored-store source-name (:folder connection-config))
+       recorded-folder)
+     (inbox-or-category-folder-name monitored-store target-name (:folder connection-config))]))
+
+(defn- record-in-place!
+  "Nothing moves, but record the resolved location so a previously-unrecorded (legacy) e-mail gets a
+   concrete folder and account and stays findable for future moves."
+  [connection-id message-id folder-name]
+  (t/log! :info ["Source and target folder are both" folder-name "- leaving the message in place."])
+  (db/update-email-folder message-id folder-name)
+  (db/update-email-connection message-id connection-id)
+  true)
 
 (defn move-messages-by-id-between-category-folders
   "Return true if the message could be moved, :not-found if its source folder was searched but no
@@ -494,28 +522,51 @@
   [^String id message-id ^String source-name ^String target-name _context]
   (let [^ConnectionData connection-data (connection-data-from-id id)]
     (if (and (some? connection-data) (connected? connection-data))
-      (let [^Store monitored-store (:store connection-data)
-            connection-config (:config connection-data)
-            ^String source-folder-name (let [recorded-folder (db/email-folder message-id)]
-                                         (if (s/blank? recorded-folder)
-                                           ;; No recorded folder: the email predates folder tracking, so it lives under
-                                           ;; the DEFAULT category folder, never a (newer, possibly-changed) custom destination.
-                                           (inbox-or-default-category-folder-name monitored-store source-name (:folder connection-config))
-                                           recorded-folder))
-            ^String target-folder-name (inbox-or-category-folder-name monitored-store target-name (:folder connection-config))]
+      (let [[source-folder-name target-folder-name] (resolve-move-folders connection-data message-id source-name target-name)]
         (if (= source-folder-name target-folder-name)
-          (do (t/log! :info ["Source and target folder are both" target-folder-name "- leaving the message in place."])
-              ;; Even though nothing moves, record the resolved folder so a previously-unrecorded
-              ;; (legacy) email gets a concrete location and stays findable for future moves.
-              (db/update-email-folder message-id target-folder-name)
-              (db/update-email-connection message-id id)
-              true)
+          (record-in-place! id message-id target-folder-name)
           ;; Never open move folders on the Store used by IdleManager. Closing either folder after the
           ;; move could otherwise close the monitored INBOX and create a gap in real-time delivery.
-          (move-message-on-dedicated-store! connection-config source-folder-name target-folder-name message-id)))
+          (move-message-on-dedicated-store! (:config connection-data) source-folder-name target-folder-name message-id)))
       (do
         (t/log! :info ["IMAP store in connection" id "is not connected. Cancelling the move attempt."])
         false))))
+
+(defn move-emails-by-id!
+  "Move many stored messages ([{:message-id :category}]) into their category folders over ONE dedicated
+   Store, keeping every folder open for the whole run: one login (and one OAuth refresh) instead of one
+   per message. Returns the results in order: true, :not-found or false. A message whose move throws
+   counts as false and does not stop the others."
+  [^String id moves]
+  (let [^ConnectionData connection-data (connection-data-from-id id)]
+    (if-not (and (some? connection-data) (connected? connection-data))
+      (do (t/log! :info ["IMAP store in connection" id "is not connected. Cancelling the batch move."])
+          (vec (repeat (count moves) false)))
+      (let [connection-config (:config connection-data)
+            open-folders (atom {})]
+        (when (oauth2? connection-config) (refresh-access-token connection-config))
+        (with-open [^Store move-store (login connection-config)]
+          (let [folder-named (fn ^IMAPFolder [^String folder-name]
+                               (or (get @open-folders folder-name)
+                                   (let [folder (open-folder-in-store move-store folder-name)]
+                                     (swap! open-folders assoc folder-name folder)
+                                     folder)))]
+            (try
+              (mapv (fn [{:keys [message-id category]}]
+                      (try
+                        (let [[source-folder-name target-folder-name] (resolve-move-folders connection-data message-id category category)]
+                          (if (= source-folder-name target-folder-name)
+                            (record-in-place! id message-id target-folder-name)
+                            (move-message-between-open-folders! id (folder-named source-folder-name) (folder-named target-folder-name)
+                                                                source-folder-name target-folder-name message-id)))
+                        (catch Exception e
+                          (t/log! {:level :error :error e} ["Moving" message-id "failed"])
+                          false)))
+                    moves)
+              (finally
+                (doseq [^IMAPFolder folder (vals @open-folders)]
+                  (try (when (.isOpen folder) (.close folder false))
+                       (catch Exception e (t/log! {:level :warn :error e} "Error closing a batch-move folder"))))))))))))
 
 (defn- invalid-grant-error?
   "True only when the provider explicitly rejected the refresh token (HTTP 4xx with an
@@ -581,15 +632,18 @@
     (when-not (contains? before id)
       (t/log! :warn ["The IMAP store of connection" id "closed unexpectedly. Reconnecting in" store-close-recovery-delay-seconds "seconds."])
       (try
+        ;; The scheduler only times the grace period; the blocking reconnect runs on its own thread so
+        ;; several recoveries never starve the other connections' health checks on the small pool.
         (.schedule ^ScheduledExecutorService executor-service
                    ^Runnable (fn []
-                               (try
-                                 (when-let [connection-data (connection-data-from-id id)]
-                                   (when-not (contains? @intentional-closes id)
-                                     (restore-connection-if-needed! connection-data context)))
-                                 (catch Exception e
-                                   (t/log! {:level :error :error e} ["Recovering connection" id "after an unexpected store close failed."]))
-                                 (finally (swap! recoveries-in-progress disj id))))
+                               (async/thread
+                                 (try
+                                   (when-let [connection-data (connection-data-from-id id)]
+                                     (when-not (contains? @intentional-closes id)
+                                       (restore-connection-if-needed! connection-data context)))
+                                   (catch Exception e
+                                     (t/log! {:level :error :error e} ["Recovering connection" id "after an unexpected store close failed."]))
+                                   (finally (swap! recoveries-in-progress disj id)))))
                    (long store-close-recovery-delay-seconds) TimeUnit/SECONDS)
         (catch java.util.concurrent.RejectedExecutionException _
           ;; Shutting down: the executor is gone and so is the need to recover.
@@ -663,7 +717,10 @@
       (disconnect connection-data)
       (catch Exception e
         (t/log! {:level :warn :error e} ["Error while closing connection" id "before removing it from the registry."])))
-    (swap! connections dissoc id)))
+    (swap! connections dissoc id)
+    ;; Nothing is registered under this id any more, so the store listener ignores its CLOSED event by
+    ;; itself; the marker would otherwise outlive the connection.
+    (swap! intentional-closes disj id)))
 
 (defn disconnect-all [] (doseq [connection (vals @connections)] (disconnect connection)))
 
@@ -720,9 +777,11 @@
 
 (defn restore-connection-if-needed!
   "Reconnect a dropped store, back-fill mail missed meanwhile, reopen the monitored folder and resume
-   IDLE. Shared by the periodic health check and the store's connection listener."
+   IDLE. Shared by the periodic health check and the store's connection listener; the two are
+   serialized per connection so a drop is never repaired twice at once."
   [^ConnectionData connection-data context]
-  (let [^Store store (:store connection-data)
+  (locking connection-data
+   (let [^Store store (:store connection-data)
         ^Folder folder (:folder connection-data)
         config (:config connection-data)]
     (try
@@ -744,7 +803,7 @@
       (t/log! :debug "Idling and waiting for messages after a health check.")
       (start-idling-for-id (:id config))
       (catch Exception e
-        (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state.")))))
+        (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state."))))))
 
 (defn schedule-health-checks [^ConnectionData connection-data context]
   (let [config (:config connection-data)
@@ -857,6 +916,19 @@
   (connection-id-for-email [_ connections email] (connection-id-for-email connections email))
   (move-email-between-categories [_ connection-id message-id old-category new-category context] (move-messages-by-id-between-category-folders connection-id message-id old-category new-category context))
   (move-email-to-category [_ connection-id message original-folder category] (move-message connection-id message original-folder category))
+  (move-emails-by-id [_ connection-id moves] (move-emails-by-id! connection-id moves))
+  (prefetch-message-identities [_ folder from to]
+    ;; One FETCH for a whole range of envelopes, so the per-message identity lookups that follow are
+    ;; answered from the cache. Best effort: a range the server cannot serve is simply read one by one.
+    (try
+      (let [^IMAPFolder folder folder
+            messages (.getMessages folder (int (min from to)) (int (max from to)))
+            profile (doto (FetchProfile.) (.add FetchProfile$Item/ENVELOPE))]
+        (.fetch folder messages profile)
+        (count messages))
+      (catch Exception e
+        (t/log! :debug ["Could not prefetch envelopes" from "-" to ":" (.getMessage e)])
+        0)))
   (current-folder-name [_ folder] (.getFullName ^Folder folder))
   (open-folder-for-bulk-read [_ connection-data folder-name] (open-folder-for-bulk-read connection-data folder-name))
   (close-folder-for-bulk-read [_ bulk-handle] (close-folder-for-bulk-read bulk-handle))

@@ -106,6 +106,8 @@
   []
   (if (mariadb?) [:unix_timestamp] [:strftime "%s" "now"]))
 
+(defn- in-clause-placeholders [n] (string/join ", " (repeat n "?")))
+
 ;; Insert Clauses
 
 (defn insert->insert-ignore [insert-query]
@@ -426,28 +428,30 @@
                                      :limit limit}) builder-function-kebab))
 
 (defn fetch-training-tokens-for
-  "Cached classification tokens as {message-id tokens} for the given ids."
-  [message-ids]
+  "Cached classification tokens as {message-id tokens} for the given ids, only from rows produced by
+   the given tokenizer version (older rows are ignored and get recomputed)."
+  [message-ids version]
   (if (empty? message-ids)
     {}
     (into {} (map (juxt :message_id :tokens))
           (jdbc/execute! (ds)
-                         (into [(str "SELECT message_id, tokens FROM training_tokens WHERE message_id IN (" (string/join ", " (repeat (count message-ids) "?")) ")")]
+                         (into [(str "SELECT message_id, tokens FROM training_tokens WHERE version = ? AND message_id IN (" (in-clause-placeholders (count message-ids)) ")") version]
                                message-ids)
                          builder-function))))
 
 (defn save-training-tokens!
-  "Cache classification tokens ({message-id tokens}); an existing row is replaced."
-  [tokens-by-id]
+  "Cache classification tokens ({message-id tokens}) produced by the given tokenizer version; an
+   existing row is replaced."
+  [tokens-by-id version]
   (when (seq tokens-by-id)
     (let [now (epoch-seconds)
           insert (builder/for-insert-multi :training_tokens
-                                           [:message_id :tokens :generated_at]
-                                           (mapv (fn [[id tokens]] [id tokens now]) tokens-by-id)
+                                           [:message_id :tokens :generated_at :version]
+                                           (mapv (fn [[id tokens]] [id tokens now version]) tokens-by-id)
                                            {})]
       (jdbc/execute! (ds)
                      (if (mariadb?)
-                       (conj (rest insert) (str (first insert) " ON DUPLICATE KEY UPDATE tokens = VALUES(tokens), generated_at = VALUES(generated_at)"))
+                       (conj (rest insert) (str (first insert) " ON DUPLICATE KEY UPDATE tokens = VALUES(tokens), generated_at = VALUES(generated_at), version = VALUES(version)"))
                        (conj (rest insert) (string/replace-first (first insert) #"^INSERT" "INSERT OR REPLACE")))))))
 
 (defn delete-training-tokens!
@@ -455,18 +459,26 @@
   [message-id]
   (jdbc/execute! (ds) (honey/format {:delete-from :training-tokens :where [:= :message-id message-id]})))
 
-(defn- parse-failure-by-uid [connection-id folder uid]
-  (when (some? uid)
-    (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-failures]
-                                           :where [:and [:= :connection-id connection-id] [:= :folder folder] [:= :uid uid]]})
-                       builder-function-kebab)))
+(defn- existing-parse-failure
+  "The entry a repeated failure belongs to: the same UID, or - when the UID could not be read - the
+   same sequence number among the entries without UID. Without this fallback a folder whose store
+   dropped would add one new row per remaining message on every run."
+  [connection-id folder uid message-number]
+  (let [match (cond
+                (some? uid) [:= :uid uid]
+                (some? message-number) [:and [:= :uid nil] [:= :message-number message-number]]
+                :else nil)]
+    (when match
+      (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-failures]
+                                             :where [:and [:= :connection-id connection-id] [:= :folder folder] match]})
+                         builder-function-kebab))))
 
 (defn record-parse-failure!
-  "Insert a failure, or bump the attempt count of the entry that already exists for the same UID."
+  "Insert a failure, or bump the attempt count of the entry that already exists for the same message."
   [{:keys [connection-id folder uid message-number message-id subject error]}]
   (let [now (epoch-seconds)
         error-text (some-> error str (subs 0 (min 1000 (count (str error)))))]
-    (if-let [existing (parse-failure-by-uid connection-id folder uid)]
+    (if-let [existing (existing-parse-failure connection-id folder uid message-number)]
       (jdbc/execute! (ds) (honey/format {:update :parse-failures
                                          :set {:message-number message-number
                                                :message-id (or message-id (:message-id existing))
@@ -496,12 +508,33 @@
   (jdbc/execute! (ds) (honey/format {:delete-from :parse-failures :where [:= :id id]})))
 
 (defn parse-failures-for-connection
-  "Every recorded failure of a connection, grouped for display: newest first."
-  [connection-id]
+  "The most recent recorded failures of a connection for display (at most limit rows); the full
+   per-folder counts come from parse-failure-counts."
+  [connection-id limit]
   (jdbc/execute! (ds) (honey/format {:select [:*] :from [:parse-failures]
                                      :where [:= :connection-id connection-id]
-                                     :order-by [[:folder :asc] [:last-seen :desc] [:id :desc]]})
+                                     :order-by [[:folder :asc] [:last-seen :desc] [:id :desc]]
+                                     :limit limit})
                  builder-function-kebab))
+
+(defn parse-failure-counts
+  "Number of recorded failures per folder of a connection: [{:folder ... :count n} ...]."
+  [connection-id]
+  (jdbc/execute! (ds) (honey/format {:select [:folder [[:count :*] :count]] :from [:parse-failures]
+                                     :where [:= :connection-id connection-id]
+                                     :group-by [:folder]
+                                     :order-by [[:folder :asc]]})
+                 builder-function-kebab))
+
+(defn parse-failure-keys
+  "The identities of a folder's recorded failures, so a run can tell whether a message it just stored
+   had a failure entry without issuing a DELETE per message."
+  [connection-id folder]
+  (let [rows (jdbc/execute! (ds) (honey/format {:select [:uid :message-id] :from [:parse-failures]
+                                                :where [:and [:= :connection-id connection-id] [:= :folder folder]]})
+                            builder-function-kebab)]
+    {:uids (into #{} (keep :uid) rows)
+     :message-ids (into #{} (keep :message-id) rows)}))
 
 (defn parse-failures-for-folder [connection-id folder]
   (jdbc/execute! (ds) (honey/format {:select [:*] :from [:parse-failures]
@@ -509,13 +542,16 @@
                                      :order-by [[:uid :desc] [:id :desc]]})
                  builder-function-kebab))
 
-(defn parse-batch-email-count
-  "How many e-mails of a batch are still in the database (the e-mail list shows exactly these)."
+(defn parse-batch-message-ids
+  "The Message-IDs saved by a folder parse run that are still in the database, newest first."
   [batch-id]
-  (:count (jdbc/execute-one! (ds) (honey/format {:select [[[:count :headers.message-id] :count]]
-                                                 :from [:parse-batch-emails]
-                                                 :join [:headers [:= :headers.message-id :parse-batch-emails.message-id]]
-                                                 :where [:= :parse-batch-emails.batch-id batch-id]}) builder-function)))
+  (mapv :message-id
+        (jdbc/execute! (ds) (honey/format {:select [:headers.message-id]
+                                           :from [:parse-batch-emails]
+                                           :join [:headers [:= :headers.message-id :parse-batch-emails.message-id]]
+                                           :where [:= :parse-batch-emails.batch-id batch-id]
+                                           :order-by [[:headers.date :desc]]})
+                       builder-function-kebab)))
 
 (defn get-categories []
   (jdbc/execute! (ds) (honey/format {:select [:*] :from :categories}) builder-function))
@@ -709,7 +745,6 @@
         participants (map core.email/construct-participants (fetch-participants message-id))]
     (core.email/->EnrichedEmail header bodies participants metadata)))
 
-(defn- in-clause-placeholders [n] (string/join ", " (repeat n "?")))
 
 (defn fetch-metadata-for [message-ids]
   (when (seq message-ids)
@@ -952,6 +987,8 @@
   (record-parse-batch-email [_ batch-id message-id] (record-parse-batch-email! batch-id message-id))
   (record-parse-failure [_ failure] (record-parse-failure! failure))
   (resolve-parse-failures [_ connection-id folder uid message-id] (resolve-parse-failures! connection-id folder uid message-id))
+  (parse-failure-keys [_ connection-id folder] (parse-failure-keys connection-id folder))
+  (fetch-parse-batch-message-ids [_ batch-id] (parse-batch-message-ids batch-id))
   (fetch-parse-batch [_ id] (parse-batch id))
   (save-email [_ email]
     ;; One transaction per email, and failures propagate: a partially-saved email whose header

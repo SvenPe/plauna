@@ -132,7 +132,7 @@
                   {:model "maxent"
                    :confirmation server/model-switch-confirmation})]
       (is (= :alert (:type result)))
-      (is (str/includes? (:content result) "No complete model")))))
+      (is (str/includes? (:content result) "No model of that type exists yet")))))
 
 (deftest wrap-authentication-blocks-unauthenticated
   (let [handler (server/wrap-authentication ok-handler)
@@ -423,6 +423,7 @@
         calls (atom [])]
     (with-redefs [client/refetch-message-by-id (fn [_] {:body [] :participants participants})
                   db/fetch-bodies-for (fn [_] [])
+                  db/delete-training-tokens! (fn [_] nil)
                   db/save-contacts (fn [contacts] (swap! calls conj [:contacts contacts]))
                   db/save-communications (fn [contacts] (swap! calls conj [:communications contacts]))
                   db/fetch-metadata (fn [_] {:language "en"})]
@@ -555,12 +556,26 @@
       (server/manual-training-job)
       (is (= 1 @recorded) "A run that trained nothing is not recorded as successful"))))
 
-(deftest model-switch-is-refused-after-a-partial-training
-  (with-redefs [server/train-categorization-model! (fn [_] {:type :info :content "Trained the deu model(s). Not trained - eng: one category."})
+(deftest model-switch-proceeds-after-a-partial-training
+  (let [switched (atom nil)]
+    (with-redefs [server/train-categorization-model! (fn [_] {:type :info :content "Trained the deu model(s). Not trained - fra: one category."})
+                  preferences/update-preference (fn [key value] (reset! switched [key value]))
+                  preferences/record-successful-training! (fn [_])
+                  files/model-file (fn [language _] (java.io.File. (str "/nonexistent/" language ".bin")))
+                  server/languages-to-use-in-training (fn [] ["deu" "fra"])]
+      (let [result (server/switch-categorization-model! {:model "maxent" :use-current-categories "true" :confirmation "Start training"})]
+        (is (= [:categorization-algorithm "maxent"] @switched) "Languages that cannot be trained do not block the switch")
+        (is (= :info (:type result)))
+        (is (str/includes? (:content result) "Switched to maxent."))
+        (is (str/includes? (:content result) "Not trained - fra: one category."))
+        (is (str/includes? (:content result) "E-mails in deu, fra are not categorized by this model"))))))
+
+(deftest model-switch-is-refused-only-when-nothing-could-be-trained
+  (with-redefs [server/train-categorization-model! (fn [_] {:type :alert :content "No model was trained."})
                 preferences/update-preference (fn [_ _] (throw (ex-info "must not switch" {})))]
     (let [result (server/switch-categorization-model! {:model "maxent" :use-current-categories "true" :confirmation "Start training"})]
       (is (= :alert (:type result)))
-      (is (str/includes? (:content result) "not every language could be trained")))))
+      (is (str/includes? (:content result) "No model was trained")))))
 
 (deftest training-steps-follow-the-run-through-its-phases
   (let [state-ids (fn [steps] (mapv (juxt :id :state) steps))]
@@ -598,3 +613,30 @@
           "A run that stopped while collecting marks that step as failed and leaves the rest untouched"))
     (is (= 99 (server/training-percent {:status :running :phase :writing})))
     (is (contains? (server/training-status) :steps))))
+
+(deftest a-busy-slot-does-not-count-as-a-completed-automatic-run
+  (reset! server/training-progress {:status :running :label "Manual training" :phase :training})
+  (try
+    (is (false? (#'server/run-automatic-training!)) "A refused daily run reports failure so it is caught up later")
+    (finally (reset! server/training-progress {:status :idle}))))
+
+(deftest finished-training-jobs-surface-their-result-as-a-message
+  (reset! server/training-progress {:status :idle})
+  (reset! server/global-messages [])
+  (server/run-training-job! "Manual training" (fn [] {:type :alert :content "nothing to train"}))
+  (is (= [{:type :alert :content "nothing to train"}] @server/global-messages))
+  (reset! server/global-messages []))
+
+(deftest model-switch-validation-rejects-before-claiming-the-slot
+  (with-redefs [preferences/categorization-model (fn [] "naive-bayes")]
+    (is (= :alert (:type (server/model-switch-validation {:model "nonsense" :confirmation "Start training"}))))
+    (is (= :info (:type (server/model-switch-validation {:model "naive-bayes" :confirmation "Start training"}))))
+    (is (= :alert (:type (server/model-switch-validation {:model "maxent" :confirmation "start training"}))))
+    (is (nil? (server/model-switch-validation {:model "maxent" :confirmation "Start training"})))))
+
+(deftest folder-parse-summary-message-explains-an-aborted-run
+  (let [aborted (server/folder-parse-summary-message {:folder "INBOX" :processed 3 :skipped 10 :errors 50 :remaining 800 :batch-size 100 :batch-id "b"
+                                                       :aborted "50 consecutive messages could not be read; the connection to the folder is probably lost"})]
+    (is (= :info (:type aborted)))
+    (is (str/includes? (:content aborted) "The run was 50 consecutive messages could not be read"))
+    (is (str/includes? (:content aborted) "800 e-mail(s) were not examined"))))

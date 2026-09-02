@@ -508,20 +508,22 @@
       (cond (nil? (seq connections))
             (error-result nil "There are no active connections.")
 
-            (some? connection-id-guess)
-            (do
-              (t/log! :debug ["Email seems to belong to the connection with the id" connection-id-guess])
-              (let [move-result (int/move-email-between-categories client connection-id-guess message-id old-category category context)]
-                (cond
-                  (true? move-result) (success-result :ok nil)
-                  (= :not-found move-result) (success-result :not-found nil)
-                  :else (error-result nil "Moving email failed. Please check the logs."))))
-
             :else
-            (let [results (for [conn connections
-                                :let [id (get-in conn [:config :id])]]
-                            (do (t/log! :debug ["Move message-id" message-id])
-                                (int/move-email-between-categories client id message-id old-category category context)))]
+            ;; Try the most likely account first; when it does not hold the message (:not-found), fall
+            ;; back to every other active connection - a recorded account is a strong hint, not proof.
+            (let [all-ids (map #(get-in % [:config :id]) connections)
+                  ordered (if connection-id-guess
+                            (cons connection-id-guess (remove #{connection-id-guess} all-ids))
+                            all-ids)
+                  results (loop [ids ordered results []]
+                            (if (empty? ids)
+                              results
+                              (let [id (first ids)
+                                    _ (t/log! :debug ["Trying to move message-id" message-id "via connection" id])
+                                    result (int/move-email-between-categories client id message-id old-category category context)]
+                                (if (true? result)
+                                  (conj results result)
+                                  (recur (rest ids) (conj results result))))))]
               (cond
                 (some true? results) (success-result :ok nil)
                 (every? #(= :not-found %) results) (success-result :not-found nil)
@@ -596,9 +598,20 @@
     (catch Throwable inner
       (t/log! {:level :warn :error inner} ["Could not record the failure of message" n "in" folder-name]))))
 
-(defn- resolve-parse-failures-safely! [db connection-id folder-name uid message-id]
-  (try (int/resolve-parse-failures db connection-id folder-name uid message-id)
-       (catch Throwable e (t/log! {:level :warn :error e} ["Could not clear recorded failures for" message-id]))))
+(defn- known-failures
+  "The identities of the folder's recorded failures, loaded once per run so the loop only issues a
+   DELETE for messages that actually have an entry. Empty when the lookup is unavailable."
+  [db connection-id folder-name]
+  (try (or (int/parse-failure-keys db connection-id folder-name) {:uids #{} :message-ids #{}})
+       (catch Throwable _ {:uids #{} :message-ids #{}})))
+
+(defn- resolve-parse-failures-safely!
+  "Clear the failure entry of a message that is stored now - only when one exists for its UID or Message-ID."
+  [db connection-id folder-name uid message-id {:keys [uids message-ids]}]
+  (when (or (and (some? uid) (contains? uids uid))
+            (and (some? message-id) (contains? message-ids message-id)))
+    (try (int/resolve-parse-failures db connection-id folder-name uid message-id)
+         (catch Throwable e (t/log! {:level :warn :error e} ["Could not clear recorded failures for" message-id])))))
 
 (defn- finish-processed-email!
   "Bookkeeping shared by the sequence-number and UID paths after a message went through the workflow."
@@ -610,7 +623,7 @@
       (int/record-parse-batch-email db (:batch-id options) message-id))
     ;; A message that is stored now is no longer a failure, whichever way it got in.
     (when (contains? #{:processed :skipped} status)
-      (resolve-parse-failures-safely! db connection-id folder-name uid message-id))
+      (resolve-parse-failures-safely! db connection-id folder-name uid message-id (:known-failures options)))
     status))
 
 (defn- process-nth-email-from-folder
@@ -623,7 +636,7 @@
       (let [known-message-id (int/nth-message-id-from-folder client n folder)]
         (if (and (some? known-message-id) (int/email-exists? db known-message-id))
           (do (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping"])
-              (resolve-parse-failures-safely! db connection-id folder-name nil known-message-id)
+              (resolve-parse-failures-safely! db connection-id folder-name nil known-message-id (:known-failures options))
               :skipped)
           (let [email-message (int/nth-email-from-folder client n folder)
                 {:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
@@ -632,6 +645,43 @@
         (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
         (record-parse-failure-safely! client db n folder-name folder connection-id e)
         :error))))
+
+(defn- retry-one-failure!
+  "Re-read one previously failed message by UID. Returns :processed, :skipped, :gone or :errors."
+  [client db folder folder-name connection-id options {:keys [uid] :as failure} context]
+  (if (nil? uid)
+    ;; Without a UID the message cannot be addressed; the entry stays for information.
+    :errors
+    (try
+      (if-let [email-message (int/email-by-uid-from-folder client uid folder)]
+        (let [message-id (-> email-message :email :header :message-id)]
+          (if (and (some? message-id) (int/email-exists? db message-id))
+            (do (resolve-parse-failures-safely! db connection-id folder-name uid message-id (:known-failures options))
+                :skipped)
+            (let [{:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
+              (finish-processed-email! db email-message status connection-id folder-name uid options)
+              (if (= :processed status) :processed :skipped))))
+        (do (t/log! :info ["Message with UID" uid "no longer exists in" folder-name "- dropping its failure entry."])
+            (resolve-parse-failures-safely! db connection-id folder-name uid nil (:known-failures options))
+            :gone))
+      (catch Exception e
+        (t/log! :error ["Retrying message with UID" uid "from folder" folder-name "failed again:" e])
+        (try (int/record-parse-failure db (assoc failure :error (str (.getMessage e))))
+             (catch Throwable _ nil))
+        :errors))))
+
+(defn- run-completing!
+  "Run body-fn on a background thread and ALWAYS hand a summary to on-complete: a Throwable escaping
+   the loop is turned into an aborted summary instead of leaving the run marked as running forever."
+  [label on-complete base-summary body-fn]
+  (async/thread
+    (let [result (try
+                   (body-fn)
+                   (catch Throwable t
+                     (t/log! {:level :error :error t} [label "aborted unexpectedly"])
+                     (assoc base-summary :aborted (str "aborted: " (.getMessage t)))))]
+      (try (on-complete result)
+           (catch Throwable e (t/log! {:level :error :error e} [label "completion callback failed"]))))))
 
 (defn retry-failed-messages!
   "Re-read previously failed messages of one folder by their IMAP UID and run them through the normal
@@ -643,84 +693,88 @@
   (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
         folder (:folder bulk)
         connection-id (:connection-id bulk)
+        options (assoc options :known-failures (known-failures db connection-id folder-name))
         on-complete (or (:on-complete options) (fn [_] nil))
         base {:folder folder-name :message-count (:message-count bulk) :batch-size nil
               :processed 0 :skipped 0 :gone 0 :errors 0 :examined 0 :remaining 0}]
-    (async/thread
-      (let [result (try
-                     (reduce (fn [summary {:keys [uid id] :as failure}]
-                               (let [outcome (try
-                                               (cond
-                                                 (nil? uid)
-                                                 ;; Without a UID the message cannot be addressed; the entry stays for information.
-                                                 :errors
-
-                                                 :else
-                                                 (if-let [email-message (int/email-by-uid-from-folder client uid folder)]
-                                                   (let [message-id (-> email-message :email :header :message-id)]
-                                                     (if (and (some? message-id) (int/email-exists? db message-id))
-                                                       (do (resolve-parse-failures-safely! db connection-id folder-name uid message-id)
-                                                           :skipped)
-                                                       (let [{:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
-                                                         (finish-processed-email! db email-message status connection-id folder-name uid options)
-                                                         (if (= :processed status) :processed :skipped))))
-                                                   (do (t/log! :info ["Message with UID" uid "no longer exists in" folder-name "- dropping its failure entry."])
-                                                       (resolve-parse-failures-safely! db connection-id folder-name uid nil)
-                                                       :gone)))
-                                               (catch Exception e
-                                                 (t/log! :error ["Retrying message with UID" uid "from folder" folder-name "failed again:" e])
-                                                 (try (int/record-parse-failure db (assoc failure :error (str (.getMessage e))))
-                                                      (catch Throwable _ nil))
-                                                 :errors))]
-                                 (-> summary (update outcome inc) (update :examined inc))))
-                             base
-                             failures)
-                     (finally (int/close-folder-for-bulk-read client bulk)))]
-        (t/log! :info ["Finished retrying" (:examined result) "failed message(s) in" folder-name "-" (:processed result) "new," (:skipped result) "already stored," (:gone result) "gone," (:errors result) "failed again"])
-        (try (on-complete result)
-             (catch Exception e (t/log! {:level :error :error e} "The retry completion callback failed")))))
+    (run-completing! (str "Retrying failed messages of " folder-name) on-complete base
+                     (fn []
+                       (let [result (try
+                                      (reduce (fn [summary failure]
+                                                (let [outcome (retry-one-failure! client db folder folder-name connection-id options failure context)]
+                                                  (-> summary (update outcome inc) (update :examined inc))))
+                                              base
+                                              failures)
+                                      (finally (int/close-folder-for-bulk-read client bulk)))]
+                         (t/log! :info ["Finished retrying" (:examined result) "failed message(s) in" folder-name "-" (:processed result) "new," (:skipped result) "already stored," (:gone result) "gone," (:errors result) "failed again"])
+                         result)))
     (count failures)))
+
+(def ^:private batch-move-chunk-size
+  "E-mails per database fetch and per IMAP move call: small enough for SQLite's bind-variable limit
+   (999 on older builds), large enough to keep the round trips few."
+  200)
 
 (defn move-parse-batch-emails!
   "Move every e-mail of a parse batch that has a category into that category's IMAP folder: the fix for
    a batch that was parsed with 'move' unchecked. E-mails without a category stay where they are.
-   progress-fn is called with the running summary after every attempted move; the final summary
+   Works in chunks over ONE dedicated IMAP connection (see int/move-emails-by-id). progress-fn is
+   called with the running summary after every chunk; the final summary
    {:batch-id :total :uncategorized :moved :not-found :failed} is returned."
   [{:keys [db client] :as context} batch-id connection-id progress-fn]
-  (let [emails (int/fetch-emails db {:entity :enriched-email :strict true :with-bodies false} {:where (batch->where batch-id)})
-        categorized (filter #(some? (-> % :metadata :category)) emails)]
-    (reduce (fn [summary email]
-              (let [message-id (-> email :header :message-id)
-                    category (-> email :metadata :category)
-                    result (try
-                             ;; The recorded folder (see move-message) is the source; the category argument
-                             ;; only matters for legacy e-mails without one.
-                             (int/move-email-between-categories client connection-id message-id category category context)
-                             (catch Exception e
-                               (t/log! {:level :error :error e} ["Moving" message-id "of batch" batch-id "failed"])
-                               false))
-                    outcome (cond (true? result) :moved
-                                  (= :not-found result) :not-found
-                                  :else :failed)
-                    updated (update summary outcome inc)]
-                (progress-fn updated)
-                updated))
-            {:batch-id batch-id
-             :total (count categorized)
-             :uncategorized (- (count emails) (count categorized))
-             :moved 0 :not-found 0 :failed 0}
-            categorized)))
+  (let [message-ids (int/fetch-parse-batch-message-ids db batch-id)
+        chunks (partition-all batch-move-chunk-size message-ids)
+        summary (atom {:batch-id batch-id :total 0 :uncategorized 0 :moved 0 :not-found 0 :failed 0})]
+    (doseq [chunk chunks
+            :let [emails (int/fetch-emails db {:entity :enriched-email :strict true :with-bodies false}
+                                           {:where [:in :headers.message-id (vec chunk)]})
+                  categorized (filter #(some? (-> % :metadata :category)) emails)
+                  moves (mapv (fn [email] {:message-id (-> email :header :message-id) :category (-> email :metadata :category)}) categorized)
+                  results (if (seq moves)
+                            (try (int/move-emails-by-id client connection-id moves)
+                                 (catch Exception e
+                                   (t/log! {:level :error :error e} ["Moving a chunk of batch" batch-id "failed"])
+                                   (repeat (count moves) false)))
+                            [])]]
+      (swap! summary (fn [current]
+                       (reduce (fn [acc result]
+                                 (update acc (cond (true? result) :moved
+                                                   (= :not-found result) :not-found
+                                                   :else :failed) inc))
+                               (-> current
+                                   (update :total + (count moves))
+                                   (update :uncategorized + (- (count emails) (count categorized))))
+                               results)))
+      (progress-fn @summary))
+    @summary))
 
 (defn- empty-folder-summary [folder-name message-count batch-size]
   {:folder folder-name :message-count message-count :batch-size batch-size
    :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0})
 
+(def ^:private prefetch-chunk-size
+  "Sequence numbers whose envelopes are fetched with one IMAP command before they are examined."
+  100)
+
+(def ^:private consecutive-error-limit
+  "Consecutive unreadable messages after which a run gives up: that many failures in a row mean the
+   folder or the connection is gone, and going on would record one failure per remaining message."
+  50)
+
+(defn- prefetch-identities-safely! [client folder numbers]
+  (when (seq numbers)
+    (try (int/prefetch-message-identities client folder (apply min numbers) (apply max numbers))
+         (catch Throwable _ nil))))
+
 (defn- process-folder-messages!
   "Walk the sequence numbers of a folder from newest to oldest and process each message, stopping
-   early once batch-size messages were newly saved. Returns the summary map."
+   early once batch-size messages were newly saved, or when consecutive-error-limit messages in a row
+   could not be read (the summary then carries :aborted). Returns the summary map."
   [client folder-name folder options context bulk sequence-numbers summary]
   (let [batch-size (:batch-size options)]
     (loop [remaining-numbers sequence-numbers
+           prefetched #{}
+           consecutive-errors 0
            summary summary]
       (cond
         (empty? remaining-numbers)
@@ -729,11 +783,23 @@
         (and (some? batch-size) (>= (:processed summary) batch-size))
         (assoc summary :remaining (count remaining-numbers))
 
+        (>= consecutive-errors consecutive-error-limit)
+        (do (t/log! :error [consecutive-errors "consecutive messages of" folder-name "could not be read - the folder or the connection is probably gone. Giving up on this run."])
+            (assoc summary :remaining (count remaining-numbers)
+                   :aborted (str consecutive-errors " consecutive messages could not be read; the connection to the folder is probably lost")))
+
         :else
         (let [n (first remaining-numbers)
+              prefetched (if (contains? prefetched n)
+                           prefetched
+                           (let [chunk (take prefetch-chunk-size remaining-numbers)]
+                             (prefetch-identities-safely! client folder chunk)
+                             (set chunk)))
               outcome (process-nth-email-from-folder client n folder-name folder options context bulk)
               counter (case outcome :processed :processed :skipped :skipped :errors)]
           (recur (rest remaining-numbers)
+                 prefetched
+                 (if (= :errors counter) (inc consecutive-errors) 0)
                  (-> summary (update counter inc) (update :examined inc))))))))
 
 (defn read-emails-from-folder
@@ -755,12 +821,13 @@
    - :on-complete, a function called with a summary map once the background thread has finished:
      {:folder :message-count :batch-size :processed :skipped :errors :examined :remaining} where
      :remaining is the number of (older) messages that were not examined because the batch was full."
-  [connection-data folder-name options {:keys [client] :as context}]
+  [connection-data folder-name options {:keys [client db] :as context}]
   (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
         folder (:folder bulk)
         message-count (:message-count bulk)
         limit (:limit options)
         batch-size (:batch-size options)
+        options (assoc options :known-failures (known-failures db (:connection-id bulk) folder-name))
         on-complete (or (:on-complete options) (fn [_] nil))
         ;; Lowest sequence number to process. With :limit, take only the top N (most recent) messages;
         ;; without it, everything down to 1. (Sequence numbers are 1-based; higher = more recent.)
@@ -771,22 +838,22 @@
       (do
         (t/log! :info ["There are" message-count "emails in" folder-name "-" to-process "will get processed asynchronously"
                        (if batch-size (str "(stopping after " batch-size " newly saved emails)") "")])
-        ;; Use async/thread (a real thread), not async/go: each email does blocking JDBC and IMAP work,
-        ;; and a long blocking loop inside a go block would tie up a shared core.async dispatch thread.
-        (async/thread
-          (let [result (try
-                         ;; Iterate sequence numbers high -> low. When move? is enabled a processed message is moved
-                         ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
-                         ;; Going downward means the numbers we have not processed yet are never affected, so no
-                         ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
-                         (process-folder-messages! client folder-name folder options context bulk
-                                                   (range message-count (dec lowest) -1) summary)
-                         (finally
-                           (int/close-folder-for-bulk-read client bulk)))]
-            (t/log! :info ["Finished parsing" folder-name "-" (:processed result) "new," (:skipped result) "already stored,"
-                           (:errors result) "failed," (:remaining result) "not examined"])
-            (try (on-complete result)
-                 (catch Exception e (t/log! {:level :error :error e} "The parse completion callback failed"))))))
+        ;; A real thread (run-completing! uses async/thread), not async/go: each email does blocking JDBC
+        ;; and IMAP work, and a long blocking loop inside a go block would tie up a shared dispatch thread.
+        (run-completing! (str "Parsing " folder-name) on-complete summary
+                         (fn []
+                           (let [result (try
+                                          ;; Iterate sequence numbers high -> low. When move? is enabled a processed message is moved
+                                          ;; out and expunged, which shifts the sequence numbers of all HIGHER messages down by one.
+                                          ;; Going downward means the numbers we have not processed yet are never affected, so no
+                                          ;; message is skipped or referenced after it moved. (Sequence numbers are 1-based.)
+                                          (process-folder-messages! client folder-name folder options context bulk
+                                                                    (range message-count (dec lowest) -1) summary)
+                                          (finally
+                                            (int/close-folder-for-bulk-read client bulk)))]
+                             (t/log! :info ["Finished parsing" folder-name "-" (:processed result) "new," (:skipped result) "already stored,"
+                                            (:errors result) "failed," (:remaining result) "not examined" (or (:aborted result) "")])
+                             result))))
       (do
         (int/close-folder-for-bulk-read client bulk)
         (t/log! :info ["There are no emails in the folder. Doing nothing."])

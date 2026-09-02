@@ -231,15 +231,14 @@
   ([connections] (render "admin-connections.html" {:configs connections :active-nav :admin}))
   ([connections messages] (render "admin-connections.html" {:configs connections :active-nav :admin :messages (mapv type->toast-role messages)})))
 
-(defn- format-parse-batch
-  "Human-readable timestamps for a folder parse run row on the connection page."
-  [batch]
-  (assoc batch
-         :started (some-> (:started-at batch) timestamp->date str (str/replace "T" " ") (subs 0 16))
-         :finished (some-> (:finished-at batch) timestamp->date str (str/replace "T" " ") (subs 0 16))))
 
 (defn- format-timestamp [epoch-seconds]
   (some-> epoch-seconds timestamp->date str (str/replace "T" " ") (subs 0 16)))
+
+(defn- format-parse-batch
+  "Human-readable start time for a folder parse run row on the connection page."
+  [batch]
+  (assoc batch :started (format-timestamp (:started-at batch))))
 
 (defn- format-parse-failure-group [group]
   (update group :failures (fn [failures] (mapv #(assoc % :last-seen-text (format-timestamp (:last-seen %))) failures))))

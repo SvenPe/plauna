@@ -44,25 +44,37 @@ All notable changes to this project will be documented in this file.
   filtered to exactly those e-mails. The batch filter is a removable chip that combines with the
   other filters. Runs interrupted by a restart are marked as aborted.
 - Record messages that could not be read during a folder parse or the reconnect catch-up (folder,
-  IMAP UID, Message-ID, subject, error, attempts) and list them on the connection page. A "Retry"
-  re-reads them by UID and presents the recovered e-mails as a reviewable batch; entries clear
-  themselves once the message is stored or has disappeared from the server.
+  IMAP UID, Message-ID, subject, error, attempts) and list them on the connection page (the most
+  recent 200 rows, with exact per-folder counts). A "Retry" re-reads them by UID and presents the
+  recovered e-mails as a reviewable batch; entries clear themselves once the message is stored or has
+  disappeared from the server, and "Dismiss" removes one by hand. A run gives up after 50 unreadable
+  messages in a row - the sign of a lost connection - instead of recording every remaining message,
+  and repeated failures of a message whose UID cannot be read are still deduplicated (by sequence
+  number). Folder parses prefetch message envelopes in blocks of 100, cutting the per-message round
+  trips when re-scanning a mostly known folder.
 - Move a parse batch to its category folders afterwards: a run parsed without "Move e-mails after
   categorization" offers "Move to category folders" on the connection page and on the batch's e-mail
-  list. The categorized e-mails of the batch are moved in the background and a summary reports how
-  many were moved, not found or left in place because they have no category.
+  list. The categorized e-mails of the batch are moved in the background over a single IMAP
+  connection, in chunks of 200, and a summary reports how many were moved, not found or left in place
+  because they have no category.
 - Remember the IMAP account each e-mail was read from (`metadata.connection_id`, back-filled from
-  parse runs and, with a single configured account, from that account). Moves and re-fetches use it
-  directly instead of guessing the account from the recipient address and trying every connection.
-  Adopted from upstream Plauna.
+  parse runs and, with a single configured account, from that account). Moves and re-fetches try that
+  account first instead of guessing from the recipient address; the other active connections remain
+  the fallback when it does not hold the message. Adopted from upstream Plauna.
 - React to the IMAP server closing the connection right away: a connection listener on the store
   schedules the same reconnect-and-catch-up the periodic health check performs, a few seconds after
-  the drop, instead of waiting for the next health-check interval. Adopted from upstream Plauna.
+  the drop, instead of waiting for the next health-check interval; listener and health check are
+  serialized per connection so a drop is never repaired twice at once. Adopted from upstream Plauna.
+- The connection page reloads itself while a parse, retry or batch move runs by polling a small
+  status endpoint, and never while a form field is being edited.
 - Model training runs in the background and shows a live progress page with a progress bar, a
   checklist of every step (prepare, collect, train per language, write, finish) that is ticked off as
   the run advances, the collection count and the per-language MaxEnt iteration, instead of blocking
   the request until the reverse proxy reports a 504 gateway time-out. Manual training, the model switch and the daily
-  automatic run share one slot, so only one training runs at a time.
+  automatic run share one slot, so only one training runs at a time. A request that finds the slot occupied is
+  told so instead of being dropped; the run's result is also shown as a message on the next page load;
+  a model switch is validated before it occupies the slot; languages that cannot be trained (a
+  single category) do not block the switch but are named in the result.
 
 ## [2026-07-10.0] - 2026-07-10
 

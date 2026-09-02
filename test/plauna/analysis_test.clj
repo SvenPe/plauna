@@ -22,7 +22,7 @@
                        :content (s/join " " (repeat 510 "Payment"))}]
                :metadata {:category-id 7}}
         tokens (analysis/classification-tokens email)
-        training-line (analysis/format-training-data [email])]
+        training-line (analysis/format-training-lines [[(get-in email [:metadata :category-id]) (analysis/training-tokens-text email)]])]
     (is (= ["sender-address:billing@example.com"
             "sender-domain:example.com"
             "subject:invoice"

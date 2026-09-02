@@ -18,6 +18,8 @@
   (record-parse-batch-email [this batch-id message-id] "Remember that message-id was newly saved by the folder parse run batch-id.")
   (record-parse-failure [this failure] "Remember a message that could not be read or processed: {:connection-id :folder :uid :message-number :message-id :subject :error}. A repeated failure of the same UID updates the existing entry.")
   (resolve-parse-failures [this connection-id folder uid message-id] "Forget recorded failures of a message that was read successfully after all, matched by UID or Message-ID.")
+  (parse-failure-keys [this connection-id folder] "The identities of the recorded failures of a folder: {:uids #{...} :message-ids #{...}}, so a run only resolves failures that exist.")
+  (fetch-parse-batch-message-ids [this batch-id] "The Message-IDs saved by a folder parse run, newest first.")
   (fetch-parse-batch [this id] "Get one folder parse run by id, or nil.")
   (save-email [this email]))
 
@@ -32,6 +34,8 @@
      source folder was searched successfully but contains no matching message, and false for other
      failures such as a disconnected store.")
   (move-email-to-category [this connection-id original-message original-folder category])
+  (move-emails-by-id [this connection-id moves] "Move several stored messages ([{:message-id :category}]) into their category folders over ONE dedicated connection. Returns the per-move results in order: true, :not-found or false.")
+  (prefetch-message-identities [this folder from to] "Best-effort bulk fetch of the envelopes of messages from..to (sequence numbers) so the following per-message identity lookups need no round trip.")
   (nth-email-from-folder [this n folder])
   (nth-message-id-from-folder [this n folder] "Return only the Message-ID of message number n in a folder (a cheap header fetch, without the body), or nil when the message has none.")
   (nth-message-identity-from-folder [this n folder] "Best-effort identification of message number n for the failure list: {:uid :message-id :subject}, each nil when it cannot be read.")

@@ -169,6 +169,11 @@
     (legacy-classification-tokens email)
     (classification-tokens email)))
 
+(def training-tokens-version
+  "Bump whenever classification-feature-groups or the normalizers change: cached training_tokens rows
+   of an older version are ignored and recomputed on the next training run."
+  1)
+
 (defn training-tokens-text
   "The classification features of an e-mail as one space-separated line, the form cached in the
    training_tokens table. Blank when the e-mail yields no usable feature."
@@ -177,7 +182,9 @@
 
 (defn format-training-lines
   "Training file content from [category-id tokens-text] pairs; pairs without a category or without
-   tokens are left out. The model label is the category ID, see format-training-data."
+   tokens are left out. The model label is the category ID, not its name: DocumentSampleStream treats
+   the first whitespace-delimited token as the label, so a name like \"Work Projects\" would be
+   trained as \"Work\" and never resolve back to a category. IDs are single tokens by construction."
   [pairs]
   (transduce
    (comp (filter (fn [[category tokens]] (and (some? category) (not (st/blank? tokens)))))
@@ -185,20 +192,6 @@
    str
    ""
    pairs))
-
-(defn format-training-data [data]
-  ;; The model label is the category ID, not its name: DocumentSampleStream treats the first
-  ;; whitespace-delimited token as the label, so a name like "Work Projects" would be trained
-  ;; as "Work" and never resolve back to a category. IDs are single tokens by construction.
-  (transduce
-   (comp (map (fn [email] [(get-in email [:metadata :category-id])
-                           (classification-tokens email)]))
-         (filter (fn [[category tokens]] (and (some? category) (seq tokens))))
-         (map (fn [[category tokens]]
-                (str category " " (st/join " " tokens) "\n"))))
-   str
-   ""
-   data))
 
 (def training-iterations
   "Upper bound of optimisation iterations per model. MaxEnt may stop earlier once it converges;
@@ -257,7 +250,7 @@
 
 (defn training-file-outcomes
   "Inspect a training file: how many samples it holds and which labels (category ids) occur. The label
-   is the first whitespace-delimited token of each line, see format-training-data."
+   is the first whitespace-delimited token of each line, see format-training-lines."
   [^File file]
   (with-open [reader (clojure.java.io/reader file)]
     (reduce (fn [summary line]
@@ -315,7 +308,7 @@
     (normalize (tt/clean-text-content (:content body-part) (core-email/text-content-type body-part)))))
 
 (defn label->category
-  "Resolve a model label to its category row. Labels are category ids (see format-training-data);
+  "Resolve a model label to its category row. Labels are category ids (see format-training-lines);
    fall back to a name lookup so models trained before ids were used as labels keep working until
    the next re-training. Returns nil when the label matches no existing category."
   [label]

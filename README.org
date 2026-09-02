@@ -448,7 +448,7 @@ The categorization model is selected under "Admin" → "Preferences":
 - *Maximum Entropy (MaxEnt, GIS)* considers the same combined sender, domain, subject and body features without Naive Bayes' feature-independence assumption.
 - *Maximum Entropy (MaxEnt, L-BFGS)* fits the same model family with the quasi-Newton optimiser, which converges in far fewer passes over the data and therefore trains several times faster than GIS. Its model files are stored separately, so switching between the two MaxEnt variants works like any other model switch.
 
-The first time you switch to a model for which no complete model files exist, Plauna can train it from all current category assignments in the enabled training languages. The confirmation requires the exact text =Start training= to prevent accidental migration. Naive Bayes and MaxEnt files are stored side by side, so you can switch back to an already trained model without discarding either family.
+The first time you switch to a model for which no model files exist, Plauna can train it from all current category assignments in the enabled training languages. The confirmation requires the exact text =Start training= to prevent accidental migration. A language whose categorized e-mails all belong to one category cannot be trained in any model family; such languages do not block the switch, they are named in the result and their e-mails stay uncategorized until they have e-mails in at least two categories and a later training run succeeds for them. The switch is refused only when no language at all could be trained. Naive Bayes and MaxEnt files are stored side by side, so you can switch back to an already trained model without discarding either family.
 
 *** Automatic Categorization
 

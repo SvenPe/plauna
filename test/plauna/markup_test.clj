@@ -199,11 +199,12 @@
       (is (str/includes? html "Recent Folder Parse Runs"))
       (is (str/includes? html "href=\"/emails?batch=run-1\""))
       (is (not (str/includes? html "href=\"/emails?batch=run-2\"")) "A run without new e-mails offers no review link")
-      (is (str/includes? html "http-equiv=\"refresh\"") "The page reloads while a run is in progress")))
+      (is (str/includes? html "var running = true;") "The page polls and reloads while a run is in progress")
+      (is (not (str/includes? html "http-equiv=\"refresh\"")) "No blind meta refresh that would discard form input")))
   (with-redefs [client/disconnected-connections (fn [] [])]
     (let [html (markup/connection {:id "connection-1" :host "h" :user "u" :parse-batches [] :parse-running? false} [] [])]
       (is (not (str/includes? html "Recent Folder Parse Runs")))
-      (is (not (str/includes? html "http-equiv=\"refresh\""))))))
+      (is (str/includes? html "var running = false;")))))
 
 (deftest training-progress-page-polls-the-status-endpoint
   (with-redefs [client/disconnected-connections (fn [] [])]

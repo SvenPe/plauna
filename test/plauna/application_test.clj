@@ -1,5 +1,6 @@
 (ns plauna.application-test
   (:require [clojure.test :refer :all]
+            [clojure.string :as str]
             [honey.sql :as honey]
             [plauna.interfaces :as int]
             [taoensso.telemere :as t]
@@ -940,39 +941,37 @@
         (is (some #{:headers.date} flat) "Date filter present"))))
   "All filters (metadata, content search, subject, from, to, category, date) combine with AND")
 
-(deftest move-parse-batch-emails-moves-only-categorized-emails
+(deftest move-parse-batch-emails-moves-only-categorized-emails-in-chunks
   (let [moves (atom [])
         progress (atom [])
-        emails [{:header {:message-id "m-1"} :metadata {:category "invoices"}}
-                {:header {:message-id "m-2"} :metadata {:category nil}}
-                {:header {:message-id "m-3"} :metadata {:category "friends"}}
-                {:header {:message-id "m-4"} :metadata {:category "invoices"}}
-                {:header {:message-id "m-5"} :metadata {:category "friends"}}]
+        fetched (atom [])
+        by-id {"m-1" {:header {:message-id "m-1"} :metadata {:category "invoices"}}
+               "m-2" {:header {:message-id "m-2"} :metadata {:category nil}}
+               "m-3" {:header {:message-id "m-3"} :metadata {:category "friends"}}
+               "m-4" {:header {:message-id "m-4"} :metadata {:category "invoices"}}
+               "m-5" {:header {:message-id "m-5"} :metadata {:category "friends"}}}
         db (reify int/DB
+             (fetch-parse-batch-message-ids [_ batch-id] (is (= "run-1" batch-id)) ["m-1" "m-2" "m-3" "m-4" "m-5"])
              (fetch-emails [_ entity customization]
                (is (= {:entity :enriched-email :strict true :with-bodies false} entity))
-               (is (= [:in :headers.message-id {:select [:parse-batch-emails.message-id]
-                                                :from [:parse-batch-emails]
-                                                :where [:= :parse-batch-emails.batch-id "run-1"]}]
-                      (:where customization)))
-               emails))
+               (let [[op column ids] (:where customization)]
+                 (is (= [:in :headers.message-id] [op column]))
+                 (swap! fetched conj ids)
+                 (mapv by-id ids))))
         client (reify int/EmailClient
-                 (move-email-between-categories [_ connection-id message-id old-category new-category _]
-                   (swap! moves conj [connection-id message-id old-category new-category])
-                   (case message-id
-                     "m-3" :not-found
-                     "m-4" (throw (ex-info "imap down" {}))
-                     "m-5" false
-                     true)))
-        summary (app/move-parse-batch-emails! {:db db :client client} "run-1" "conn-1" #(swap! progress conj %))]
-    (is (= [["conn-1" "m-1" "invoices" "invoices"]
-            ["conn-1" "m-3" "friends" "friends"]
-            ["conn-1" "m-4" "invoices" "invoices"]
-            ["conn-1" "m-5" "friends" "friends"]]
+                 (move-emails-by-id [_ connection-id requested]
+                   (swap! moves conj [connection-id requested])
+                   (mapv (fn [{:keys [message-id]}] (case message-id "m-3" :not-found "m-4" false "m-5" false true)) requested)))
+        summary (with-redefs [app/batch-move-chunk-size 2]
+                  (app/move-parse-batch-emails! {:db db :client client} "run-1" "conn-1" #(swap! progress conj %)))]
+    (is (= [["m-1" "m-2"] ["m-3" "m-4"] ["m-5"]] @fetched) "The batch is fetched in chunks, never with one IN clause over everything")
+    (is (= [["conn-1" [{:message-id "m-1" :category "invoices"}]]
+            ["conn-1" [{:message-id "m-3" :category "friends"} {:message-id "m-4" :category "invoices"}]]
+            ["conn-1" [{:message-id "m-5" :category "friends"}]]]
            @moves)
-        "The uncategorized e-mail is never moved; every categorized one is attempted despite failures")
+        "Only categorized e-mails are moved, one call per chunk over the batch's connection")
     (is (= {:batch-id "run-1" :total 4 :uncategorized 1 :moved 1 :not-found 1 :failed 2} summary))
-    (is (= 4 (count @progress)) "Progress is reported after every attempted move")
+    (is (= 3 (count @progress)) "Progress is reported after every chunk")
     (is (= summary (last @progress)))))
 
 (deftest move-email-prefers-the-recorded-connection
@@ -1059,6 +1058,7 @@
              (email-exists? [_ message-id] (= "known-14" message-id))
              (save-email [_ email] (swap! saved conj (-> email :header :message-id)))
              (update-email-folder [_ _ _] nil)
+             (parse-failure-keys [_ _ _] {:uids #{11 12 13 14} :message-ids #{}})
              (record-parse-batch-email [_ batch-id message-id] (swap! batch conj [batch-id message-id]))
              (resolve-parse-failures [_ _ folder uid message-id] (swap! resolved conj [folder uid message-id]))
              (record-parse-failure [_ failure] (swap! recorded conj (select-keys failure [:uid :error]))))
@@ -1072,3 +1072,64 @@
       (is (= #{["INBOX" 11 "recovered-11"] ["INBOX" 12 nil] ["INBOX" 14 "known-14"]} (set @resolved))
           "Recovered, gone and already-stored messages all clear their failure entry")
       (is (= [{:uid 13 :error "still broken"}] @recorded) "A message that fails again updates its entry"))))
+
+(deftest read-emails-from-folder-gives-up-after-consecutive-failures
+  (let [recorded (atom [])
+        summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 200 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (nth-message-id-from-folder [_ _ _] (throw (ex-info "folder closed" {})))
+                 (nth-message-identity-from-folder [_ _ _] (throw (ex-info "folder closed" {}))))
+        db (reify int/DB
+             (record-parse-failure [_ failure] (swap! recorded conj failure)))]
+    (app/read-emails-from-folder {} "INBOX" {:on-complete #(deliver summary %)} {:client client :db db})
+    (let [result (await-summary summary)]
+      (is (= 50 (:errors result)) "The run stops after the consecutive-error limit instead of touching every message")
+      (is (= 150 (:remaining result)))
+      (is (string? (:aborted result)))
+      (is (= 50 (count @recorded)))
+      (is (every? #(and (nil? (:uid %)) (some? (:message-number %))) @recorded)
+          "Failures without UID still carry the sequence number the database deduplicates on"))))
+
+(deftest read-emails-from-folder-reports-completion-even-when-the-loop-throws
+  (let [summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 3 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] (throw (Error. "close blew up")))
+                 (nth-message-id-from-folder [_ _ _] "known")
+                 (nth-message-identity-from-folder [_ _ _] {}))
+        db (reify int/DB
+             (email-exists? [_ _] true))]
+    (app/read-emails-from-folder {} "INBOX" {:on-complete #(deliver summary %)} {:client client :db db})
+    (let [result (await-summary summary)]
+      (is (not= ::timeout result) "on-complete runs although closing the folder threw an Error")
+      (is (str/starts-with? (:aborted result) "aborted:")))))
+
+(deftest resolving-failures-only-touches-the-database-when-an-entry-exists
+  (let [deletes (atom [])
+        summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 3 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (nth-message-id-from-folder [_ n _] (str "id-" n)))
+        db (reify int/DB
+             (parse-failure-keys [_ _ _] {:uids #{} :message-ids #{"id-2"}})
+             (email-exists? [_ _] true)
+             (resolve-parse-failures [_ _ folder uid message-id] (swap! deletes conj [folder uid message-id])))]
+    (app/read-emails-from-folder {} "INBOX" {:on-complete #(deliver summary %)} {:client client :db db})
+    (await-summary summary)
+    (is (= [["INBOX" nil "id-2"]] @deletes) "Only the message with a recorded failure triggers a DELETE")))
+
+(deftest move-email-falls-back-to-other-connections-when-the-recorded-one-lacks-the-message
+  (let [tried (atom [])
+        client (reify int/EmailClient
+                 (connections [_] {"a" {:config {:id "a"}} "b" {:config {:id "b"}}})
+                 (connection-id-for-email [_ _ _] nil)
+                 (move-email-between-categories [_ connection-id _ _ _ _]
+                   (swap! tried conj connection-id)
+                   (if (= "b" connection-id) true :not-found)))
+        email {:header {:message-id "m-1"} :metadata {:category "old" :connection-id "a"}}
+        result (app/move-email-to-category email "new" {:client client})]
+    (is (= :ok (:result result)))
+    (is (= ["a" "b"] @tried) "The recorded account is tried first, the other one afterwards")))

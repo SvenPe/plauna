@@ -60,27 +60,17 @@
       (steps || []).forEach(function (step) { stepsList.appendChild(renderStep(step, false)); });
     }
 
-    function describe(state) {
-      if (state.status === 'idle') { return 'No training run has been started.'; }
-      if (state.phase === 'starting') { return 'Preparing the training run…'; }
-      if (state.phase === 'collecting') {
-        var computed = state['tokens-computed'] || 0;
-        return 'Collecting training data: ' + (state['emails-written'] || 0) + ' of ' + (state['emails-total'] || 0) + ' categorized e-mails'
-          + (computed ? ' (' + computed + ' analysed for the first time and cached)' : '');
-      }
-      if (state.phase === 'training') {
-        var progress = state['language-progress'] || {};
-        var parts = Object.keys(progress).sort().map(function (language) {
-          var p = progress[language];
-          if (p['failed?']) { return language + ': failed'; }
-          if (p['done?']) { return language + ': done'; }
-          if (p.iteration) { return language + ': iteration ' + p.iteration + ' of at most ' + p.iterations; }
-          return language + ': running';
+    function runningDetail(steps) {
+      // The headline detail is the running step (or its running sub-step) - the same text the checklist shows.
+      var found = null;
+      (steps || []).forEach(function (step) {
+        if (step.state !== 'running') return;
+        found = step.label + (step.detail ? ' - ' + step.detail : '');
+        (step.children || []).forEach(function (child) {
+          if (child.state === 'running') { found = step.label + ' - ' + child.label + (child.detail ? ': ' + child.detail : ''); }
         });
-        return 'Training ' + (state.languages || parts.length) + ' language model(s) in parallel' + (parts.length ? ' - ' + parts.join(', ') : '');
-      }
-      if (state.phase === 'writing') { return 'Writing the model files…'; }
-      return '';
+      });
+      return found || '';
     }
 
     function render(state) {
@@ -88,7 +78,7 @@
       bar.value = state.percent || 0;
       label.textContent = (state.label || 'Training') + (running ? ' in progress' : (state.status === 'finished' ? ' finished' : ''));
       percent.textContent = (state.percent || 0) + ' %';
-      detail.textContent = running ? describe(state) : '';
+      detail.textContent = running ? runningDetail(state.steps) : '';
       renderSteps(state.steps);
       if (state.status === 'finished' && state.result) {
         result.hidden = false;

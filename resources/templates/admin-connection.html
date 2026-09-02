@@ -1,11 +1,5 @@
 {% extends "base.html" %}
 
-{% block head-extra %}
-{% if parse-running? %}
-<!-- A folder parse is running in the background: reload so the finished summary and its review link appear. -->
-<meta http-equiv="refresh" content="10">
-{% endif %}
-{% endblock %}
 
 {% block content %}
 
@@ -131,7 +125,7 @@
   {% for group in parse-failures %}
   <div class="my-4">
     <div class="flex flex-wrap items-center gap-3">
-      <h5 class="font-semibold">{{group.folder}} <span class="badge badge-ghost">{{group.count}}</span></h5>
+      <h5 class="font-semibold">{{group.folder}} <span class="badge badge-ghost">{{group.count}}</span>{% if group.truncated? %} <span class="text-sm opacity-70">showing the {{group.shown}} most recent</span>{% endif %}</h5>
       <form action="{{group.retry-url}}" method="post" class="flex items-center gap-2">
         <input type="hidden" name="folder" value="{{group.folder}}" />
         <input type="hidden" name="redirect-url" value="/admin/connections/{{id}}" />
@@ -173,7 +167,7 @@
 {% if parse-batches|not-empty %}
 <div class="my-8">
   <h4 class="text-lg">Recent Folder Parse Runs</h4>
-  {% if parse-running? %}<p class="text-sm opacity-70">A run is in progress; this page reloads every 10 seconds until it has finished.</p>{% endif %}
+  {% if parse-running? %}<p class="text-sm opacity-70">A run is in progress; this page reloads when it has finished (and meanwhile every 10 seconds unless you are editing a field).</p>{% endif %}
   <p class="text-sm opacity-70">"Move to category folders" moves the categorized e-mails of a batch that was parsed without "Move e-mails after categorization" into their category folders now. E-mails without a category stay where they are.</p>
   <div class="overflow-x-auto">
     <table class="table table-zebra table-sm">
@@ -226,6 +220,27 @@
 {% endif %}
 
   <script>
+    // Background activity (parse, retry, batch move): poll a tiny status endpoint and reload the page
+    // when the work finishes - or every 10 s while it runs, but never while a form field is focused,
+    // so typing into the connection settings is not thrown away.
+    (function () {
+      var running = {% if parse-running? %}true{% else %}false{% endif %};
+      if (!running) return;
+      function editing() {
+        var el = document.activeElement;
+        return el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA');
+      }
+      function poll() {
+        fetch('/admin/connections/{{id}}/activity', {cache: 'no-store'})
+          .then(function (r) { return r.json(); })
+          .then(function (state) {
+            if (!state.running || !editing()) { window.location.reload(); } else { setTimeout(poll, 10000); }
+          })
+          .catch(function () { setTimeout(poll, 10000); });
+      }
+      setTimeout(poll, 10000);
+    })();
+
     document.addEventListener('DOMContentLoaded', () => {
         const select = document.getElementById('auth-select');
         const oauthGroup = Array.from(document.querySelectorAll('.oauth-related'));

@@ -197,13 +197,13 @@
    cached for every later run."
   [emails]
   (let [message-id #(-> % :header :message-id)
-        cached (db/fetch-training-tokens-for (mapv message-id emails))
+        cached (db/fetch-training-tokens-for (mapv message-id emails) analysis/training-tokens-version)
         missing (remove #(contains? cached (message-id %)) emails)
         computed (when (seq missing)
                    (into {} (pmap (fn [email] [(message-id email) (analysis/training-tokens-text email)])
                                   (attach-bodies missing))))]
     (when (seq computed)
-      (db/save-training-tokens! computed)
+      (db/save-training-tokens! computed analysis/training-tokens-version)
       (swap! training-progress update :tokens-computed (fnil + 0) (count computed)))
     (merge cached computed)))
 
@@ -333,6 +333,8 @@
                    {:type :alert :content "Training failed. The existing model remains active."}))]
     ;; The phase is left where the run ended, so the step list can show which step failed.
     (swap! training-progress assoc :status :finished :finished-at (System/currentTimeMillis) :result result)
+    ;; Also surface the outcome on the next page load: the progress page may long have been closed.
+    (add-to-messages result)
     result))
 
 (defn run-training-job!
@@ -427,8 +429,7 @@
   "The progress page's JSON view of the current run."
   []
   (let [state @training-progress]
-    (-> (select-keys state [:status :label :phase :languages :language-progress
-                            :emails-written :emails-total :tokens-computed :started-at :finished-at :result])
+    (-> (select-keys state [:status :label :phase :started-at :finished-at :result])
         (assoc :percent (training-percent state)
                :steps (training-steps state)))))
 
@@ -436,20 +437,25 @@
 
 (def model-switch-confirmation "Start training")
 
-(defn- model-files-available? [model]
-  (let [languages (vec (languages-to-use-in-training))]
-    (and (seq languages)
-         (every? #(.exists ^java.io.File (files/model-file % model)) languages))))
+(defn- languages-without-model
+  "The training languages for which no model file of the given family exists."
+  [model]
+  (vec (remove #(.exists ^java.io.File (files/model-file % model)) (languages-to-use-in-training))))
 
-(defn switch-categorization-model!
-  "Validate and perform an administrator-requested model switch. The active preference changes only
-   after every requested target model was trained successfully (or a complete target model set was
-   already available)."
-  [{:keys [model use-current-categories confirmation]}]
+(defn- languages-with-model [model]
+  (vec (filter #(.exists ^java.io.File (files/model-file % model)) (languages-to-use-in-training))))
+
+(defn- uncategorized-languages-note [languages]
+  (when (seq languages)
+    (str " E-mails in " (st/join ", " languages) " are not categorized by this model until those languages have e-mails in at least two categories and a training run has succeeded for them.")))
+
+(defn model-switch-validation
+  "The alert/info message that rejects a model switch request, or nil when the request is valid.
+   Kept separate from the switch itself so a rejected request never occupies the training slot."
+  [{:keys [model confirmation]}]
   (let [valid-models (set (map :id analysis/supported-categorization-models))
         target (when (contains? valid-models model) model)
-        current (p/categorization-model)
-        train-current? (contains? #{true "true" "on"} use-current-categories)]
+        current (p/categorization-model)]
     (cond
       (nil? target)
       {:type :alert :content "Unknown categorization model. Nothing was changed."}
@@ -460,23 +466,42 @@
       (not= model-switch-confirmation confirmation)
       {:type :alert :content (str "Model switch not confirmed. Enter ‘" model-switch-confirmation "’ exactly.")}
 
-      :else
+      :else nil)))
+
+(defn switch-categorization-model!
+  "Validate and perform an administrator-requested model switch. The active preference changes only
+   after every requested target model was trained successfully (or a complete target model set was
+   already available)."
+  [{:keys [model use-current-categories] :as params}]
+  (let [target model
+        train-current? (contains? #{true "true" "on"} use-current-categories)]
+    (or
+      (model-switch-validation params)
       (try
         (if train-current?
-          (if-let [result (train-categorization-model! target)]
-            ;; A partial result leaves the target model set incomplete, so the switch must not happen.
-            (if (= :info (:type result))
-              {:type :alert :content (str "Model switch not performed because not every language could be trained. " (:content result))}
-              result)
-            (do (p/update-preference :categorization-algorithm target)
-                (p/record-successful-training! (Instant/now))
-                {:type :success
-                 :content (str "Switched to " target " after training with the current category assignments.")}))
-          (if (model-files-available? target)
-            (do (p/update-preference :categorization-algorithm target)
-                {:type :success :content (str "Switched to the existing " target " model.")})
-            {:type :alert
-             :content "No complete model of that type exists yet. Keep the training option selected for the first switch."}))
+          (let [result (train-categorization-model! target)]
+            (if (= :alert (:type result))
+              ;; Nothing could be trained: there is no model to switch to.
+              result
+              ;; Every trainable language has a model now. A language whose e-mails all share one
+              ;; category never had a usable model in any family, so it must not block the switch; it
+              ;; is named instead.
+              (do (p/update-preference :categorization-algorithm target)
+                  (p/record-successful-training! (Instant/now))
+                  (if (nil? result)
+                    {:type :success
+                     :content (str "Switched to " target " after training with the current category assignments.")}
+                    {:type :info
+                     :content (str "Switched to " target ". " (:content result)
+                                   (uncategorized-languages-note (languages-without-model target)))}))))
+          (let [missing (languages-without-model target)]
+            (if (seq (languages-with-model target))
+              (do (p/update-preference :categorization-algorithm target)
+                  (if (seq missing)
+                    {:type :info :content (str "Switched to the existing " target " model." (uncategorized-languages-note missing))}
+                    {:type :success :content (str "Switched to the existing " target " model.")}))
+              {:type :alert
+               :content "No model of that type exists yet. Keep the training option selected for the first switch."})))
         (catch Throwable e
           (t/log! {:level :error :error e} "Categorization model switch failed; the previous model remains active.")
           {:type :alert
@@ -488,9 +513,16 @@
   (try
     (t/log! :info "Starting automatic model training.")
     (let [result (run-training-job! "Automatic training" manual-training-job)]
-      (if (contains? #{:success :info} (:type result))
+      (cond
+        (identical? result training-busy-message)
+        (do (t/log! :warn "Automatic model training skipped: another training run is in progress. Plauna will try again at the next scheduled time.")
+            false)
+
+        (contains? #{:success :info} (:type result))
         (do (t/log! :info ["Automatic model training completed." (when (= :info (:type result)) (:content result))])
             true)
+
+        :else
         (do (t/log! :warn ["Automatic model training did not complete:" (:content result) "Plauna will try again at the next scheduled time."])
             false)))
     (catch Throwable e
@@ -673,10 +705,10 @@
                                   (filter (fn [r] (and (blank? r) (contains? content-keys (part-key r)))))
                                   (keep :id))]
         (when (seq stale-ids) (db/delete-bodies-by-ids stale-ids))
-        (when (seq content-parts)
-          (db/save-bodies content-parts)
-          ;; The text changed, so the cached classification tokens must be derived again.
-          (db/delete-training-tokens! message-id))
+        (when (seq content-parts) (db/save-bodies content-parts))
+        ;; Anything re-fetched may change the features (body text, sender), so the cached classification
+        ;; tokens must be derived again.
+        (db/delete-training-tokens! message-id)
         (when (seq attachment-parts) (db/save-bodies attachment-parts)))
       (when (seq (:participants refetched))
         (db/save-contacts (:participants refetched))
@@ -834,12 +866,13 @@
   "Turn the summary of a finished folder parse into a toast for the next page load. The remaining count
    tells the user whether another run of the same batch is needed; the link opens the e-mails this run
    saved so their detected categories can be checked right away."
-  [{:keys [folder processed skipped errors remaining batch-size batch-id]}]
+  [{:keys [folder processed skipped errors remaining batch-size batch-id aborted]}]
   (let [remaining-text (cond
+                         (some? aborted) (str " The run was " aborted ". " remaining " e-mail(s) were not examined - check the connection and run the parse again.")
                          (pos? remaining) (str " " remaining " older e-mail(s) were not examined because the batch of " batch-size " was full - run the parse again to continue.")
                          (some? batch-size) " The folder has been examined completely; there is nothing left for another batch."
                          :else "")]
-    (cond-> {:type (if (pos? errors) :info :success)
+    (cond-> {:type (if (or (pos? errors) (some? aborted)) :info :success)
              :content (str "Finished parsing " folder ": " processed " new e-mail(s) saved and categorized, "
                            skipped " already stored e-mail(s) skipped"
                            (when (pos? errors) (str ", " errors " could not be read (see the logs)"))
@@ -847,28 +880,37 @@
       (and (some? batch-id) (pos? processed)) (assoc :link (batch-emails-url batch-id)
                                                      :link-text "Review this batch"))))
 
-(defn- start-folder-parse!
-  "Register a parse run, start it and return the number of messages in the folder. The run's summary
-   is stored when the background thread finishes and surfaced as a toast with a review link."
-  [context id folder move? batch-size assigned-category]
-  (let [batch-id (.toString (UUID/randomUUID))
-        conn-data (client/connection-data-from-id id)]
+(defn- run-as-parse-batch!
+  "The lifecycle every background run over a folder shares: register a parse_batches row, start the
+   run with an :on-complete that stores the summary and surfaces summary-message-fn's toast, and never
+   leave the row 'running' when the start itself fails. start-fn receives [batch-id options] and
+   returns whatever the caller wants back."
+  [id folder batch-size options summary-message-fn start-fn]
+  (let [batch-id (.toString (UUID/randomUUID))]
     (db/create-parse-batch! {:id batch-id :connection-id id :folder folder :batch-size batch-size})
     (try
-      (app/read-emails-from-folder conn-data folder
-                                   {:move? move?
-                                    :batch-size batch-size
-                                    :batch-id batch-id
-                                    :assigned-category (:name assigned-category)
-                                    :assigned-category-id (:id assigned-category)
-                                    :on-complete (fn [summary]
-                                                   (db/finish-parse-batch! batch-id summary)
-                                                   (add-to-messages (folder-parse-summary-message (assoc summary :batch-id batch-id))))}
-                                   context)
+      (start-fn batch-id (assoc options
+                                :batch-id batch-id
+                                :on-complete (fn [summary]
+                                               (db/finish-parse-batch! batch-id summary)
+                                               (add-to-messages (summary-message-fn (assoc summary :batch-id batch-id))))))
       (catch Exception e
         ;; Opening the folder failed before any thread started: close the run so it is not shown as running.
         (db/finish-parse-batch! batch-id {})
         (throw e)))))
+
+(defn- start-folder-parse!
+  "Register a parse run, start it and return the number of messages in the folder. The run's summary
+   is stored when the background thread finishes and surfaced as a toast with a review link."
+  [context id folder move? batch-size assigned-category]
+  (let [conn-data (client/connection-data-from-id id)]
+    (run-as-parse-batch! id folder batch-size
+                         {:move? move?
+                          :batch-size batch-size
+                          :assigned-category (:name assigned-category)
+                          :assigned-category-id (:id assigned-category)}
+                         folder-parse-summary-message
+                         (fn [_ options] (app/read-emails-from-folder conn-data folder options context)))))
 
 (defn batch-move-url [batch-id] (str "/parse-batches/" batch-id "/move"))
 
@@ -921,31 +963,27 @@
   [context id folder move?]
   (let [failures (db/parse-failures-for-folder id folder)]
     (when (seq failures)
-      (let [batch-id (.toString (UUID/randomUUID))
-            conn-data (client/connection-data-from-id id)]
-        (db/create-parse-batch! {:id batch-id :connection-id id :folder folder :batch-size nil})
-        (try
-          (app/retry-failed-messages! conn-data folder failures
-                                      {:move? move?
-                                       :batch-id batch-id
-                                       :on-complete (fn [summary]
-                                                      (db/finish-parse-batch! batch-id summary)
-                                                      (add-to-messages (retry-summary-message (assoc summary :batch-id batch-id))))}
-                                      context)
-          (catch Exception e
-            (db/finish-parse-batch! batch-id {})
-            (throw e)))))))
+      (let [conn-data (client/connection-data-from-id id)]
+        (run-as-parse-batch! id folder nil {:move? move?} retry-summary-message
+                             (fn [_ options] (app/retry-failed-messages! conn-data folder failures options context)))))))
+
+(def failure-list-limit
+  "Failure rows rendered on the connection page; the per-folder counts stay exact."
+  200)
 
 (defn connection-parse-failures
   "The recorded read failures of a connection, grouped by folder for the connection page."
   [id]
-  (let [groups (group-by :folder (db/parse-failures-for-connection id))]
-    {:parse-failures (mapv (fn [[folder failures]]
-                             {:folder folder
-                              :count (count failures)
-                              :retry-url (str "/admin/connections/" id "/failures/retry")
-                              :failures (vec failures)})
-                           (sort-by key groups))}))
+  (let [rows (group-by :folder (db/parse-failures-for-connection id failure-list-limit))]
+    {:parse-failures (mapv (fn [{:keys [folder count]}]
+                             (let [shown (vec (get rows folder))]
+                               {:folder folder
+                                :count count
+                                :shown (clojure.core/count shown)
+                                :truncated? (< (clojure.core/count shown) count)
+                                :retry-url (str "/admin/connections/" id "/failures/retry")
+                                :failures shown}))
+                           (db/parse-failure-counts id))}))
 
 (defn connection-parse-batches
   "The recent folder parse runs of a connection for the connection page, plus whether one is running."
@@ -958,6 +996,12 @@
                       (db/parse-batches-for-connection id 10))]
     {:parse-batches batches
      :parse-running? (boolean (some #(or (= "running" (:status %)) (= "running" (get-in % [:move :status]))) batches))}))
+
+(defn connection-activity
+  "Whether a folder parse, retry or batch move of the connection is running: the connection page polls
+   this to reload itself only while something is going on (and never while the user is editing)."
+  [id]
+  {:running (:parse-running? (connection-parse-batches id))})
 
 (defn recategorize-email-response
   "Handle an inline category change. A missing IMAP message is reported separately so the browser
@@ -1222,11 +1266,14 @@
              (redirect-request request)))))
 
    (comp/POST "/admin/preferences/model" request
-     ;; The switch may train a complete model set, so it runs like a manual training run.
+     ;; The switch may train a complete model set, so it runs like a manual training run - but only
+     ;; after the request itself passed validation, so a typo never claims the training slot.
      (let [params (:params request)]
-       (if (start-training-job! "Model switch" #(switch-categorization-model! params))
-         (redirect (training-progress-url "/admin/preferences") 303)
-         (redirect-request request training-busy-message))))
+       (if-let [rejection (model-switch-validation params)]
+         (redirect-request request rejection)
+         (if (start-training-job! "Model switch" #(switch-categorization-model! params))
+           (redirect (training-progress-url "/admin/preferences") 303)
+           (redirect-request request training-busy-message)))))
 
    (comp/POST "/admin/languages" {params :params}
      (let [langs-to-use (if (vector? (:use params)) (:use params) [(:use params)])]
@@ -1304,8 +1351,11 @@
      ;; Training runs in the background; the browser is sent to a progress page that polls
      ;; /training/status. A synchronous response used to exceed reverse proxy timeouts (504).
      (let [back (or (same-origin-referer request) "/emails")]
-       (start-training-job! "Manual training" manual-training-job)
-       (redirect (training-progress-url back) 303)))
+       (if (start-training-job! "Manual training" manual-training-job)
+         (redirect (training-progress-url back) 303)
+         ;; Another run holds the slot: say so instead of showing that run as if it were this request.
+         (do (add-to-messages training-busy-message)
+             (redirect back 303)))))
 
    (comp/GET "/training/progress" request
      (let [back (safe-redirect-path (get-in request [:params :back]) "/emails")]
@@ -1402,6 +1452,11 @@
      (let [params (:params request)
            existing (db/get-auth-provider (:id params))]
        (db/update-auth-provider (auth-provider-update-from-params params existing))))
+
+   (comp/GET "/admin/connections/:id/activity" request
+     {:status 200
+      :headers {"Content-Type" "application/json; charset=UTF-8" "Cache-Control" "no-store"}
+      :body (generate-string (connection-activity (:id (:route-params request))))})
 
    (comp/POST "/admin/connections/:id/failures/retry" request
      (let [id (:id (:route-params request))
