@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer :all]
             [honey.sql :as honey]
+            [plauna.analysis :as analysis]
             [plauna.application :as app]
             [plauna.auth :as auth]
             [plauna.client :as client]
@@ -514,3 +515,46 @@
     (is (= :info (:type partial)))
     (is (str/includes? (:content partial) "7 were not found"))
     (is (str/includes? (:content partial) "3 could not be moved"))))
+
+(deftest retry-summary-message-links-to-recovered-emails
+  (let [recovered (server/retry-summary-message {:folder "INBOX" :processed 4 :skipped 0 :gone 1 :errors 0 :batch-id "r-1"})
+        nothing (server/retry-summary-message {:folder "INBOX" :processed 0 :skipped 0 :gone 0 :errors 2 :batch-id "r-2"})]
+    (is (= :success (:type recovered)))
+    (is (= "/emails?batch=r-1" (:link recovered)))
+    (is (str/includes? (:content recovered) "4 saved and categorized"))
+    (is (= :info (:type nothing)))
+    (is (nil? (:link nothing)))
+    (is (str/includes? (:content nothing) "2 failed again"))))
+
+(deftest training-outcome-message-names-skipped-and-failed-languages
+  (with-redefs [analysis/label->category (fn [label] (when (= "7" label) {:id 7 :name "Rechnungen"}))]
+    (is (nil? (server/training-outcome-message [{:language "deu"}] [] [])) "Everything trained: the default success message applies")
+    (let [partial (server/training-outcome-message [{:language "deu"}]
+                                                   [{:language "eng" :samples 12 :labels #{"7"}}]
+                                                   [{:language "fra" :error (ex-info "boom" {})}])]
+      (is (= :info (:type partial)))
+      (is (str/includes? (:content partial) "Trained the deu model(s)"))
+      (is (str/includes? (:content partial) "eng: all 12 categorized e-mail(s) belong to one category (Rechnungen)"))
+      (is (str/includes? (:content partial) "fra: training failed (boom)")))
+    (let [nothing (server/training-outcome-message [] [{:language "eng" :samples 3 :labels #{"9"}}] [])]
+      (is (= :alert (:type nothing)))
+      (is (str/includes? (:content nothing) "No model was trained"))
+      (is (str/includes? (:content nothing) "(9)") "An unknown label falls back to the raw label"))))
+
+(deftest partial-training-counts-as-a-successful-scheduled-run
+  (let [recorded (atom 0)]
+    (with-redefs [preferences/record-successful-training! (fn [_] (swap! recorded inc))
+                  server/write-emails-to-training-files-and-train (fn [] {:type :info :content "partial"})]
+      (is (= {:type :info :content "partial"} (server/manual-training-job)))
+      (is (= 1 @recorded)))
+    (with-redefs [preferences/record-successful-training! (fn [_] (swap! recorded inc))
+                  server/write-emails-to-training-files-and-train (fn [] {:type :alert :content "nothing"})]
+      (server/manual-training-job)
+      (is (= 1 @recorded) "A run that trained nothing is not recorded as successful"))))
+
+(deftest model-switch-is-refused-after-a-partial-training
+  (with-redefs [server/train-categorization-model! (fn [_] {:type :info :content "Trained the deu model(s). Not trained - eng: one category."})
+                preferences/update-preference (fn [_ _] (throw (ex-info "must not switch" {})))]
+    (let [result (server/switch-categorization-model! {:model "maxent" :use-current-categories "true" :confirmation "Start training"})]
+      (is (= :alert (:type result)))
+      (is (str/includes? (:content result) "not every language could be trained")))))

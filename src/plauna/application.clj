@@ -581,26 +581,105 @@
          (success-result :ok {:move (:move process-result)}))
        (catch Exception e (error-result e "Error encountered when processing incoming email"))))
 
+(defn- record-parse-failure-safely!
+  "Keep a trace of a message that could not be read or processed, so it can be listed and retried
+   later. Identification is best effort and must never turn one failure into two."
+  [client db n folder-name folder connection-id ^Exception error]
+  (try
+    (let [identity (try (int/nth-message-identity-from-folder client n folder)
+                        (catch Exception _ {}))]
+      (int/record-parse-failure db (merge identity
+                                          {:connection-id connection-id
+                                           :folder folder-name
+                                           :message-number n
+                                           :error (str (.getMessage error))})))
+    (catch Throwable inner
+      (t/log! {:level :warn :error inner} ["Could not record the failure of message" n "in" folder-name]))))
+
+(defn- resolve-parse-failures-safely! [db connection-id folder-name uid message-id]
+  (try (int/resolve-parse-failures db connection-id folder-name uid message-id)
+       (catch Throwable e (t/log! {:level :warn :error e} ["Could not clear recorded failures for" message-id]))))
+
+(defn- finish-processed-email!
+  "Bookkeeping shared by the sequence-number and UID paths after a message went through the workflow."
+  [db email-message status connection-id folder-name uid options]
+  (let [message-id (-> email-message :email :header :message-id)]
+    ;; Membership is recorded only for e-mails this run actually saved, so the batch view shows
+    ;; exactly what needs reviewing.
+    (when (and (= :processed status) (some? (:batch-id options)))
+      (int/record-parse-batch-email db (:batch-id options) message-id))
+    ;; A message that is stored now is no longer a failure, whichever way it got in.
+    (when (contains? #{:processed :skipped} status)
+      (resolve-parse-failures-safely! db connection-id folder-name uid message-id))
+    status))
+
 (defn- process-nth-email-from-folder
   "Process message number n of a folder opened for bulk reading. Returns :processed, :skipped or :error.
    The Message-ID is read on its own first: an already stored message is recognised from that one
    small header fetch, so re-scanning a folder that is mostly known does not download every body again."
   [client n folder-name folder options {:keys [db] :as context} messages-result]
-  (try
-    (let [known-message-id (int/nth-message-id-from-folder client n folder)]
-      (if (and (some? known-message-id) (int/email-exists? db known-message-id))
-        (do (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping"])
-            :skipped)
-        (let [email-message (int/nth-email-from-folder client n folder)
-              {:keys [status]} (incoming-email-workflow email-message (:connection-id messages-result) folder options context)]
-          ;; Membership is recorded only for e-mails this run actually saved, so the batch view shows
-          ;; exactly what needs reviewing.
-          (when (and (= :processed status) (some? (:batch-id options)))
-            (int/record-parse-batch-email db (:batch-id options) (-> email-message :email :header :message-id)))
-          status)))
-    (catch Exception e
-      (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
-      :error)))
+  (let [connection-id (:connection-id messages-result)]
+    (try
+      (let [known-message-id (int/nth-message-id-from-folder client n folder)]
+        (if (and (some? known-message-id) (int/email-exists? db known-message-id))
+          (do (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping"])
+              (resolve-parse-failures-safely! db connection-id folder-name nil known-message-id)
+              :skipped)
+          (let [email-message (int/nth-email-from-folder client n folder)
+                {:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
+            (finish-processed-email! db email-message status connection-id folder-name nil options))))
+      (catch Exception e
+        (t/log! :error ["Skipping email number" n "from folder" folder-name "because it could not be read or processed:" e])
+        (record-parse-failure-safely! client db n folder-name folder connection-id e)
+        :error))))
+
+(defn retry-failed-messages!
+  "Re-read previously failed messages of one folder by their IMAP UID and run them through the normal
+   workflow (categorize, save, optionally move). Runs on a background thread. options are those of
+   read-emails-from-folder (:move? :batch-id :assigned-category ... :on-complete); the summary passed
+   to :on-complete is {:folder :processed :skipped :gone :errors :examined :remaining 0 :batch-size nil}
+   where :gone counts messages that no longer exist on the server (their failure entries are dropped)."
+  [connection-data folder-name failures options {:keys [client db] :as context}]
+  (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
+        folder (:folder bulk)
+        connection-id (:connection-id bulk)
+        on-complete (or (:on-complete options) (fn [_] nil))
+        base {:folder folder-name :message-count (:message-count bulk) :batch-size nil
+              :processed 0 :skipped 0 :gone 0 :errors 0 :examined 0 :remaining 0}]
+    (async/thread
+      (let [result (try
+                     (reduce (fn [summary {:keys [uid id] :as failure}]
+                               (let [outcome (try
+                                               (cond
+                                                 (nil? uid)
+                                                 ;; Without a UID the message cannot be addressed; the entry stays for information.
+                                                 :errors
+
+                                                 :else
+                                                 (if-let [email-message (int/email-by-uid-from-folder client uid folder)]
+                                                   (let [message-id (-> email-message :email :header :message-id)]
+                                                     (if (and (some? message-id) (int/email-exists? db message-id))
+                                                       (do (resolve-parse-failures-safely! db connection-id folder-name uid message-id)
+                                                           :skipped)
+                                                       (let [{:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
+                                                         (finish-processed-email! db email-message status connection-id folder-name uid options)
+                                                         (if (= :processed status) :processed :skipped))))
+                                                   (do (t/log! :info ["Message with UID" uid "no longer exists in" folder-name "- dropping its failure entry."])
+                                                       (resolve-parse-failures-safely! db connection-id folder-name uid nil)
+                                                       :gone)))
+                                               (catch Exception e
+                                                 (t/log! :error ["Retrying message with UID" uid "from folder" folder-name "failed again:" e])
+                                                 (try (int/record-parse-failure db (assoc failure :error (str (.getMessage e))))
+                                                      (catch Throwable _ nil))
+                                                 :errors))]
+                                 (-> summary (update outcome inc) (update :examined inc))))
+                             base
+                             failures)
+                     (finally (int/close-folder-for-bulk-read client bulk)))]
+        (t/log! :info ["Finished retrying" (:examined result) "failed message(s) in" folder-name "-" (:processed result) "new," (:skipped result) "already stored," (:gone result) "gone," (:errors result) "failed again"])
+        (try (on-complete result)
+             (catch Exception e (t/log! {:level :error :error e} "The retry completion callback failed")))))
+    (count failures)))
 
 (defn move-parse-batch-emails!
   "Move every e-mail of a parse batch that has a category into that category's IMAP folder: the fix for

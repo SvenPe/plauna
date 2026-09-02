@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- A language whose categorized e-mails all belong to one category no longer aborts the whole training
+  run with "Training data must contain more than one outcome". The language is skipped and named in
+  the result, the other languages are trained, and a failing language is reported the same way.
 - Read e-mails whose IMAP ENVELOPE the server delivers in a form the mail library cannot parse
   (typically malformed address headers, reported as "Failed to load IMAP envelope"). Such messages
   failed on every backfill and folder parse; Plauna now rebuilds Message-ID, subject, date and
@@ -35,6 +38,10 @@ All notable changes to this project will be documented in this file.
   while a run is in progress), and both the finished message and the table link to the E-mails page
   filtered to exactly those e-mails. The batch filter is a removable chip that combines with the
   other filters. Runs interrupted by a restart are marked as aborted.
+- Record messages that could not be read during a folder parse or the reconnect catch-up (folder,
+  IMAP UID, Message-ID, subject, error, attempts) and list them on the connection page. A "Retry"
+  re-reads them by UID and presents the recovered e-mails as a reviewable batch; entries clear
+  themselves once the message is stored or has disappeared from the server.
 - Move a parse batch to its category folders afterwards: a run parsed without "Move e-mails after
   categorization" offers "Move to category folders" on the connection page and on the batch's e-mail
   list. The categorized e-mails of the batch are moved in the background and a summary reports how

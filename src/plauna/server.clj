@@ -191,10 +191,39 @@
                                (swap! training-progress update :emails-written (fnil + 0) (count data)))]]
       (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false))))
 
+(defn- category-label-name
+  "Human-readable name for a training label (a category id; legacy files may hold names)."
+  [label]
+  (or (:name (analysis/label->category label)) label))
+
+(defn- single-outcome-note [{:keys [language samples labels]}]
+  (str language ": all " samples " categorized e-mail(s) belong to one category (" (category-label-name (first labels))
+       "); a model needs at least two categories"))
+
+(defn training-outcome-message
+  "Summarize a training run that trained some languages and skipped or failed others. Returns nil
+   when every language trained, an :info when at least one model was written, otherwise an :alert."
+  [trained skipped failed]
+  (let [notes (concat (map single-outcome-note skipped)
+                      (map (fn [{:keys [language error]}] (str language ": training failed (" (.getMessage ^Throwable error) ")")) failed))]
+    (cond
+      (empty? notes) nil
+
+      (seq trained)
+      {:type :info
+       :content (str "Trained the " (st/join ", " (map :language trained)) " model(s). Not trained - "
+                     (st/join "; " notes) ".")}
+
+      :else
+      {:type :alert
+       :content (str "No model was trained. " (st/join "; " notes) ".")})))
+
 (defn train-categorization-model!
   "Build the requested model family from the current categorized e-mails. Model files are kept per
-   algorithm, so training an inactive family cannot damage the active classifier. Returns an alert
-   map when there is no usable training data and nil on success; training failures propagate."
+   algorithm, so training an inactive family cannot damage the active classifier. A language whose
+   data holds only one category, or whose training fails, is skipped and named in the result while
+   the other languages are still trained. Returns nil when every language trained, an :info map for a
+   partial result and an :alert map when nothing could be trained."
   [model]
   ;; Rebuilding the training files is destructive. Serialize manual and automatic runs so one cannot
   ;; delete or overwrite the files while the other is still reading them.
@@ -202,13 +231,20 @@
     (if (seq (languages-to-use-in-training))
       (do (write-all-categorized-emails-to-training-files)
           (let [training-files (vec (files/training-files))]
-            (report-training-progress! {:phase :training :languages (count training-files) :language-index 0 :iteration 0 :iterations analysis/training-iterations})
             (if (seq training-files)
-              (doseq [training-model (analysis/train-data training-files model report-training-progress!)]
-                (files/write-model-file-atomically!
-                 (:language training-model)
-                 model
-                 #(analysis/serialize-and-write-model! (:model training-model) %)))
+              (let [inspected (map #(merge % (analysis/training-file-outcomes (:file %))) training-files)
+                    ;; OpenNLP rejects data with a single outcome (InsufficientTrainingDataException); skip
+                    ;; those languages up front instead of letting one of them abort the whole run.
+                    {trainable true skipped false} (group-by #(> (count (:labels %)) 1) inspected)
+                    _ (report-training-progress! {:phase :training :languages (count trainable) :language-index 0 :iteration 0 :iterations analysis/training-iterations})
+                    results (analysis/train-data (vec trainable) model report-training-progress!)
+                    {trained :trained failed :failed} (group-by #(if (:error %) :failed :trained) results)]
+                (doseq [training-model trained]
+                  (files/write-model-file-atomically!
+                   (:language training-model)
+                   model
+                   #(analysis/serialize-and-write-model! (:model training-model) %)))
+                (training-outcome-message trained skipped failed))
               {:type :alert :content "There are no categorized e-mails in the selected training languages."})))
       {:type :alert :content "There are no selected languages to train in. Cannot proceed."})))
 
@@ -276,11 +312,14 @@
     false))
 
 (defn manual-training-job
-  "Retrain the active model; a successful run is recorded for the daily schedule."
+  "Retrain the active model. A run that wrote at least one model (nil or :info result) counts as
+   successful for the daily schedule, so a language that cannot be trained yet does not make Plauna
+   retrain on every start."
   []
-  (if-let [result (write-emails-to-training-files-and-train)]
-    result
-    (do (p/record-successful-training! (Instant/now)) nil)))
+  (let [result (write-emails-to-training-files-and-train)]
+    (when (or (nil? result) (= :info (:type result)))
+      (p/record-successful-training! (Instant/now)))
+    result))
 
 (defn training-status
   "The progress page's JSON view of the current run."
@@ -322,7 +361,10 @@
       (try
         (if train-current?
           (if-let [result (train-categorization-model! target)]
-            result
+            ;; A partial result leaves the target model set incomplete, so the switch must not happen.
+            (if (= :info (:type result))
+              {:type :alert :content (str "Model switch not performed because not every language could be trained. " (:content result))}
+              result)
             (do (p/update-preference :categorization-algorithm target)
                 (p/record-successful-training! (Instant/now))
                 {:type :success
@@ -343,8 +385,8 @@
   (try
     (t/log! :info "Starting automatic model training.")
     (let [result (run-training-job! "Automatic training" manual-training-job)]
-      (if (= :success (:type result))
-        (do (t/log! :info "Automatic model training completed.")
+      (if (contains? #{:success :info} (:type result))
+        (do (t/log! :info ["Automatic model training completed." (when (= :info (:type result)) (:content result))])
             true)
         (do (t/log! :warn ["Automatic model training did not complete:" (:content result) "Plauna will try again at the next scheduled time."])
             false)))
@@ -757,6 +799,47 @@
                                  {:type :alert :content (str "Moving the " folder " batch failed. Please see the logs.")}
                                  (batch-move-summary-message (assoc summary :folder folder))))))
           true))))
+
+(defn retry-summary-message
+  "Toast for a finished retry of previously failed messages, with a review link when something was saved."
+  [{:keys [folder processed skipped gone errors batch-id]}]
+  (cond-> {:type (if (pos? errors) :info :success)
+           :content (str "Retried the failed messages of " folder ": " processed " saved and categorized, "
+                         skipped " turned out to be stored already, " gone " no longer exist on the server"
+                         (if (pos? errors) (str ", " errors " failed again (see the logs and the failure list).") "."))}
+    (and (some? batch-id) (pos? processed)) (assoc :link (batch-emails-url batch-id) :link-text "Review these e-mails")))
+
+(defn start-failure-retry!
+  "Retry every recorded failure of one folder as a new parse run, so the recovered e-mails can be
+   reviewed as a batch. Returns the number of messages to retry, or nil when there is nothing to do."
+  [context id folder move?]
+  (let [failures (db/parse-failures-for-folder id folder)]
+    (when (seq failures)
+      (let [batch-id (.toString (UUID/randomUUID))
+            conn-data (client/connection-data-from-id id)]
+        (db/create-parse-batch! {:id batch-id :connection-id id :folder folder :batch-size nil})
+        (try
+          (app/retry-failed-messages! conn-data folder failures
+                                      {:move? move?
+                                       :batch-id batch-id
+                                       :on-complete (fn [summary]
+                                                      (db/finish-parse-batch! batch-id summary)
+                                                      (add-to-messages (retry-summary-message (assoc summary :batch-id batch-id))))}
+                                      context)
+          (catch Exception e
+            (db/finish-parse-batch! batch-id {})
+            (throw e)))))))
+
+(defn connection-parse-failures
+  "The recorded read failures of a connection, grouped by folder for the connection page."
+  [id]
+  (let [groups (group-by :folder (db/parse-failures-for-connection id))]
+    {:parse-failures (mapv (fn [[folder failures]]
+                             {:folder folder
+                              :count (count failures)
+                              :retry-url (str "/admin/connections/" id "/failures/retry")
+                              :failures (vec failures)})
+                           (sort-by key groups))}))
 
 (defn connection-parse-batches
   "The recent folder parse runs of a connection for the connection page, plus whether one is running."
@@ -1214,8 +1297,30 @@
            existing (db/get-auth-provider (:id params))]
        (db/update-auth-provider (auth-provider-update-from-params params existing))))
 
+   (comp/POST "/admin/connections/:id/failures/retry" request
+     (let [id (:id (:route-params request))
+           folder (:folder (:params request))
+           move? (some? (:move (:params request)))
+           conn (client/connection-data-from-id id)]
+       (cond
+         (or (nil? conn) (not (client/connected? conn)))
+         (redirect-request request {:type :alert :content "The connection is not active. Connect first, then retry."})
+
+         (st/blank? folder)
+         (redirect-request request {:type :alert :content "No folder given."})
+
+         :else
+         (if-let [n (start-failure-retry! context id folder move?)]
+           (redirect-request request {:type :success :content (str "Retrying " n " failed message(s) of " folder " in the background. Move after categorization: " move?)})
+           (redirect-request request {:type :info :content (str "There are no recorded failures for " folder ".")})))))
+
+   (comp/POST "/admin/connections/:id/failures/:failure-id/dismiss" request
+     (let [failure-id (parse-long (str (:failure-id (:route-params request))))]
+       (when failure-id (db/delete-parse-failure! failure-id))
+       (redirect-request request)))
+
    (comp/GET "/admin/connections/:id" [id]
-     (let [conn-info (merge (connection-information id) (connection-parse-batches id))
+     (let [conn-info (merge (connection-information id) (connection-parse-batches id) (connection-parse-failures id))
            providers (without-provider-secrets (db/get-auth-providers))
            categories (db/get-categories)]
        (if (seq @global-messages)

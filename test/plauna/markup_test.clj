@@ -234,3 +234,19 @@
                  :parse-running? false}
                 [] [])]
       (is (str/includes? html "action=\"/parse-batches/run-1/move\"")))))
+
+(deftest connection-page-lists-read-failures-with-a-retry-form
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/connection
+                {:id "connection-1" :host "h" :user "u"
+                 :parse-failures [{:folder "INBOX" :count 2 :retry-url "/admin/connections/connection-1/failures/retry"
+                                   :failures [{:id 7 :uid 2327 :message-number 2327 :message-id nil :subject "Broken" :error "Failed to load IMAP envelope" :attempts 3 :last-seen 1756800000}
+                                              {:id 8 :uid nil :message-number 12 :message-id "<x@y>" :subject nil :error "boom" :attempts 1 :last-seen nil}]}]}
+                [] [])]
+      (is (str/includes? html "Messages That Could Not Be Read"))
+      (is (str/includes? html "Retry 2 message(s)"))
+      (is (str/includes? html "action=\"/admin/connections/connection-1/failures/retry\""))
+      (is (str/includes? html "action=\"/admin/connections/connection-1/failures/7/dismiss\""))
+      (is (str/includes? html "Failed to load IMAP envelope"))))
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (is (not (str/includes? (markup/connection {:id "c" :host "h" :user "u" :parse-failures []} [] []) "Messages That Could Not Be Read")))))

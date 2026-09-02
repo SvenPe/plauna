@@ -425,6 +425,60 @@
                                      :order-by [[:started-at :desc] [:id :desc]]
                                      :limit limit}) builder-function-kebab))
 
+(defn- parse-failure-by-uid [connection-id folder uid]
+  (when (some? uid)
+    (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-failures]
+                                           :where [:and [:= :connection-id connection-id] [:= :folder folder] [:= :uid uid]]})
+                       builder-function-kebab)))
+
+(defn record-parse-failure!
+  "Insert a failure, or bump the attempt count of the entry that already exists for the same UID."
+  [{:keys [connection-id folder uid message-number message-id subject error]}]
+  (let [now (epoch-seconds)
+        error-text (some-> error str (subs 0 (min 1000 (count (str error)))))]
+    (if-let [existing (parse-failure-by-uid connection-id folder uid)]
+      (jdbc/execute! (ds) (honey/format {:update :parse-failures
+                                         :set {:message-number message-number
+                                               :message-id (or message-id (:message-id existing))
+                                               :subject (or subject (:subject existing))
+                                               :error error-text
+                                               :attempts (inc (or (:attempts existing) 1))
+                                               :last-seen now}
+                                         :where [:= :id (:id existing)]}))
+      (jdbc/execute! (ds) (honey/format {:insert-into :parse-failures
+                                         :values [{:connection-id connection-id :folder folder :uid uid
+                                                   :message-number message-number :message-id message-id
+                                                   :subject subject :error error-text
+                                                   :attempts 1 :first-seen now :last-seen now}]})))))
+
+(defn resolve-parse-failures!
+  "Delete the failures of a message that was read successfully after all (matched by UID and/or Message-ID)."
+  [connection-id folder uid message-id]
+  (let [matches (cond-> []
+                  (some? uid) (conj [:= :uid uid])
+                  (not (string/blank? (str message-id))) (conj [:= :message-id message-id]))]
+    (when (seq matches)
+      (jdbc/execute! (ds) (honey/format {:delete-from :parse-failures
+                                         :where [:and [:= :connection-id connection-id] [:= :folder folder]
+                                                 (if (= 1 (count matches)) (first matches) (into [:or] matches))]})))))
+
+(defn delete-parse-failure! [id]
+  (jdbc/execute! (ds) (honey/format {:delete-from :parse-failures :where [:= :id id]})))
+
+(defn parse-failures-for-connection
+  "Every recorded failure of a connection, grouped for display: newest first."
+  [connection-id]
+  (jdbc/execute! (ds) (honey/format {:select [:*] :from [:parse-failures]
+                                     :where [:= :connection-id connection-id]
+                                     :order-by [[:folder :asc] [:last-seen :desc] [:id :desc]]})
+                 builder-function-kebab))
+
+(defn parse-failures-for-folder [connection-id folder]
+  (jdbc/execute! (ds) (honey/format {:select [:*] :from [:parse-failures]
+                                     :where [:and [:= :connection-id connection-id] [:= :folder folder]]
+                                     :order-by [[:uid :desc] [:id :desc]]})
+                 builder-function-kebab))
+
 (defn parse-batch-email-count
   "How many e-mails of a batch are still in the database (the e-mail list shows exactly these)."
   [batch-id]
@@ -866,6 +920,8 @@
   (update-email-folder [_ message-id folder] (update-email-folder message-id folder))
   (email-exists? [_ message-id] (email-exists? message-id))
   (record-parse-batch-email [_ batch-id message-id] (record-parse-batch-email! batch-id message-id))
+  (record-parse-failure [_ failure] (record-parse-failure! failure))
+  (resolve-parse-failures [_ connection-id folder uid message-id] (resolve-parse-failures! connection-id folder uid message-id))
   (fetch-parse-batch [_ id] (parse-batch id))
   (save-email [_ email]
     ;; One transaction per email, and failures propagate: a partially-saved email whose header

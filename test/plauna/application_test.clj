@@ -1013,3 +1013,62 @@
     (is (= ["conn-1" "conn-1"] (mapv #(-> % :metadata :connection-id) @saved))
         "Both the automatic and the assigned-category path store the account id")
     (is (= "test" (-> @saved first :metadata :category)) "The rest of the metadata is untouched")))
+
+(deftest read-emails-from-folder-records-failures-with-their-identity
+  (let [recorded (atom [])
+        summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 3 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (current-folder-name [_ folder] (str folder))
+                 (nth-message-id-from-folder [_ n _] (if (= n 2) (throw (ex-info "Failed to load IMAP envelope" {})) (str "id-" n)))
+                 (nth-message-identity-from-folder [_ n _] {:uid (* 100 n) :message-id nil :subject (str "subject-" n)})
+                 (nth-email-from-folder [_ n _] {:email {:header {:message-id (str "id-" n)}} :message n}))
+        analyzer (reify int/Analyzer (enrich-email [_ email] (assoc email :metadata {:category nil})))
+        db (reify int/DB
+             (email-exists? [_ _] false)
+             (save-email [_ _] nil)
+             (update-email-folder [_ _ _] nil)
+             (resolve-parse-failures [_ _ _ _ _] nil)
+             (record-parse-failure [_ failure] (swap! recorded conj failure)))]
+    (app/read-emails-from-folder {} "INBOX" {:move? false :on-complete #(deliver summary %)} {:client client :analyzer analyzer :db db})
+    (let [result (await-summary summary)]
+      (is (= 1 (:errors result)))
+      (is (= [{:connection-id "conn-1" :folder "INBOX" :uid 200 :message-number 2 :message-id nil :subject "subject-2" :error "Failed to load IMAP envelope"}]
+             @recorded)
+          "The failed message is recorded with UID, subject and the error text"))))
+
+(deftest retry-failed-messages-handles-recovered-gone-and-still-failing-messages
+  (let [saved (atom [])
+        batch (atom [])
+        resolved (atom [])
+        recorded (atom [])
+        summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 50 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (current-folder-name [_ folder] (str folder))
+                 (email-by-uid-from-folder [_ uid _]
+                   (case (long uid)
+                     11 {:email {:header {:message-id "recovered-11"}} :message 11}
+                     12 nil
+                     13 (throw (ex-info "still broken" {}))
+                     14 {:email {:header {:message-id "known-14"}} :message 14})))
+        analyzer (reify int/Analyzer (enrich-email [_ email] (assoc email :metadata {:category "test"})))
+        db (reify int/DB
+             (email-exists? [_ message-id] (= "known-14" message-id))
+             (save-email [_ email] (swap! saved conj (-> email :header :message-id)))
+             (update-email-folder [_ _ _] nil)
+             (record-parse-batch-email [_ batch-id message-id] (swap! batch conj [batch-id message-id]))
+             (resolve-parse-failures [_ _ folder uid message-id] (swap! resolved conj [folder uid message-id]))
+             (record-parse-failure [_ failure] (swap! recorded conj (select-keys failure [:uid :error]))))
+        failures [{:id 1 :uid 11} {:id 2 :uid 12} {:id 3 :uid 13} {:id 4 :uid 14} {:id 5 :uid nil}]]
+    (is (= 5 (app/retry-failed-messages! {} "INBOX" failures {:move? false :batch-id "retry-1" :on-complete #(deliver summary %)}
+                                         {:client client :analyzer analyzer :db db})))
+    (let [result (await-summary summary)]
+      (is (= {:processed 1 :skipped 1 :gone 1 :errors 2 :examined 5} (select-keys result [:processed :skipped :gone :errors :examined])))
+      (is (= ["recovered-11"] @saved))
+      (is (= [["retry-1" "recovered-11"]] @batch) "Only the recovered e-mail joins the review batch")
+      (is (= #{["INBOX" 11 "recovered-11"] ["INBOX" 12 nil] ["INBOX" 14 "known-14"]} (set @resolved))
+          "Recovered, gone and already-stored messages all clear their failure entry")
+      (is (= [{:uid 13 :error "still broken"}] @recorded) "A message that fails again updates its entry"))))

@@ -16,6 +16,8 @@
   (update-email-folder [this message-id folder] "Record the IMAP folder a message currently lives in.")
   (email-exists? [this message-id] "Return true if a header with this message-id is already in the database.")
   (record-parse-batch-email [this batch-id message-id] "Remember that message-id was newly saved by the folder parse run batch-id.")
+  (record-parse-failure [this failure] "Remember a message that could not be read or processed: {:connection-id :folder :uid :message-number :message-id :subject :error}. A repeated failure of the same UID updates the existing entry.")
+  (resolve-parse-failures [this connection-id folder uid message-id] "Forget recorded failures of a message that was read successfully after all, matched by UID or Message-ID.")
   (fetch-parse-batch [this id] "Get one folder parse run by id, or nil.")
   (save-email [this email]))
 
@@ -32,6 +34,8 @@
   (move-email-to-category [this connection-id original-message original-folder category])
   (nth-email-from-folder [this n folder])
   (nth-message-id-from-folder [this n folder] "Return only the Message-ID of message number n in a folder (a cheap header fetch, without the body), or nil when the message has none.")
+  (nth-message-identity-from-folder [this n folder] "Best-effort identification of message number n for the failure list: {:uid :message-id :subject}, each nil when it cannot be read.")
+  (email-by-uid-from-folder [this uid folder] "Read the message with the given IMAP UID from a folder opened for bulk reading, like nth-email-from-folder; nil when no such message exists any more.")
   (current-folder-name [this folder] "Return the full IMAP name of a folder object.")
   (open-folder-for-bulk-read [this connection-data folder-name] "Open folder-name on a dedicated Store connection, isolated from the IDLE monitor. Returns a handle {:folder :message-count :connection-id ...}.")
   (close-folder-for-bulk-read [this bulk-handle] "Close the dedicated connection opened by open-folder-for-bulk-read."))

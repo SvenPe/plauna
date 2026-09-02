@@ -124,6 +124,52 @@
   </div>
 </div>
 
+{% if parse-failures|not-empty %}
+<div class="my-8">
+  <h4 class="text-lg">Messages That Could Not Be Read</h4>
+  <p class="text-sm opacity-70">These messages failed while parsing a folder or catching up after a reconnect and were therefore never saved. "Retry" reads them again by their IMAP UID and lists the recovered e-mails as a reviewable batch. Entries disappear once the message is stored or no longer exists on the server; "Dismiss" removes one by hand.</p>
+  {% for group in parse-failures %}
+  <div class="my-4">
+    <div class="flex flex-wrap items-center gap-3">
+      <h5 class="font-semibold">{{group.folder}} <span class="badge badge-ghost">{{group.count}}</span></h5>
+      <form action="{{group.retry-url}}" method="post" class="flex items-center gap-2">
+        <input type="hidden" name="folder" value="{{group.folder}}" />
+        <input type="hidden" name="redirect-url" value="/admin/connections/{{id}}" />
+        <label class="flex items-center gap-1 text-sm"><input class="checkbox checkbox-xs" name="move" type="checkbox"> Move after categorization</label>
+        <button class="btn btn-outline btn-xs" type="submit">Retry {{group.count}} message(s)</button>
+      </form>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="table table-zebra table-xs">
+        <thead>
+          <tr><th>UID</th><th>No.</th><th>Message-ID</th><th>Subject</th><th>Error</th><th class="text-right">Attempts</th><th>Last seen</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for failure in group.failures %}
+          <tr>
+            <td>{{failure.uid|default:"?"}}</td>
+            <td>{{failure.message-number}}</td>
+            <td class="max-w-xs truncate" title="{{failure.message-id}}">{{failure.message-id|default:"unknown"}}</td>
+            <td class="max-w-xs truncate" title="{{failure.subject}}">{{failure.subject|default:"unknown"}}</td>
+            <td class="max-w-md truncate" title="{{failure.error}}">{{failure.error}}</td>
+            <td class="text-right">{{failure.attempts}}</td>
+            <td class="whitespace-nowrap">{{failure.last-seen-text}}</td>
+            <td>
+              <form action="/admin/connections/{{id}}/failures/{{failure.id}}/dismiss" method="post" class="inline">
+                <input type="hidden" name="redirect-url" value="/admin/connections/{{id}}" />
+                <button class="btn btn-ghost btn-xs" type="submit" title="Forget this entry">Dismiss</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 {% if parse-batches|not-empty %}
 <div class="my-8">
   <h4 class="text-lg">Recent Folder Parse Runs</h4>

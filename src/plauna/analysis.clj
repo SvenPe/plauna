@@ -226,9 +226,24 @@
         maxent-model (.train trainer events)]
     (DoccatModel. language maxent-model manifest factory)))
 
+(defn training-file-outcomes
+  "Inspect a training file: how many samples it holds and which labels (category ids) occur. The label
+   is the first whitespace-delimited token of each line, see format-training-data."
+  [^File file]
+  (with-open [reader (clojure.java.io/reader file)]
+    (reduce (fn [summary line]
+              (if-let [label (first (st/split (st/trim line) #"\s+"))]
+                (if (st/blank? label)
+                  summary
+                  (-> summary (update :samples inc) (update :labels conj label)))
+                summary))
+            {:samples 0 :labels #{}}
+            (line-seq reader))))
+
 (defn train-data
   "Train one model per training file. progress-fn (optional) is called with
-   {:language :language-index :languages :iteration :iterations} as training advances."
+   {:language :language-index :languages :iteration :iterations} as training advances.
+   A language whose training fails does not abort the others: its entry carries :error instead of :model."
   ([training-files] (train-data training-files (p/categorization-model)))
   ([training-files model] (train-data training-files model (fn [_] nil)))
   ([training-files model progress-fn]
@@ -237,8 +252,12 @@
            (fn [index tf]
              (let [position {:language (:language tf) :language-index (inc index) :languages total}]
                (progress-fn (assoc position :iteration 0 :iterations training-iterations))
-               {:model (train-model (:language tf) (:file tf) model #(progress-fn (merge position %)))
-                :language (:language tf)}))
+               (try
+                 {:model (train-model (:language tf) (:file tf) model #(progress-fn (merge position %)))
+                  :language (:language tf)}
+                 (catch Exception e
+                   (t/log! {:level :error :error e} ["Training the" (:language tf) "model failed."])
+                   {:language (:language tf) :error e}))))
            training-files)))))
 
 (defn categorize-tokens [tokens ^File model-file]

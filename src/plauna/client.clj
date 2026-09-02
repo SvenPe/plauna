@@ -871,4 +871,18 @@
     ;; cheap for known messages.
     (let [^IMAPMessage message (.getMessage ^IMAPFolder folder n)]
       (set-message-as-peek message)
-      (message-id-of message))))
+      (message-id-of message)))
+  (nth-message-identity-from-folder [_ n folder]
+    (let [^IMAPMessage message (.getMessage ^IMAPFolder folder n)
+          attempt (fn [f] (try (f) (catch Exception _ nil)))]
+      (set-message-as-peek message)
+      {:uid (attempt #(.getUID ^IMAPFolder folder message))
+       :message-id (attempt #(message-id-of message))
+       :subject (attempt #(try (.getSubject message)
+                               (catch MessagingException _ (decode-header-text (raw-header message "Subject")))))}))
+  (email-by-uid-from-folder [_ uid folder]
+    (when-let [^IMAPMessage message (.getMessageByUID ^IMAPFolder folder (long uid))]
+      (set-message-as-peek message)
+      (t/log! :debug ["Reading message with UID" uid "from" (.getName ^IMAPFolder folder)])
+      {:email (message->email message)
+       :message message})))

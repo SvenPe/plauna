@@ -95,3 +95,26 @@
         (is (:done? (last @events)) "The final event marks the end of training"))
       (finally
         (io/delete-file training-file true)))))
+
+(deftest training-file-outcomes-counts-samples-and-labels
+  (let [training-file (java.io.File/createTempFile "plauna-training-" ".train")]
+    (try
+      (spit training-file "1 subject:a body:b\n1 subject:c\n\n2 subject:d\n")
+      (is (= {:samples 3 :labels #{"1" "2"}} (analysis/training-file-outcomes training-file)))
+      (finally (io/delete-file training-file true)))))
+
+(deftest a-failing-language-does-not-abort-the-other-models
+  (let [good (java.io.File/createTempFile "plauna-training-good-" ".train")
+        single (java.io.File/createTempFile "plauna-training-single-" ".train")]
+    (try
+      (spit good (str "1 sender-domain:shop.example subject:invoice body:payment\n"
+                      "2 sender-domain:friends.example subject:dinner body:tomorrow\n"))
+      (spit single "1 sender-domain:shop.example subject:invoice body:payment\n")
+      (let [results (analysis/train-data [{:language "eng" :file good} {:language "deu" :file single}] "naive-bayes")]
+        (is (= ["eng" "deu"] (mapv :language results)))
+        (is (some? (:model (first results))) "The trainable language still yields a model")
+        (is (nil? (:model (second results))))
+        (is (instance? Exception (:error (second results))) "The single-outcome language reports its error instead of throwing"))
+      (finally
+        (io/delete-file good true)
+        (io/delete-file single true)))))

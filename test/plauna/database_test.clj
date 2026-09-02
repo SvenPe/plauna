@@ -205,3 +205,25 @@
   (is (= "conn-2" (db/email-connection-id "conn-rt")))
   (is (= "conn-2" (:connection-id (first (db/fetch-metadata-for ["conn-rt"])))) "The batch fetch exposes the account too")
   (is (nil? (db/email-connection-id "no-such-message"))))
+
+(deftest parse-failures-are-recorded-updated-and-resolved
+  (db/record-parse-failure! {:connection-id "conn-f" :folder "INBOX" :uid 501 :message-number 7 :message-id nil :subject "first" :error "Failed to load IMAP envelope"})
+  (db/record-parse-failure! {:connection-id "conn-f" :folder "INBOX" :uid 501 :message-number 6 :message-id "<m-501>" :subject nil :error "again"})
+  (db/record-parse-failure! {:connection-id "conn-f" :folder "Archive" :uid nil :message-number 1 :message-id nil :subject nil :error "no uid"})
+  (db/record-parse-failure! {:connection-id "conn-f" :folder "Archive" :uid nil :message-number 2 :message-id nil :subject nil :error "no uid either"})
+  (let [failures (db/parse-failures-for-connection "conn-f")
+        inbox (first (filter #(= "INBOX" (:folder %)) failures))]
+    (is (= 3 (count failures)) "Two failures without UID stay separate; the same UID is one entry")
+    (is (= 2 (:attempts inbox)))
+    (is (= 6 (:message-number inbox)))
+    (is (= "<m-501>" (:message-id inbox)) "A later attempt fills in the Message-ID")
+    (is (= "first" (:subject inbox)) "A later attempt without subject keeps the known one")
+    (is (= "again" (:error inbox))))
+  (is (= 1 (count (db/parse-failures-for-folder "conn-f" "INBOX"))))
+  (db/resolve-parse-failures! "conn-f" "INBOX" nil "<m-501>")
+  (is (empty? (db/parse-failures-for-folder "conn-f" "INBOX")) "Resolving by Message-ID removes the entry")
+  (let [archive (db/parse-failures-for-folder "conn-f" "Archive")]
+    (db/delete-parse-failure! (:id (first archive)))
+    (is (= 1 (count (db/parse-failures-for-folder "conn-f" "Archive")))))
+  (db/resolve-parse-failures! "conn-f" "Archive" nil nil)
+  (is (= 1 (count (db/parse-failures-for-folder "conn-f" "Archive"))) "Nothing to match on: nothing is deleted"))
