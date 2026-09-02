@@ -210,7 +210,8 @@
     (let [html (markup/training-progress-page "/admin/preferences")]
       (is (str/includes? html "/training/status"))
       (is (str/includes? html "href=\"/admin/preferences\""))
-      (is (str/includes? html "<progress")))))
+      (is (str/includes? html "<progress"))
+      (is (str/includes? html "id=\"training-steps\"") "The step checklist has its container"))))
 
 (deftest connection-page-offers-to-move-a-finished-batch
   (with-redefs [client/disconnected-connections (fn [] [])]

@@ -425,6 +425,36 @@
                                      :order-by [[:started-at :desc] [:id :desc]]
                                      :limit limit}) builder-function-kebab))
 
+(defn fetch-training-tokens-for
+  "Cached classification tokens as {message-id tokens} for the given ids."
+  [message-ids]
+  (if (empty? message-ids)
+    {}
+    (into {} (map (juxt :message_id :tokens))
+          (jdbc/execute! (ds)
+                         (into [(str "SELECT message_id, tokens FROM training_tokens WHERE message_id IN (" (string/join ", " (repeat (count message-ids) "?")) ")")]
+                               message-ids)
+                         builder-function))))
+
+(defn save-training-tokens!
+  "Cache classification tokens ({message-id tokens}); an existing row is replaced."
+  [tokens-by-id]
+  (when (seq tokens-by-id)
+    (let [now (epoch-seconds)
+          insert (builder/for-insert-multi :training_tokens
+                                           [:message_id :tokens :generated_at]
+                                           (mapv (fn [[id tokens]] [id tokens now]) tokens-by-id)
+                                           {})]
+      (jdbc/execute! (ds)
+                     (if (mariadb?)
+                       (conj (rest insert) (str (first insert) " ON DUPLICATE KEY UPDATE tokens = VALUES(tokens), generated_at = VALUES(generated_at)"))
+                       (conj (rest insert) (string/replace-first (first insert) #"^INSERT" "INSERT OR REPLACE")))))))
+
+(defn delete-training-tokens!
+  "Drop the cached tokens of a message whose content changed, so the next training recomputes them."
+  [message-id]
+  (jdbc/execute! (ds) (honey/format {:delete-from :training-tokens :where [:= :message-id message-id]})))
+
 (defn- parse-failure-by-uid [connection-id folder uid]
   (when (some? uid)
     (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-failures]

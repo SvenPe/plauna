@@ -471,11 +471,14 @@
   (is (= 0 (server/training-percent {:status :running :phase :starting})))
   (is (= 0 (server/training-percent {:status :running :phase :collecting :emails-written 0 :emails-total 200})))
   (is (= 13 (server/training-percent {:status :running :phase :collecting :emails-written 100 :emails-total 200})))
-  (is (= 25 (server/training-percent {:status :running :phase :training :languages 2 :language-index 1 :iteration 0 :iterations 1000})))
-  (is (= 44 (server/training-percent {:status :running :phase :training :languages 2 :language-index 1 :iteration 500 :iterations 1000})))
-  (is (= 63 (server/training-percent {:status :running :phase :training :languages 2 :language-index 2 :iteration 0 :iterations 1000})))
+  (is (= 25 (server/training-percent {:status :running :phase :training :languages 2 :language-progress {}})))
+  (is (= 44 (server/training-percent {:status :running :phase :training :languages 2
+                                      :language-progress {"deu" {:iteration 500 :iterations 1000} "eng" {:iteration 0 :iterations 1000}}})))
+  (is (= 63 (server/training-percent {:status :running :phase :training :languages 2
+                                      :language-progress {"deu" {:done? true} "eng" {:iteration 0 :iterations 1000}}}))
+      "A finished language counts fully even without iteration callbacks")
   (is (= 100 (server/training-percent {:status :finished :phase :finished})))
-  (is (= 25 (server/training-percent {:status :running :phase :training :languages 0 :language-index 0 :iteration nil :iterations nil}))
+  (is (= 25 (server/training-percent {:status :running :phase :training :languages 0 :language-progress nil}))
       "Missing counts never divide by zero"))
 
 (deftest only-one-training-job-runs-at-a-time
@@ -558,3 +561,40 @@
     (let [result (server/switch-categorization-model! {:model "maxent" :use-current-categories "true" :confirmation "Start training"})]
       (is (= :alert (:type result)))
       (is (str/includes? (:content result) "not every language could be trained")))))
+
+(deftest training-steps-follow-the-run-through-its-phases
+  (let [state-ids (fn [steps] (mapv (juxt :id :state) steps))]
+    (is (= [["prepare" "running"] ["collect" "pending"] ["train" "pending"] ["write" "pending"] ["finish" "pending"]]
+           (state-ids (server/training-steps {:status :running :phase :starting}))))
+    (let [collecting (server/training-steps {:status :running :phase :collecting :emails-written 120 :emails-total 400 :tokens-computed 30
+                                             :training-languages ["deu" "eng"]})]
+      (is (= [["prepare" "done"] ["collect" "running"] ["train" "pending"] ["write" "pending"] ["finish" "pending"]] (state-ids collecting)))
+      (is (= "120 of 400 e-mails, 30 analysed for the first time and cached" (:detail (second collecting))))
+      (is (= [["deu" "pending"] ["eng" "pending"]] (mapv (juxt :label :state) (:children (nth collecting 2))))
+          "The languages are listed as pending before training starts"))
+    (let [training (server/training-steps {:status :running :phase :training :languages 1
+                                           :training-languages ["deu" "eng" "fra"]
+                                           :language-progress {"deu" {:iteration 250 :iterations 1000}}
+                                           :skipped-languages [{:language "fra" :reason "fra: all 3 categorized e-mail(s) belong to one category (X); a model needs at least two categories"}]})
+          children (:children (nth training 2))]
+      (is (= [["prepare" "done"] ["collect" "done"] ["train" "running"] ["write" "pending"] ["finish" "pending"]] (state-ids training)))
+      (is (= [["deu" "running" "iteration 250 of at most 1000"] ["eng" "pending" nil]
+              ["fra" "skipped" "fra: all 3 categorized e-mail(s) belong to one category (X); a model needs at least two categories"]]
+             (mapv (juxt :label :state :detail) children))))
+    (let [writing (server/training-steps {:status :running :phase :writing :models-written 1 :models-total 2
+                                          :training-languages ["deu" "eng"]
+                                          :language-progress {"deu" {:done? true} "eng" {:done? true :failed? true}}})]
+      (is (= [["prepare" "done"] ["collect" "done"] ["train" "done"] ["write" "running"] ["finish" "pending"]] (state-ids writing)))
+      (is (= "1 of 2 model file(s)" (:detail (nth writing 3))))
+      (is (= [["deu" "done"] ["eng" "failed"]] (mapv (juxt :label :state) (:children (nth writing 2))))))
+    (let [finished (server/training-steps {:status :finished :phase :writing :models-written 2 :models-total 2
+                                           :training-languages ["deu"] :language-progress {"deu" {:done? true}}
+                                           :result {:type :success :content "Training finished."}})]
+      (is (= [["prepare" "done"] ["collect" "done"] ["train" "done"] ["write" "done"] ["finish" "done"]] (state-ids finished)))
+      (is (= "Training finished." (:detail (last finished)))))
+    (let [failed-early (server/training-steps {:status :finished :phase :collecting :emails-written 0 :emails-total 0
+                                               :result {:type :alert :content "There are no categorized e-mails in the selected training languages."}})]
+      (is (= [["prepare" "done"] ["collect" "failed"] ["train" "pending"] ["write" "pending"] ["finish" "failed"]] (state-ids failed-early))
+          "A run that stopped while collecting marks that step as failed and leaves the rest untouched"))
+    (is (= 99 (server/training-percent {:status :running :phase :writing})))
+    (is (contains? (server/training-status) :steps))))

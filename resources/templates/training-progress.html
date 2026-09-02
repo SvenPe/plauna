@@ -10,6 +10,7 @@
     <progress id="training-bar" class="progress progress-primary w-full" value="0" max="100"></progress>
     <p id="training-percent" class="text-sm"></p>
     <p id="training-detail" class="text-sm opacity-70"></p>
+    <ul id="training-steps" class="mt-4 space-y-1 text-sm" aria-label="Training steps"></ul>
     <div id="training-result" class="alert mt-4" role="alert" hidden>
       <span id="training-result-text"></span>
     </div>
@@ -28,19 +29,57 @@
     var detail = document.getElementById('training-detail');
     var result = document.getElementById('training-result');
     var resultText = document.getElementById('training-result-text');
+    var stepsList = document.getElementById('training-steps');
+
+    var stepIcons = {done: '✓', running: '▶', pending: '○', failed: '✕', skipped: '–'};
+    var stepClasses = {done: 'text-success', running: 'text-primary font-semibold', pending: 'opacity-60', failed: 'text-error font-semibold', skipped: 'opacity-70'};
+
+    function renderStep(step, nested) {
+      var item = document.createElement('li');
+      item.className = (nested ? 'ml-6 ' : '') + (stepClasses[step.state] || '');
+      var icon = document.createElement('span');
+      icon.className = 'inline-block w-5';
+      icon.setAttribute('aria-hidden', 'true');
+      icon.textContent = stepIcons[step.state] || '○';
+      var text = document.createElement('span');
+      text.textContent = step.label + (step.detail ? ' - ' + step.detail : '');
+      var stateText = document.createElement('span');
+      stateText.className = 'sr-only';
+      stateText.textContent = ' (' + step.state + ')';
+      item.appendChild(icon);
+      item.appendChild(text);
+      item.appendChild(stateText);
+      var fragment = document.createDocumentFragment();
+      fragment.appendChild(item);
+      (step.children || []).forEach(function (child) { fragment.appendChild(renderStep(child, true)); });
+      return fragment;
+    }
+
+    function renderSteps(steps) {
+      stepsList.textContent = '';
+      (steps || []).forEach(function (step) { stepsList.appendChild(renderStep(step, false)); });
+    }
 
     function describe(state) {
       if (state.status === 'idle') { return 'No training run has been started.'; }
       if (state.phase === 'starting') { return 'Preparing the training run…'; }
       if (state.phase === 'collecting') {
-        return 'Collecting training data: ' + (state['emails-written'] || 0) + ' of ' + (state['emails-total'] || 0) + ' categorized e-mails';
+        var computed = state['tokens-computed'] || 0;
+        return 'Collecting training data: ' + (state['emails-written'] || 0) + ' of ' + (state['emails-total'] || 0) + ' categorized e-mails'
+          + (computed ? ' (' + computed + ' analysed for the first time and cached)' : '');
       }
       if (state.phase === 'training') {
-        var text = 'Training the ' + (state.language || '') + ' model (' + (state['language-index'] || 0) + ' of ' + (state.languages || 0) + ')';
-        if (state.iteration) { text += ': iteration ' + state.iteration + ' of at most ' + state.iterations; }
-        return text;
+        var progress = state['language-progress'] || {};
+        var parts = Object.keys(progress).sort().map(function (language) {
+          var p = progress[language];
+          if (p['failed?']) { return language + ': failed'; }
+          if (p['done?']) { return language + ': done'; }
+          if (p.iteration) { return language + ': iteration ' + p.iteration + ' of at most ' + p.iterations; }
+          return language + ': running';
+        });
+        return 'Training ' + (state.languages || parts.length) + ' language model(s) in parallel' + (parts.length ? ' - ' + parts.join(', ') : '');
       }
-      if (state.phase === 'finished') { return 'Finished.'; }
+      if (state.phase === 'writing') { return 'Writing the model files…'; }
       return '';
     }
 
@@ -49,7 +88,8 @@
       bar.value = state.percent || 0;
       label.textContent = (state.label || 'Training') + (running ? ' in progress' : (state.status === 'finished' ? ' finished' : ''));
       percent.textContent = (state.percent || 0) + ' %';
-      detail.textContent = describe(state);
+      detail.textContent = running ? describe(state) : '';
+      renderSteps(state.steps);
       if (state.status === 'finished' && state.result) {
         result.hidden = false;
         result.className = 'alert mt-4 ' + (state.result.type === 'success' ? 'alert-success' : (state.result.type === 'alert' ? 'alert-error' : 'alert-info'));

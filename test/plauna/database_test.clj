@@ -227,3 +227,17 @@
     (is (= 1 (count (db/parse-failures-for-folder "conn-f" "Archive")))))
   (db/resolve-parse-failures! "conn-f" "Archive" nil nil)
   (is (= 1 (count (db/parse-failures-for-folder "conn-f" "Archive"))) "Nothing to match on: nothing is deleted"))
+
+(deftest training-tokens-are-cached-replaced-and-invalidated
+  (db/save-headers [{:mime-type "text/plain" :subject "t1" :message-id "tok-1" :date 0 :in-reply-to nil}
+                    {:mime-type "text/plain" :subject "t2" :message-id "tok-2" :date 0 :in-reply-to nil}])
+  (is (= {} (db/fetch-training-tokens-for [])))
+  (is (= {} (db/fetch-training-tokens-for ["tok-1"])))
+  (db/save-training-tokens! {"tok-1" "subject:a body:b" "tok-2" "subject:c"})
+  (is (= {"tok-1" "subject:a body:b" "tok-2" "subject:c"} (db/fetch-training-tokens-for ["tok-1" "tok-2" "tok-missing"])))
+  (db/save-training-tokens! {"tok-1" "subject:new"})
+  (is (= "subject:new" (get (db/fetch-training-tokens-for ["tok-1"]) "tok-1")) "Saving again replaces the cached tokens")
+  (db/delete-training-tokens! "tok-1")
+  (is (= {"tok-2" "subject:c"} (db/fetch-training-tokens-for ["tok-1" "tok-2"])))
+  (db/delete-email-by-message-id "tok-2")
+  (is (= {} (db/fetch-training-tokens-for ["tok-2"])) "Deleting the e-mail removes its cached tokens"))

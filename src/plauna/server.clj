@@ -174,21 +174,56 @@
         0)
     0))
 
-(defn- report-training-progress! [progress]
-  (swap! training-progress merge progress))
+(defn- report-training-progress!
+  "Phase-level events merge into the run state; per-language events (those carrying :language) are
+   kept side by side under :language-progress because the languages train in parallel."
+  [progress]
+  (if-let [language (:language progress)]
+    (swap! training-progress assoc-in [:language-progress language] (dissoc progress :language))
+    (swap! training-progress merge progress)))
+
+(defn- attach-bodies
+  "Load the body parts of e-mails that were fetched without them (one query for the whole page)."
+  [emails]
+  (let [ids (mapv #(-> % :header :message-id) emails)
+        bodies (group-by :message-id (db/fetch-bodies-for ids))]
+    (mapv (fn [email]
+            (assoc email :body (map core-email/construct-body-part (get bodies (-> email :header :message-id)))))
+          emails)))
+
+(defn- training-tokens-for
+  "The classification tokens of a page of e-mails as {message-id tokens}: from the training_tokens
+   cache where present, otherwise computed now (in parallel, this is the expensive text cleaning) and
+   cached for every later run."
+  [emails]
+  (let [message-id #(-> % :header :message-id)
+        cached (db/fetch-training-tokens-for (mapv message-id emails))
+        missing (remove #(contains? cached (message-id %)) emails)
+        computed (when (seq missing)
+                   (into {} (pmap (fn [email] [(message-id email) (analysis/training-tokens-text email)])
+                                  (attach-bodies missing))))]
+    (when (seq computed)
+      (db/save-training-tokens! computed)
+      (swap! training-progress update :tokens-computed (fnil + 0) (count computed)))
+    (merge cached computed)))
 
 (defn write-all-categorized-emails-to-training-files []
   (files/delete-files-with-type :train)
   (let [languages (languages-to-use-in-training)]
-    (report-training-progress! {:phase :collecting :emails-written 0 :emails-total (categorized-email-count languages)})
+    (report-training-progress! {:phase :collecting :emails-written 0 :tokens-computed 0
+                                :emails-total (categorized-email-count languages)
+                                :training-languages (vec languages)})
     (doseq [language languages
-            :let [entity-query {:entity :enriched-email :page {:size 100 :page 1}}
+            ;; Bodies are not loaded with the page: cached tokens make them unnecessary for most e-mails.
+            :let [entity-query {:entity :enriched-email :page {:size 200 :page 1} :with-bodies false}
                   sql-query {:where [:and [:<> :category nil] [:= :language language]]}
-                  write-func (fn [data]
-                               (let [formatted (analysis/format-training-data data)]
-                                 (when (seq formatted)
-                                   (files/write-to-training-file language formatted)))
-                               (swap! training-progress update :emails-written (fnil + 0) (count data)))]]
+                  write-func (fn [emails]
+                               (let [tokens (training-tokens-for emails)
+                                     lines (analysis/format-training-lines
+                                            (map (fn [email] [(-> email :metadata :category-id) (get tokens (-> email :header :message-id))]) emails))]
+                                 (when (seq lines)
+                                   (files/write-to-training-file language lines)))
+                               (swap! training-progress update :emails-written (fnil + 0) (count emails)))]]
       (core-email/iterate-over-all-pages db/fetch-data write-func entity-query sql-query false))))
 
 (defn- category-label-name
@@ -236,14 +271,17 @@
                     ;; OpenNLP rejects data with a single outcome (InsufficientTrainingDataException); skip
                     ;; those languages up front instead of letting one of them abort the whole run.
                     {trainable true skipped false} (group-by #(> (count (:labels %)) 1) inspected)
-                    _ (report-training-progress! {:phase :training :languages (count trainable) :language-index 0 :iteration 0 :iterations analysis/training-iterations})
+                    _ (report-training-progress! {:phase :training :languages (count trainable) :language-progress {}
+                                                  :skipped-languages (mapv (fn [entry] {:language (:language entry) :reason (single-outcome-note entry)}) skipped)})
                     results (analysis/train-data (vec trainable) model report-training-progress!)
                     {trained :trained failed :failed} (group-by #(if (:error %) :failed :trained) results)]
+                (report-training-progress! {:phase :writing :models-written 0 :models-total (count trained)})
                 (doseq [training-model trained]
                   (files/write-model-file-atomically!
                    (:language training-model)
                    model
-                   #(analysis/serialize-and-write-model! (:model training-model) %)))
+                   #(analysis/serialize-and-write-model! (:model training-model) %))
+                  (swap! training-progress update :models-written (fnil inc 0)))
                 (training-outcome-message trained skipped failed))
               {:type :alert :content "There are no categorized e-mails in the selected training languages."})))
       {:type :alert :content "There are no selected languages to train in. Cannot proceed."})))
@@ -253,16 +291,17 @@
 
 (defn training-percent
   "Overall progress of a training run as 0-100. Collecting the training data is the first quarter;
-   the remaining three quarters are split evenly across the languages and, within a language,
-   advance linearly with the iterations (Naive Bayes reports none and jumps per language)."
-  [{:keys [status phase emails-written emails-total language-index languages iteration iterations]}]
+   the remaining three quarters are split evenly across the languages (which train in parallel) and,
+   within a language, advance linearly with the iterations. Trainers without iteration callbacks
+   (Naive Bayes, L-BFGS) report only their completion."
+  [{:keys [status phase emails-written emails-total languages language-progress]}]
   (let [fraction (fn [part whole] (if (and whole (pos? whole)) (min 1.0 (/ (double (or part 0)) whole)) 0.0))
+        language-fraction (fn [{:keys [done? iteration iterations]}] (if done? 1.0 (fraction iteration iterations)))
         value (case phase
                 :collecting (* 25 (fraction emails-written emails-total))
-                :training (let [language-count (max 1 (or languages 1))
-                                completed (max 0 (dec (or language-index 1)))]
-                            (+ 25 (* 75 (/ (+ completed (fraction iteration iterations)) language-count))))
-                :finished 100
+                :training (let [language-count (max 1 (or languages (count language-progress) 1))]
+                            (+ 25 (* 75 (/ (reduce + 0.0 (map language-fraction (vals language-progress))) language-count))))
+                :writing 99
                 0)]
     (if (= :finished status) 100 (int (Math/round (double value))))))
 
@@ -292,7 +331,8 @@
                  (catch Throwable e
                    (t/log! {:level :error :error e} "Model training failed.")
                    {:type :alert :content "Training failed. The existing model remains active."}))]
-    (swap! training-progress assoc :status :finished :phase :finished :finished-at (System/currentTimeMillis) :result result)
+    ;; The phase is left where the run ended, so the step list can show which step failed.
+    (swap! training-progress assoc :status :finished :finished-at (System/currentTimeMillis) :result result)
     result))
 
 (defn run-training-job!
@@ -321,13 +361,76 @@
       (p/record-successful-training! (Instant/now)))
     result))
 
+(def ^:private training-phase-order [:starting :collecting :training :writing])
+
+(defn- step-state
+  "pending / running / done / failed for the step of phase step-phase given the run's current phase and
+   status. A finished run marks every step before the last phase done; the last phase is done or failed
+   depending on the result; later steps stay pending."
+  [step-phase {:keys [status phase result]}]
+  (let [index (fn [ph] (.indexOf ^java.util.List training-phase-order ph))
+        current (index (or phase :starting))
+        mine (index step-phase)]
+    (cond
+      (< mine current) "done"
+      (> mine current) "pending"
+      (= :finished status) (if (= :alert (:type result)) "failed" "done")
+      :else "running")))
+
+(defn- language-steps
+  "One sub-step per language: pending, running (with the iteration), done, failed or skipped."
+  [{:keys [training-languages language-progress skipped-languages status phase]}]
+  (let [skipped (into {} (map (juxt :language :reason)) skipped-languages)
+        languages (distinct (concat training-languages (keys language-progress) (keys skipped)))]
+    (vec (for [language (sort languages)
+               :let [{:keys [iteration iterations done? failed?]} (get language-progress language)]]
+           {:label language
+            :state (cond
+                     (contains? skipped language) "skipped"
+                     failed? "failed"
+                     done? "done"
+                     (and (= :finished status) (not= :writing phase)) (if (contains? language-progress language) "failed" "pending")
+                     (contains? language-progress language) "running"
+                     :else "pending")
+            :detail (cond
+                      (contains? skipped language) (get skipped language)
+                      (and (not done?) (some-> iteration pos?)) (str "iteration " iteration " of at most " iterations)
+                      :else nil)}))))
+
+(defn training-steps
+  "The checklist shown on the progress page: every step of a training run with its state and a detail
+   line for the running step."
+  [{:keys [status emails-written emails-total tokens-computed models-written models-total result] :as state}]
+  (let [collect-state (step-state :collecting state)
+        training-state (step-state :training state)
+        writing-state (step-state :writing state)]
+    [{:id "prepare" :label "Prepare the training run" :state (step-state :starting state) :detail nil}
+     {:id "collect" :label "Collect the categorized e-mails"
+      :state collect-state
+      :detail (when (not= "pending" collect-state)
+                (str (or emails-written 0) " of " (or emails-total 0) " e-mails"
+                     (when (some-> tokens-computed pos?) (str ", " tokens-computed " analysed for the first time and cached"))))}
+     {:id "train" :label "Train the language models (in parallel)"
+      :state training-state
+      :detail nil
+      :children (language-steps state)}
+     {:id "write" :label "Write the model files"
+      :state writing-state
+      :detail (when (not= "pending" writing-state) (str (or models-written 0) " of " (or models-total 0) " model file(s)"))}
+     {:id "finish" :label "Finish"
+      :state (cond (not= :finished status) "pending"
+                   (= :alert (:type result)) "failed"
+                   :else "done")
+      :detail (when (= :finished status) (:content result))}]))
+
 (defn training-status
   "The progress page's JSON view of the current run."
   []
   (let [state @training-progress]
-    (-> (select-keys state [:status :label :phase :language :language-index :languages :iteration :iterations
-                            :emails-written :emails-total :started-at :finished-at :result])
-        (assoc :percent (training-percent state)))))
+    (-> (select-keys state [:status :label :phase :languages :language-progress
+                            :emails-written :emails-total :tokens-computed :started-at :finished-at :result])
+        (assoc :percent (training-percent state)
+               :steps (training-steps state)))))
 
 (defn training-progress-url [back] (str "/training/progress?back=" (java.net.URLEncoder/encode (str back) "UTF-8")))
 
@@ -570,7 +673,10 @@
                                   (filter (fn [r] (and (blank? r) (contains? content-keys (part-key r)))))
                                   (keep :id))]
         (when (seq stale-ids) (db/delete-bodies-by-ids stale-ids))
-        (when (seq content-parts) (db/save-bodies content-parts))
+        (when (seq content-parts)
+          (db/save-bodies content-parts)
+          ;; The text changed, so the cached classification tokens must be derived again.
+          (db/delete-training-tokens! message-id))
         (when (seq attachment-parts) (db/save-bodies attachment-parts)))
       (when (seq (:participants refetched))
         (db/save-contacts (:participants refetched))

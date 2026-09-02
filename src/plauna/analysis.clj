@@ -16,6 +16,7 @@
    (opennlp.tools.doccat DocumentSampleStream DocumentCategorizerME DocumentCategorizerEventStream DoccatFactory DoccatModel)
    (opennlp.tools.ml EventTrainer TrainerFactory)
    (opennlp.tools.ml.maxent GISTrainer)
+   (opennlp.tools.ml.maxent.quasinewton QNTrainer)
    (opennlp.tools.ml.naivebayes NaiveBayesTrainer)
    (opennlp.tools.monitoring TrainingProgressMonitor)
    (java.util HashMap Locale)
@@ -57,13 +58,17 @@
 
 (def supported-categorization-models
   [{:id "naive-bayes" :name "Naive Bayes"}
-   {:id "maxent" :name "Maximum Entropy (MaxEnt)"}])
+   {:id "maxent" :name "Maximum Entropy (MaxEnt, GIS)"}
+   {:id "maxent-qn" :name "Maximum Entropy (MaxEnt, L-BFGS - faster training)"}])
 
 (defn categorization-algorithm
   (^String [] (categorization-algorithm (p/categorization-model)))
   (^String [model]
    (case (p/canonical-categorization-model model)
      "maxent" GISTrainer/MAXENT_VALUE
+     ;; The same model family, fitted with the quasi-Newton (L-BFGS) optimiser, which converges in far
+     ;; fewer passes over the data than GIS. Prediction reads both with DocumentCategorizerME.
+     "maxent-qn" QNTrainer/MAXENT_QN_VALUE
      NaiveBayesTrainer/NAIVE_BAYES_VALUE)))
 
 (lang/default-init!)
@@ -164,6 +169,23 @@
     (legacy-classification-tokens email)
     (classification-tokens email)))
 
+(defn training-tokens-text
+  "The classification features of an e-mail as one space-separated line, the form cached in the
+   training_tokens table. Blank when the e-mail yields no usable feature."
+  [email]
+  (st/join " " (classification-tokens email)))
+
+(defn format-training-lines
+  "Training file content from [category-id tokens-text] pairs; pairs without a category or without
+   tokens are left out. The model label is the category ID, see format-training-data."
+  [pairs]
+  (transduce
+   (comp (filter (fn [[category tokens]] (and (some? category) (not (st/blank? tokens)))))
+         (map (fn [[category tokens]] (str category " " tokens "\n"))))
+   str
+   ""
+   pairs))
+
 (defn format-training-data [data]
   ;; The model label is the category ID, not its name: DocumentSampleStream treats the first
   ;; whitespace-delimited token as the label, so a name like "Work Projects" would be trained
@@ -183,12 +205,17 @@
    Naive Bayes needs a single pass and never reports iterations."
   1000)
 
+(defn available-processors [] (.availableProcessors (Runtime/getRuntime)))
+
 (defn training-parameters
+  "threads (optional) lets the GIS and L-BFGS trainers compute each iteration on several cores."
   ([] (training-parameters (p/categorization-model)))
-  ([model]
+  ([model] (training-parameters model 1))
+  ([model threads]
    (doto (new TrainingParameters)
      (.put TrainingParameters/ITERATIONS_PARAM (int training-iterations))
      (.put TrainingParameters/CUTOFF_PARAM 0)
+     (.put TrainingParameters/THREADS_PARAM (int (max 1 threads)))
      (.put TrainingParameters/ALGORITHM_PARAM (categorization-algorithm model)))))
 
 (comment NaiveBayesTrainer/NAIVE_BAYES_VALUE
@@ -216,15 +243,17 @@
   "The equivalent of DocumentCategorizerME/train that also reports iteration progress: OpenNLP only
    accepts a progress monitor through TrainingConfiguration, which the convenience method does not
    expose, so the trainer is assembled here from the same parts."
-  ^DoccatModel [^String language ^File file model progress-fn]
-  (let [parameters (training-parameters model)
+  (^DoccatModel [^String language ^File file model progress-fn]
+   (train-model language file model progress-fn 1))
+  (^DoccatModel [^String language ^File file model progress-fn threads]
+  (let [parameters (training-parameters model threads)
         manifest (HashMap.)
         factory (DoccatFactory.)
         ^EventTrainer trainer (TrainerFactory/getEventTrainer parameters manifest
                                                               (TrainingConfiguration. (progress-monitor progress-fn) nil))
         ^ObjectStream events (DocumentCategorizerEventStream. (training-data-stream file) (.getFeatureGenerators factory))
         maxent-model (.train trainer events)]
-    (DoccatModel. language maxent-model manifest factory)))
+    (DoccatModel. language maxent-model manifest factory))))
 
 (defn training-file-outcomes
   "Inspect a training file: how many samples it holds and which labels (category ids) occur. The label
@@ -241,24 +270,31 @@
             (line-seq reader))))
 
 (defn train-data
-  "Train one model per training file. progress-fn (optional) is called with
-   {:language :language-index :languages :iteration :iterations} as training advances.
-   A language whose training fails does not abort the others: its entry carries :error instead of :model."
+  "Train one model per training file, all languages in parallel, each trainer using its share of the
+   available cores. progress-fn (optional) is called with {:language :iteration :iterations} as a
+   language advances and once more with :done? true when it finishes. A language whose training fails
+   does not abort the others: its entry carries :error instead of :model. The result preserves the
+   order of training-files."
   ([training-files] (train-data training-files (p/categorization-model)))
   ([training-files model] (train-data training-files model (fn [_] nil)))
   ([training-files model progress-fn]
-   (let [total (count training-files)]
-     (vec (map-indexed
-           (fn [index tf]
-             (let [position {:language (:language tf) :language-index (inc index) :languages total}]
-               (progress-fn (assoc position :iteration 0 :iterations training-iterations))
-               (try
-                 {:model (train-model (:language tf) (:file tf) model #(progress-fn (merge position %)))
-                  :language (:language tf)}
-                 (catch Exception e
-                   (t/log! {:level :error :error e} ["Training the" (:language tf) "model failed."])
-                   {:language (:language tf) :error e}))))
-           training-files)))))
+   (let [threads (max 1 (quot (available-processors) (max 1 (count training-files))))
+         train-one (fn [tf]
+                     (let [language (:language tf)
+                           report #(progress-fn (assoc % :language language))]
+                       (report {:iteration 0 :iterations training-iterations})
+                       (try
+                         (let [result {:model (train-model language (:file tf) model report threads) :language language}]
+                           ;; Trainers without iteration callbacks (Naive Bayes, L-BFGS) still end with a done marker.
+                           (report {:iteration training-iterations :iterations training-iterations :done? true})
+                           result)
+                         (catch Exception e
+                           (t/log! {:level :error :error e} ["Training the" language "model failed."])
+                           (report {:done? true :failed? true})
+                           {:language language :error e}))))]
+     (->> training-files
+          (mapv #(future (train-one %)))
+          (mapv deref)))))
 
 (defn categorize-tokens [tokens ^File model-file]
   (if (and (.exists model-file) (seq tokens))

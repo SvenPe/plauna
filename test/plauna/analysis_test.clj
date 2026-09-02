@@ -87,7 +87,7 @@
       (let [trained (analysis/train-data [{:language "eng" :file training-file}] "maxent" #(swap! events conj %))]
         (is (= 1 (count trained)))
         (is (some? (:model (first trained))))
-        (is (= {:language "eng" :language-index 1 :languages 1 :iteration 0 :iterations analysis/training-iterations}
+        (is (= {:language "eng" :iteration 0 :iterations analysis/training-iterations}
                (first @events))
             "Training announces the language before the first iteration")
         (is (some #(and (pos? (:iteration %)) (= "eng" (:language %))) @events)
@@ -118,3 +118,41 @@
       (finally
         (io/delete-file good true)
         (io/delete-file single true)))))
+
+(deftest lbfgs-maxent-trains-and-predicts
+  (let [training-file (java.io.File/createTempFile "plauna-training-" ".train")
+        model-file (java.io.File/createTempFile "plauna-model-" ".bin")
+        events (atom [])]
+    (try
+      (spit training-file (str "1 sender-domain:shop.example subject:invoice body:payment\n"
+                               "1 sender-domain:shop.example subject:receipt body:purchase\n"
+                               "2 sender-domain:friends.example subject:dinner body:tomorrow\n"
+                               "2 sender-domain:friends.example subject:weekend body:meeting\n"))
+      (let [trained (first (analysis/train-data [{:language "eng" :file training-file}] "maxent-qn" #(swap! events conj %)))]
+        (is (some? (:model trained)))
+        (with-open [os (io/output-stream model-file)]
+          (analysis/serialize-and-write-model! (:model trained) os))
+        (is (= "1" (:name (analysis/categorize-tokens ["sender-domain:shop.example" "subject:invoice" "body:payment"] model-file))))
+        (is (= "2" (:name (analysis/categorize-tokens ["sender-domain:friends.example" "subject:dinner"] model-file))))
+        (is (:done? (last @events)) "A trainer without iteration callbacks still reports completion"))
+      (finally
+        (io/delete-file training-file true)
+        (io/delete-file model-file true)))))
+
+(deftest training-parameters-carry-algorithm-and-threads
+  (let [params (analysis/training-parameters "maxent-qn" 4)]
+    (is (= "MAXENT_QN" (.getStringParameter params "Algorithm" "")))
+    (is (= 4 (.getIntParameter params "Threads" 1))))
+  (is (= "MAXENT" (.getStringParameter (analysis/training-parameters "maxent") "Algorithm" "")))
+  (is (= 1 (.getIntParameter (analysis/training-parameters "maxent") "Threads" 0)) "Single-threaded unless asked otherwise"))
+
+(deftest format-training-lines-skips-unusable-pairs
+  (is (= "1 subject:a body:b\n2 subject:c\n"
+         (analysis/format-training-lines [[1 "subject:a body:b"] [nil "subject:x"] [2 "subject:c"] [3 ""] [4 nil]]))))
+
+(deftest training-tokens-text-matches-the-classification-tokens
+  (let [email {:header {:message-id "m" :subject "Invoice"}
+               :participants [{:type :sender :address "shop@example.com"}]
+               :body [{:mime-type "text/plain" :content "please pay"}]}]
+    (is (= (clojure.string/join " " (analysis/classification-tokens email)) (analysis/training-tokens-text email)))
+    (is (clojure.string/includes? (analysis/training-tokens-text email) "sender-domain:example.com"))))

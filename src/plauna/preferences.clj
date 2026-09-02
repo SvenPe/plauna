@@ -40,6 +40,7 @@
   [value]
   (case (some-> value str clojure.string/lower-case)
     ("maxent" "max-ent") "maxent"
+    ("maxent-qn" "maxent_qn" "maxentqn" "max-ent-qn" "lbfgs" "l-bfgs") "maxent-qn"
     ("naivebayes" "naive-bayes" "naive_bayes") "naive-bayes"
     "naive-bayes"))
 

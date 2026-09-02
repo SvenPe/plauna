@@ -16,6 +16,11 @@ All notable changes to this project will be documented in this file.
 
 ### ✨ Features
 
+- Faster training: the classification features of each e-mail are computed once and cached in the
+  new `training_tokens` table (invalidated when an e-mail is re-fetched), the languages train in
+  parallel, and the MaxEnt trainers use several processor cores. A new "MaxEnt, L-BFGS" model option
+  trains the same model family with the quasi-Newton optimiser in far fewer passes than GIS.
+
 - Allow explicitly selected mTLS client certificates, verified by an NGINX reverse proxy, to bypass
   the web UI password and establish a normal signed Plauna session. The opt-in integration uses a
   SHA-256 certificate-fingerprint allowlist and requires a shared proxy secret so forwarded headers
@@ -53,9 +58,10 @@ All notable changes to this project will be documented in this file.
 - React to the IMAP server closing the connection right away: a connection listener on the store
   schedules the same reconnect-and-catch-up the periodic health check performs, a few seconds after
   the drop, instead of waiting for the next health-check interval. Adopted from upstream Plauna.
-- Model training runs in the background and shows a live progress page with a progress bar, the
-  collection count and the per-language MaxEnt iteration, instead of blocking the request until the
-  reverse proxy reports a 504 gateway time-out. Manual training, the model switch and the daily
+- Model training runs in the background and shows a live progress page with a progress bar, a
+  checklist of every step (prepare, collect, train per language, write, finish) that is ticked off as
+  the run advances, the collection count and the per-language MaxEnt iteration, instead of blocking
+  the request until the reverse proxy reports a 504 gateway time-out. Manual training, the model switch and the daily
   automatic run share one slot, so only one training runs at a time.
 
 ## [2026-07-10.0] - 2026-07-10

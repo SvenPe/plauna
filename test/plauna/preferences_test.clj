@@ -23,7 +23,9 @@
 (t/deftest categorization-model-supports-new-and-legacy-setting-values
   (t/is (= "naive-bayes" (sut/canonical-categorization-model nil)))
   (t/is (= "naive-bayes" (sut/canonical-categorization-model "NAIVEBAYES")))
-  (t/is (= "maxent" (sut/canonical-categorization-model "MAXENT"))))
+  (t/is (= "maxent" (sut/canonical-categorization-model "MAXENT")))
+  (t/is (= "maxent-qn" (sut/canonical-categorization-model "MAXENT_QN")))
+  (t/is (= "maxent-qn" (sut/canonical-categorization-model "maxent-qn"))))
 
 (t/deftest scheduled-training-preferences-return-validated-string-values
   (swap! sut/cache (fn [_] (c/ttl-cache-factory {} :ttl 1)))
