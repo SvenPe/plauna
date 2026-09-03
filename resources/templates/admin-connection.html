@@ -164,6 +164,43 @@
 </div>
 {% endif %}
 
+{% if folder-emails|not-empty %}
+<div class="my-8">
+  <h4 class="text-lg">E-mails Still in Their Original Folders</h4>
+  <p class="text-sm opacity-70">Stored e-mails grouped by the folder they were read from and are still recorded in. "Move" moves the categorized ones into their category folders - across all parse runs and the live monitor at once. E-mails without a category stay where they are until they get one; duplicates that Plauna knows from another folder are not listed here because they were never saved from this folder.</p>
+  <div class="overflow-x-auto">
+    <table class="table table-zebra table-sm">
+      <thead>
+        <tr><th>Folder</th><th class="text-right">Categorized</th><th class="text-right">Without category</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for entry in folder-emails %}
+        <tr>
+          <td>{{entry.folder}}</td>
+          <td class="text-right">{{entry.categorized}}</td>
+          <td class="text-right">{{entry.uncategorized}}</td>
+          <td class="whitespace-nowrap">
+            {% if entry.move.status = "running" %}
+            <span class="badge badge-warning">moving {{entry.move.moved}} / {{entry.move.total}}</span>
+            {% else %}
+            {% if entry.move.status = "finished" %}<span class="badge badge-ghost mr-2" title="{{entry.move.not-found}} not found, {{entry.move.failed}} failed">moved {{entry.move.moved}} / {{entry.move.total}}</span>{% endif %}
+            {% if entry.categorized > 0 %}
+            <form action="{{entry.move-url}}" method="post" class="inline" onsubmit="return confirm('Move every categorized e-mail recorded in this folder into its category folder on the IMAP server?')">
+              <input type="hidden" name="folder" value="{{entry.folder}}" />
+              <input type="hidden" name="redirect-url" value="/admin/connections/{{id}}" />
+              <button class="btn btn-outline btn-xs" type="submit">Move {{entry.categorized}} to category folders</button>
+            </form>
+            {% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
 {% if parse-batches|not-empty %}
 <div class="my-8">
   <h4 class="text-lg">Recent Folder Parse Runs</h4>
@@ -178,7 +215,7 @@
           <th>Status</th>
           <th class="text-right">Batch size</th>
           <th class="text-right">New</th>
-          <th class="text-right">Skipped</th>
+          <th class="text-right" title="Already stored e-mails. 'elsewhere' = duplicates of e-mails stored from another folder; the rest were saved by earlier runs of this folder and are still waiting to be moved">Skipped</th>
           <th class="text-right">Errors</th>
           <th class="text-right">Not examined</th>
           <th></th>
@@ -192,7 +229,7 @@
           <td>{% if batch.status = "running" %}<span class="badge badge-warning">running</span>{% else %}{% if batch.status = "aborted" %}<span class="badge badge-error">aborted</span>{% else %}<span class="badge badge-success">finished</span>{% endif %}{% endif %}</td>
           <td class="text-right">{{batch.batch-size|default:"all"}}</td>
           <td class="text-right">{{batch.processed}}</td>
-          <td class="text-right">{{batch.skipped}}</td>
+          <td class="text-right" title="Already stored e-mails: {{batch.skipped|add:0}} in total, of which {{batch.skipped-elsewhere}} were duplicates of e-mails stored from other folders">{{batch.skipped}}{% if batch.skipped-elsewhere > 0 %} <span class="text-xs opacity-70">({{batch.skipped-elsewhere}} elsewhere)</span>{% endif %}</td>
           <td class="text-right">{{batch.errors}}</td>
           <td class="text-right">{{batch.remaining}}</td>
           <td class="whitespace-nowrap">

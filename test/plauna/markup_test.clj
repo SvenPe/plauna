@@ -252,3 +252,14 @@
       (is (str/includes? html "Failed to load IMAP envelope"))))
   (with-redefs [client/disconnected-connections (fn [] [])]
     (is (not (str/includes? (markup/connection {:id "c" :host "h" :user "u" :parse-failures []} [] []) "Messages That Could Not Be Read")))))
+
+(deftest connection-page-lists-folders-with-movable-emails
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/connection
+                {:id "c1" :host "h" :user "u"
+                 :folder-emails [{:folder "Newsletter_Alt" :categorized 640 :uncategorized 60 :move-url "/admin/connections/c1/folders/move" :move nil}
+                                 {:folder "INBOX" :categorized 0 :uncategorized 3 :move-url "/admin/connections/c1/folders/move" :move nil}]}
+                [] [])]
+      (is (str/includes? html "E-mails Still in Their Original Folders"))
+      (is (str/includes? html "Move 640 to category folders"))
+      (is (= 1 (count (re-seq #"to category folders</button>" html))) "A folder without categorized e-mails has no move button"))))

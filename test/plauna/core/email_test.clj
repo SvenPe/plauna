@@ -74,3 +74,14 @@
     (is (nil? (-> without :metadata :connection-id)))
     (is (= "conn-1" (-> with :metadata :connection-id)))
     (is (= "a" (-> with :metadata :category)))))
+
+(deftest synthetic-message-id-is-stable-and-recognisable
+  (let [a (core.email/synthetic-message-id 1756800000 "Shop@Example.com" " Invoice ")
+        b (core.email/synthetic-message-id 1756800000 "shop@example.com" "Invoice")
+        c (core.email/synthetic-message-id 1756800001 "shop@example.com" "Invoice")]
+    (is (= a b) "Case of the address and surrounding whitespace do not change the id")
+    (is (not= a c) "A different date gives a different id")
+    (is (core.email/synthetic-message-id? a))
+    (is (not (core.email/synthetic-message-id? "<real@example.com>")))
+    (is (not (core.email/synthetic-message-id? nil)))
+    (is (string? (core.email/synthetic-message-id nil nil nil)) "Even a message with nothing to hash gets an id")))

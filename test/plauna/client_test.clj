@@ -314,10 +314,18 @@
         "From and To are parsed leniently; the unparseable Cc header is dropped instead of failing")
     (is (every? #(= "<broken-envelope@example.com>" (:message-id %)) participants))))
 
+(deftest raw-header-fallback-synthesizes-a-missing-message-id
+  (let [raw (str "Date: Tue, 2 Sep 2026 10:00:00 +0200\r\nFrom: shop@example.com\r\nSubject: Invoice\r\nContent-Type: text/plain\r\n\r\nbody\r\n")
+        header (client/header-from-raw-headers (mime-message raw))]
+    (is (= (core-email/synthetic-message-id 1788336000 "shop@example.com" "Invoice") (:message-id header))
+        "The synthetic id is built from date, sender and subject, so mbox and IMAP agree")
+    (is (= (:message-id header) (:message-id (client/header-from-raw-headers (mime-message raw)))) "Deterministic across runs")
+    (is (every? #(= (:message-id header) (:message-id %)) (client/participants-from-raw-headers (mime-message raw) (:message-id header))))))
+
 (deftest raw-header-fallback-tolerates-missing-headers
   (let [message (mime-message "Content-Type: text/plain\r\n\r\nbody\r\n")
         header (client/header-from-raw-headers message)]
-    (is (nil? (:message-id header)))
+    (is (core-email/synthetic-message-id? (:message-id header)) "Without any header there is still a (synthetic) id")
     (is (nil? (:subject header)))
     (is (nil? (:date header)))
     (is (= [] (client/participants-from-raw-headers message nil)))

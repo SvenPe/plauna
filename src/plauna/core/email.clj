@@ -18,6 +18,23 @@
 
 (defrecord EnrichedBodyPart [^Body-Part body-part ^Metadata metadata])
 
+(defn synthetic-message-id
+  "A stable stand-in for a missing Message-ID header, derived from the message's date (epoch seconds),
+   first sender address and subject. The same message therefore gets the same id whether it is read
+   from IMAP or an mbox file, in whichever folder it lies, so it is recognised as already stored on a
+   later run. Two genuinely different messages with identical date, sender and subject collide, which
+   is the same outcome as for two messages sharing a real Message-ID."
+  [date sender-address subject]
+  (str "<plauna-"
+       (java.util.UUID/nameUUIDFromBytes (.getBytes (str (or date "") "|" (s/lower-case (str sender-address)) "|" (s/trim (str subject)))
+                                                    java.nio.charset.StandardCharsets/UTF_8))
+       "@generated.plauna>"))
+
+(defn synthetic-message-id?
+  "True for an id produced by synthetic-message-id."
+  [message-id]
+  (boolean (and (string? message-id) (s/starts-with? message-id "<plauna-") (s/ends-with? message-id "@generated.plauna>"))))
+
 (defn construct-body-part [body-part] (map->Body-Part body-part))
 
 (defn construct-participants [participant]

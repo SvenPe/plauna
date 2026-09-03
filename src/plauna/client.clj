@@ -7,6 +7,7 @@
    [taoensso.telemere :as t]
    [plauna.interfaces :as int]
    [plauna.application :as app]
+   [plauna.core.email :as core-email]
    [clojure.core.async :as async])
   (:import
    (plauna.core.email Header Body-Part Participant Email)
@@ -207,9 +208,25 @@
 
 (defn disposition [disposition] (when (some? disposition) (s/lower-case disposition)))
 
+(defn- sender-address-of
+  "The first sender address of a message from its ENVELOPE, or nil."
+  [^IMAPMessage message]
+  (let [^InternetAddress sender (or (.getSender message) (first (.getFrom message)))]
+    (when sender (.getAddress sender))))
+
+(defn envelope-message-id
+  "The Message-ID from the ENVELOPE, or a stable synthetic one (see core-email/synthetic-message-id)
+   when the message has no such header - Plauna cannot store a message without an id."
+  [^IMAPMessage message]
+  (let [message-id (.getMessageID message)]
+    (if (s/blank? message-id)
+      (let [sent (.getSentDate message)]
+        (core-email/synthetic-message-id (when sent (quot (.getTime sent) 1000)) (sender-address-of message) (.getSubject message)))
+      message-id)))
+
 (defn create-header [^IMAPMessage message]
   (let [sent (.getSentDate message)]
-    (new Header (.getMessageID message) (.getInReplyTo message) (.getSubject message)
+    (new Header (envelope-message-id message) (.getInReplyTo message) (.getSubject message)
                 (mime-type (.getContentType message))
                 (when sent (quot (.getTime sent) 1000)))))
 
@@ -257,9 +274,10 @@
         contact-key (uuid (str name address))]
     (new Participant address name contact-key contact-type message-id)))
 
-(defn create-participants [^IMAPMessage message]
+(defn create-participants
+  "The participants of a message, tagged with message-id (the header's id, synthetic or not)."
+  [^IMAPMessage message message-id]
   (let [sender (.getSender message)
-        message-id (.getMessageID message)
         sender-participant (when sender (create-participant sender :sender message-id))
         recipient-participants (mapv (fn [address] (create-participant address :receiver message-id)) (.getRecipients message Message$RecipientType/TO))
         cc-participants (mapv (fn [address] (create-participant address :cc message-id)) (.getRecipients message Message$RecipientType/CC))
@@ -306,11 +324,17 @@
              [])))))
 
 (defn header-from-raw-headers [^MimeMessage message]
-  (new Header (raw-header message "Message-ID")
-              (raw-header message "In-Reply-To")
-              (decode-header-text (raw-header message "Subject"))
-              (mime-type (.getContentType message))
-              (header-date-seconds (raw-header message "Date"))))
+  (let [subject (decode-header-text (raw-header message "Subject"))
+        date (header-date-seconds (raw-header message "Date"))
+        message-id (raw-header message "Message-ID")
+        ^InternetAddress from (or (first (header-addresses message "From")) (first (header-addresses message "Sender")))]
+    (new Header (if (s/blank? message-id)
+                  (core-email/synthetic-message-id date (when from (.getAddress from)) subject)
+                  message-id)
+                (raw-header message "In-Reply-To")
+                subject
+                (mime-type (.getContentType message))
+                date)))
 
 (defn participants-from-raw-headers [^MimeMessage message message-id]
   (let [from (or (first (header-addresses message "From")) (first (header-addresses message "Sender")))
@@ -325,17 +349,20 @@
    one, otherwise rebuilt from the raw header block."
   [^IMAPMessage message]
   (try
-    [(create-header message) (create-participants message)]
+    (let [header (create-header message)]
+      [header (create-participants message (:message-id header))])
     (catch MessagingException e
       (t/log! :info ["The IMAP envelope of message" (.getMessageNumber message) "could not be loaded (" (.getMessage e) "). Reading its raw headers instead."])
       (let [header (header-from-raw-headers message)]
         [header (participants-from-raw-headers message (:message-id header))]))))
 
 (defn message-id-of
-  "The Message-ID of an IMAP message, from the ENVELOPE or, when that cannot be loaded, the raw header."
+  "The Message-ID of an IMAP message (synthetic when the header is missing), from the ENVELOPE or, when
+   that cannot be loaded, the raw header block. The same id message->email stores, so the cheap
+   already-stored check recognises messages without a Message-ID header too."
   [^IMAPMessage message]
-  (try (.getMessageID message)
-       (catch MessagingException _ (raw-header message "Message-ID"))))
+  (try (envelope-message-id message)
+       (catch MessagingException _ (:message-id (header-from-raw-headers message)))))
 
 (defn message->email [^IMAPMessage message]
   (let [[header participants] (envelope-or-raw-headers message)]

@@ -640,3 +640,13 @@
     (is (= :info (:type aborted)))
     (is (str/includes? (:content aborted) "The run was 50 consecutive messages could not be read"))
     (is (str/includes? (:content aborted) "800 e-mail(s) were not examined"))))
+
+(deftest folder-parse-summary-message-explains-the-skips
+  (let [message (server/folder-parse-summary-message {:folder "Old" :processed 100 :skipped 71 :skipped-elsewhere 12 :errors 0 :remaining 4344 :batch-size 100 :batch-id "b"})]
+    (is (str/includes? (:content message) "71 already stored e-mail(s) skipped (59 saved by earlier runs of this folder and still waiting to be moved, 12 duplicate(s) of e-mails stored from other folders)"))))
+
+(deftest move-summary-message-names-what-was-moved
+  (let [message (server/move-summary-message "the folder Old" {:moved 90 :total 95 :not-found 5 :failed 0 :uncategorized 3})]
+    (is (= :info (:type message)))
+    (is (str/includes? (:content message) "Moved 90 of 95 categorized e-mail(s) of the folder Old"))
+    (is (str/includes? (:content message) "5 were not found"))))

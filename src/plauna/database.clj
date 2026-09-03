@@ -375,6 +375,41 @@
                                                          :from   :metadata
                                                          :where  [:= :message-id message-id]}) builder-function)))
 
+(defn email-location
+  "Where a stored e-mail is known to live: {:folder ... :connection-id ...}, or nil when unknown."
+  [message-id]
+  (let [row (jdbc/execute-one! (ds) (honey/format {:select [:folder :connection-id]
+                                                   :from   :metadata
+                                                   :where  [:= :message-id message-id]}) builder-function-kebab)]
+    (when row {:folder (:folder row) :connection-id (:connection-id row)})))
+
+(defn categorized-message-ids-in-folder
+  "The Message-IDs of stored, categorized e-mails whose recorded location is the folder of the connection."
+  [connection-id folder]
+  (mapv :message-id
+        (jdbc/execute! (ds) (honey/format {:select [:metadata.message-id]
+                                           :from [:metadata]
+                                           :join [:headers [:= :headers.message-id :metadata.message-id]]
+                                           :where [:and [:= :metadata.connection-id connection-id]
+                                                   [:= :metadata.folder folder]
+                                                   [:<> :metadata.category nil]]
+                                           :order-by [[:headers.date :desc]]})
+                       builder-function-kebab)))
+
+(defn folder-email-counts
+  "Per recorded folder of a connection: how many stored e-mails are categorized and how many are not.
+   [{:folder ... :categorized n :uncategorized m} ...]"
+  [connection-id]
+  (mapv (fn [row] {:folder (:folder row) :categorized (long (or (:categorized row) 0)) :uncategorized (long (or (:uncategorized row) 0))})
+        (jdbc/execute! (ds) (honey/format {:select [:folder
+                                                    [[:sum [:case [:<> :category nil] [:inline 1] :else [:inline 0]]] :categorized]
+                                                    [[:sum [:case [:= :category nil] [:inline 1] :else [:inline 0]]] :uncategorized]]
+                                           :from [:metadata]
+                                           :where [:and [:= :connection-id connection-id] [:<> :folder nil]]
+                                           :group-by [:folder]
+                                           :order-by [[:folder :asc]]})
+                       builder-function-kebab)))
+
 (defn email-folder
   "Return the recorded IMAP folder for a message, or nil if none was recorded."
   [message-id]
@@ -401,10 +436,11 @@
 
 (defn finish-parse-batch!
   "Store the final counts of a run and mark it finished."
-  [id {:keys [processed skipped errors remaining]}]
+  [id {:keys [processed skipped skipped-elsewhere errors remaining]}]
   (jdbc/execute! (ds) (honey/format {:update :parse-batches
                                      :set {:status "finished" :finished-at (epoch-seconds)
                                            :processed (or processed 0) :skipped (or skipped 0)
+                                           :skipped-elsewhere (or skipped-elsewhere 0)
                                            :errors (or errors 0) :remaining (or remaining 0)}
                                      :where [:= :id id]})))
 
@@ -989,6 +1025,8 @@
   (resolve-parse-failures [_ connection-id folder uid message-id] (resolve-parse-failures! connection-id folder uid message-id))
   (parse-failure-keys [_ connection-id folder] (parse-failure-keys connection-id folder))
   (fetch-parse-batch-message-ids [_ batch-id] (parse-batch-message-ids batch-id))
+  (fetch-email-location [_ message-id] (email-location message-id))
+  (fetch-categorized-message-ids-in-folder [_ connection-id folder] (categorized-message-ids-in-folder connection-id folder))
   (fetch-parse-batch [_ id] (parse-batch id))
   (save-email [_ email]
     ;; One transaction per email, and failures propagate: a partially-saved email whose header

@@ -63,7 +63,9 @@ Tester\r
 ;; Wrong data tests
 
 (deftest wrong-data-1
-    ;; The mbox contains more than 3 e-mails. The expectation is that only the ones with proper message-id will get through.
+  ;; The mbox holds 16 messages, most of them patch mails WITHOUT a Message-ID header but with From,
+  ;; Date and Subject. Those used to be dropped; they now get a stable synthetic id and get through.
+  ;; Only fragments with none of the identifying headers are still dropped.
   (let [inner-chan (chan 20)
         test-chan (pub inner-chan :type)]
     (parser/parser-event-loop test-chan inner-chan)
@@ -72,6 +74,22 @@ Tester\r
       (sub test-chan :parsed-enrichable-email results-chan)
       (loop [event (async-utils/fetch-or-timeout!! results-chan 200) results []]
         (if (or (nil? event) (= :timed-out event))
-          (is (= 3 (count results)))
+          (let [message-ids (map #(get-in % [:payload :header :message-id]) results)]
+            (is (> (count results) 3) "Messages without a Message-ID header are kept")
+            (is (every? #(not (clojure.string/blank? %)) message-ids) "Every kept message has an id")
+            (is (some core-email/synthetic-message-id? message-ids) "Most of them carry a synthetic id")
+            (is (some #(= "<u5tacjjdpxq.fsf@lysator.liu.se>" %) message-ids) "Real Message-IDs are kept as they are"))
           (recur (async-utils/fetch-or-timeout!! results-chan 200) (conj results event)))))))
 
+
+(deftest mbox-message-without-message-id-gets-a-synthetic-one
+  (let [raw (str "From: shop@example.com\r\nTo: me@example.com\r\nSubject: Invoice\r\nDate: Tue, 2 Sep 2026 10:00:00 +0200\r\nContent-Type: text/plain\r\n\r\nbody\r\n")
+        email (parser/parse-email (java.io.ByteArrayInputStream. (.getBytes raw "UTF-8")))]
+    (is (= (core-email/synthetic-message-id 1788336000 "shop@example.com" "Invoice") (-> email :header :message-id)))
+    (is (every? #(= (-> email :header :message-id) (:message-id %)) (:participants email)) "Participants carry the same id")
+    (is (every? #(= (-> email :header :message-id) (:message-id %)) (:body email)) "Body parts carry the same id")))
+
+(deftest a-fragment-without-any-identifying-header-is-still-dropped
+  (let [email (parser/parse-email (java.io.ByteArrayInputStream. (.getBytes "Content-Type: text/plain\r\n\r\njust text\r\n" "UTF-8")))]
+    (is (nil? (-> email :header :message-id)))
+    (is (false? (parser/with-message-id? email)))))

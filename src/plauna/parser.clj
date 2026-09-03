@@ -34,11 +34,21 @@
         :else (do (t/log! :error ["Wrong type of mailbox for participants" (class mailbox)])
                   {:name "n/a" :address "n/a" :contact-key nil :message-id message-id :type type})))
 
-(defn message-id [^Message message]
+(defn message-id
+  "The Message-ID of a parsed mbox message, or a stable synthetic one when the header is missing. A
+   fragment without Message-ID, Date, From and Subject is not a message: it gets nil and is dropped
+   (see with-message-id?)."
+  [^Message message]
   (let [message-id (.getMessageId message)]
-    (if (some? message-id)
+    (if (not (st/blank? message-id))
       (st/trim message-id)
-      "")))
+      (let [date (.getDate message)
+            from (first (.getFrom message))
+            subject (.getSubject message)]
+        (when (or date from (not (st/blank? subject)))
+          (core-email/synthetic-message-id (when date (quot (.getTime date) 1000))
+                                           (when from (.getAddress ^Mailbox from))
+                                           subject))))))
 
 (defn detect-utf8
   "Some emails have the charset uft-8 in quotation marks or escaped like \\UTF-8

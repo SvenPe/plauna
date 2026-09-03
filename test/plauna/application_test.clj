@@ -458,7 +458,7 @@
       (is (= ["id-10" "id-9" "id-8"] @saved))
       (is (= [["id-10" ":test-folder"] ["id-9" ":test-folder"] ["id-8" ":test-folder"]] @recorded-folders)
           "Without move, the e-mails stay in their folder and that folder is recorded")
-      (is (= {:folder "Old" :message-count 10 :batch-size 3 :processed 3 :skipped 0 :errors 0 :examined 3 :remaining 7}
+      (is (= {:folder "Old" :message-count 10 :batch-size 3 :processed 3 :skipped 0 :skipped-elsewhere 0 :errors 0 :examined 3 :remaining 7}
              result))))
   "With :batch-size N the parse stops after N newly saved e-mails and reports how many were left unexamined.")
 
@@ -559,7 +559,7 @@
                  (open-folder-for-bulk-read [_ _ _] {:message-count 0 :connection-id "c" :folder :f})
                  (close-folder-for-bulk-read [_ _] nil))]
     (is (= 0 (app/read-emails-from-folder {} "Empty" {:batch-size 100 :on-complete #(deliver summary %)} {:client client})))
-    (is (= {:folder "Empty" :message-count 0 :batch-size 100 :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0}
+    (is (= {:folder "Empty" :message-count 0 :batch-size 100 :processed 0 :skipped 0 :skipped-elsewhere 0 :errors 0 :examined 0 :remaining 0}
            (await-summary summary)))))
 
 (deftest fetch-emails-applies-date-filter
@@ -1133,3 +1133,32 @@
         result (app/move-email-to-category email "new" {:client client})]
     (is (= :ok (:result result)))
     (is (= ["a" "b"] @tried) "The recorded account is tried first, the other one afterwards")))
+
+(deftest skipped-emails-are-classified-by-where-they-were-stored-from
+  (let [summary (promise)
+        client (reify int/EmailClient
+                 (open-folder-for-bulk-read [_ _ _] {:message-count 3 :connection-id "conn-1" :folder :f})
+                 (close-folder-for-bulk-read [_ _] nil)
+                 (nth-message-id-from-folder [_ n _] (str "id-" n)))
+        db (reify int/DB
+             (email-exists? [_ _] true)
+             (fetch-email-location [_ message-id] (case message-id
+                                                    "id-3" {:folder "Old" :connection-id "conn-1"}
+                                                    "id-2" {:folder "INBOX" :connection-id "conn-1"}
+                                                    nil)))]
+    (app/read-emails-from-folder {} "Old" {:on-complete #(deliver summary %)} {:client client :db db})
+    (let [result (await-summary summary)]
+      (is (= 3 (:skipped result)))
+      (is (= 2 (:skipped-elsewhere result)) "Stored from another folder, or from an unknown place, counts as elsewhere")
+      (is (= 0 (:processed result))))))
+
+(deftest move-folder-emails-uses-the-recorded-folder-membership
+  (let [asked (atom nil)
+        db (reify int/DB
+             (fetch-categorized-message-ids-in-folder [_ connection-id folder] (reset! asked [connection-id folder]) ["m-1"])
+             (fetch-emails [_ _ _] [{:header {:message-id "m-1"} :metadata {:category "news"}}]))
+        client (reify int/EmailClient
+                 (move-emails-by-id [_ _ moves] (mapv (constantly true) moves)))
+        summary (app/move-folder-emails! {:db db :client client} "conn-1" "Newsletter_Alt" (fn [_] nil))]
+    (is (= ["conn-1" "Newsletter_Alt"] @asked))
+    (is (= {:folder "Newsletter_Alt" :total 1 :uncategorized 0 :moved 1 :not-found 0 :failed 0} summary))))

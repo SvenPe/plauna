@@ -866,7 +866,7 @@
   "Turn the summary of a finished folder parse into a toast for the next page load. The remaining count
    tells the user whether another run of the same batch is needed; the link opens the e-mails this run
    saved so their detected categories can be checked right away."
-  [{:keys [folder processed skipped errors remaining batch-size batch-id aborted]}]
+  [{:keys [folder processed skipped skipped-elsewhere errors remaining batch-size batch-id aborted]}]
   (let [remaining-text (cond
                          (some? aborted) (str " The run was " aborted ". " remaining " e-mail(s) were not examined - check the connection and run the parse again.")
                          (pos? remaining) (str " " remaining " older e-mail(s) were not examined because the batch of " batch-size " was full - run the parse again to continue.")
@@ -875,6 +875,9 @@
     (cond-> {:type (if (or (pos? errors) (some? aborted)) :info :success)
              :content (str "Finished parsing " folder ": " processed " new e-mail(s) saved and categorized, "
                            skipped " already stored e-mail(s) skipped"
+                           (when (pos? skipped)
+                             (str " (" (- skipped (or skipped-elsewhere 0)) " saved by earlier runs of this folder and still waiting to be moved, "
+                                  (or skipped-elsewhere 0) " duplicate(s) of e-mails stored from other folders)"))
                            (when (pos? errors) (str ", " errors " could not be read (see the logs)"))
                            "." remaining-text)}
       (and (some? batch-id) (pos? processed)) (assoc :link (batch-emails-url batch-id)
@@ -914,39 +917,80 @@
 
 (defn batch-move-url [batch-id] (str "/parse-batches/" batch-id "/move"))
 
-(defn batch-move-summary-message
-  "Toast for a finished 'move batch to category folders' job."
-  [{:keys [folder moved total not-found failed uncategorized]}]
+(defn move-summary-message
+  "Toast for a finished 'move to category folders' job over a set of e-mails described by what-text
+   (e.g. \"the Old batch\" or \"the folder Newsletter_Alt\")."
+  [what-text {:keys [moved total not-found failed uncategorized]}]
   {:type (if (pos? (+ not-found failed)) :info :success)
-   :content (str "Moved " moved " of " total " categorized e-mail(s) of the " folder " batch into their category folders."
+   :content (str "Moved " moved " of " total " categorized e-mail(s) of " what-text " into their category folders."
                  (when (pos? not-found) (str " " not-found " were not found on the server."))
                  (when (pos? failed) (str " " failed " could not be moved (see the logs)."))
                  (when (pos? uncategorized) (str " " uncategorized " e-mail(s) without a category were left in place.")))})
 
-(defn start-batch-move!
-  "Move the categorized e-mails of a parse batch into their category folders on a background thread,
-   publishing progress in batch-moves and a toast on completion. Returns false when a move for the
-   batch is already running."
-  [context {:keys [id folder connection-id]}]
+(defn batch-move-summary-message
+  "Toast for a finished 'move batch to category folders' job."
+  [{:keys [folder] :as summary}]
+  (move-summary-message (str "the " folder " batch") summary))
+
+(defn- start-move-job!
+  "Run move-fn (context progress-fn -> summary) on a background thread under job-key in batch-moves,
+   publishing progress and a toast on completion. Returns false when that job is already running."
+  [context job-key what-text move-fn]
   (let [[before _] (swap-vals! batch-moves
                                (fn [moves]
-                                 (if (= "running" (get-in moves [id :status]))
+                                 (if (= "running" (get-in moves [job-key :status]))
                                    moves
-                                   (assoc moves id {:status "running" :moved 0 :total 0 :not-found 0 :failed 0}))))]
-    (if (= "running" (get-in before [id :status]))
+                                   (assoc moves job-key {:status "running" :moved 0 :total 0 :not-found 0 :failed 0}))))]
+    (if (= "running" (get-in before [job-key :status]))
       false
       (do (async/thread
             (let [summary (try
-                            (app/move-parse-batch-emails! context id connection-id
-                                                          (fn [progress] (swap! batch-moves update id merge progress)))
+                            (move-fn context (fn [progress] (swap! batch-moves update job-key merge progress)))
                             (catch Throwable e
-                              (t/log! {:level :error :error e} ["Moving parse batch" id "failed"])
+                              (t/log! {:level :error :error e} ["Moving" what-text "failed"])
                               {:total 0 :moved 0 :not-found 0 :failed 0 :uncategorized 0 :error true}))]
-              (swap! batch-moves update id merge summary {:status "finished"})
+              (swap! batch-moves update job-key merge summary {:status "finished"})
               (add-to-messages (if (:error summary)
-                                 {:type :alert :content (str "Moving the " folder " batch failed. Please see the logs.")}
-                                 (batch-move-summary-message (assoc summary :folder folder))))))
+                                 {:type :alert :content (str "Moving " what-text " failed. Please see the logs.")}
+                                 (move-summary-message what-text summary)))))
           true))))
+
+(defn start-batch-move!
+  "Move the categorized e-mails of a parse batch into their category folders on a background thread.
+   Returns false when a move for the batch is already running."
+  [context {:keys [id folder connection-id]}]
+  (start-move-job! context id (str "the " folder " batch")
+                   (fn [context progress-fn] (app/move-parse-batch-emails! context id connection-id progress-fn))))
+
+(defn folder-move-key [connection-id folder] (str "folder:" connection-id ":" folder))
+
+(defn start-folder-move!
+  "Move every stored, categorized e-mail still recorded in the folder into its category folder,
+   whichever run stored it. Returns false when that move is already running."
+  [context connection-id folder]
+  (start-move-job! context (folder-move-key connection-id folder) (str "the folder " folder)
+                   (fn [context progress-fn] (app/move-folder-emails! context connection-id folder progress-fn))))
+
+(defn- category-destination-folders
+  "The folders categorized e-mails are moved INTO; e-mails recorded there are already where they belong."
+  []
+  (into #{} (keep :destination_folder) (db/get-categories)))
+
+(defn connection-folder-emails
+  "Per recorded folder of a connection: how many stored e-mails are categorized (movable) and how many
+   are not, with the state of a running or finished folder move. Category destination folders and the
+   default 'Categories/...' tree are left out - their e-mails are already in place."
+  [id]
+  (let [destinations (category-destination-folders)
+        moves @batch-moves]
+    {:folder-emails (->> (db/folder-email-counts id)
+                         (remove (fn [{:keys [folder]}]
+                                   (or (contains? destinations folder)
+                                       (re-matches #"(?i)categories[./\\].*" (str folder)))))
+                         (mapv (fn [{:keys [folder] :as counts}]
+                                 (assoc counts
+                                        :move-url (str "/admin/connections/" id "/folders/move")
+                                        :move (get moves (folder-move-key id folder))))))}))
 
 (defn retry-summary-message
   "Toast for a finished retry of previously failed messages, with a review link when something was saved."
@@ -995,7 +1039,10 @@
                                          :move (get moves (:id batch))))
                       (db/parse-batches-for-connection id 10))]
     {:parse-batches batches
-     :parse-running? (boolean (some #(or (= "running" (:status %)) (= "running" (get-in % [:move :status]))) batches))}))
+     :parse-running? (boolean (or (some #(or (= "running" (:status %)) (= "running" (get-in % [:move :status]))) batches)
+                                  (some (fn [[job-key state]]
+                                          (and (= "running" (:status state)) (st/starts-with? (str job-key) (str "folder:" id ":"))))
+                                        moves)))}))
 
 (defn connection-activity
   "Whether a folder parse, retry or batch move of the connection is running: the connection page polls
@@ -1379,6 +1426,23 @@
                      (some? batch-id) (assoc :batch-move-url (batch-move-url batch-id)))]
        (success-html-with-body (result-with-messages (markup/list-emails (:data result) (:parameters result) options) global-messages))))
 
+   (comp/POST "/admin/connections/:id/folders/move" request
+     (let [id (:id (:route-params request))
+           folder (:folder (:params request))
+           conn (client/connection-data-from-id id)]
+       (cond
+         (or (nil? conn) (not (client/connected? conn)))
+         (redirect-request request {:type :alert :content "The connection is not active. Connect first, then move."})
+
+         (st/blank? folder)
+         (redirect-request request {:type :alert :content "No folder given."})
+
+         (not (start-folder-move! context id folder))
+         (redirect-request request {:type :info :content (str "The e-mails of " folder " are already being moved.")})
+
+         :else
+         (redirect-request request {:type :success :content (str "Moving the categorized e-mails of " folder " into their category folders in the background.")}))))
+
    (comp/POST "/parse-batches/:id/move" request
      (let [batch-id (:id (:route-params request))
            batch (db/parse-batch batch-id)]
@@ -1481,7 +1545,7 @@
        (redirect-request request)))
 
    (comp/GET "/admin/connections/:id" [id]
-     (let [conn-info (merge (connection-information id) (connection-parse-batches id) (connection-parse-failures id))
+     (let [conn-info (merge (connection-information id) (connection-parse-batches id) (connection-parse-failures id) (connection-folder-emails id))
            providers (without-provider-secrets (db/get-auth-providers))
            categories (db/get-categories)]
        (if (seq @global-messages)

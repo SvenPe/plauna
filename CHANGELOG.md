@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- Messages without a Message-ID header could not be stored ("Column 'message_id' cannot be null").
+  They now get a stable substitute id derived from date, sender and subject, identical for IMAP and
+  mbox, so they are saved once and recognised as stored afterwards.
+
 - A language whose categorized e-mails all belong to one category no longer aborts the whole training
   run with "Training data must contain more than one outcome". The language is skipped and named in
   the result, the other languages are trained, and a failing language is reported the same way.
@@ -52,6 +56,12 @@ All notable changes to this project will be documented in this file.
   and repeated failures of a message whose UID cannot be read are still deduplicated (by sequence
   number). Folder parses prefetch message envelopes in blocks of 100, cutting the per-message round
   trips when re-scanning a mostly known folder.
+- Move all categorized e-mails still recorded in a folder into their category folders at once, across
+  every parse run: the connection page lists each source folder with its stored e-mails with and
+  without a category and offers "Move N to category folders".
+- Parse runs distinguish why an e-mail was skipped: saved by an earlier run of the same folder (still
+  waiting to be moved) or a duplicate of an e-mail stored from another folder ("elsewhere"). Both the
+  run's message and the run table show the breakdown.
 - Move a parse batch to its category folders afterwards: a run parsed without "Move e-mails after
   categorization" offers "Move to category folders" on the connection page and on the batch's e-mail
   list. The categorized e-mails of the batch are moved in the background over a single IMAP

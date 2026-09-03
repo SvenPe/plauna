@@ -256,3 +256,26 @@
   (is (= {:uids #{} :message-ids #{}} (db/parse-failure-keys "conn-nu" "INBOX")))
   (db/record-parse-failure! {:connection-id "conn-nu" :folder "INBOX" :uid 900 :message-number 44 :message-id "<k@x>" :subject nil :error "e"})
   (is (= {:uids #{900} :message-ids #{"<k@x>"}} (db/parse-failure-keys "conn-nu" "INBOX"))))
+
+(deftest folder-email-counts-and-categorized-ids-follow-the-recorded-location
+  (let [cat (ensure-category "loc-cat")]
+    (db/save-headers [{:mime-type "text/plain" :subject "a" :message-id "loc-1" :date 3 :in-reply-to nil}
+                      {:mime-type "text/plain" :subject "b" :message-id "loc-2" :date 2 :in-reply-to nil}
+                      {:mime-type "text/plain" :subject "c" :message-id "loc-3" :date 1 :in-reply-to nil}])
+    (db/update-metadata-batch [{:message-id "loc-1" :language "eng" :language-confidence 0.9 :category-id cat :category-confidence 0.9 :connection-id "conn-loc"}
+                               {:message-id "loc-2" :language "eng" :language-confidence 0.9 :category-id nil :category-confidence 0 :connection-id "conn-loc"}
+                               {:message-id "loc-3" :language "eng" :language-confidence 0.9 :category-id cat :category-confidence 0.9 :connection-id "conn-loc"}])
+    (db/update-email-folder "loc-1" "Old")
+    (db/update-email-folder "loc-2" "Old")
+    (db/update-email-folder "loc-3" "Archive")
+    (is (= {:folder "Old" :connection-id "conn-loc"} (db/email-location "loc-1")))
+    (is (nil? (db/email-location "no-such")))
+    (is (= [{:folder "Archive" :categorized 1 :uncategorized 0} {:folder "Old" :categorized 1 :uncategorized 1}]
+           (db/folder-email-counts "conn-loc")))
+    (is (= ["loc-1"] (db/categorized-message-ids-in-folder "conn-loc" "Old")))
+    (is (= [] (db/categorized-message-ids-in-folder "other" "Old")))))
+
+(deftest finish-parse-batch-stores-the-skip-breakdown
+  (db/create-parse-batch! {:id "batch-skip" :connection-id "conn-s" :folder "Old" :batch-size 100})
+  (db/finish-parse-batch! "batch-skip" {:processed 1 :skipped 10 :skipped-elsewhere 4 :errors 0 :remaining 0})
+  (is (= [10 4] ((juxt :skipped :skipped-elsewhere) (db/parse-batch "batch-skip")))))

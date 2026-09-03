@@ -635,9 +635,13 @@
     (try
       (let [known-message-id (int/nth-message-id-from-folder client n folder)]
         (if (and (some? known-message-id) (int/email-exists? db known-message-id))
-          (do (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping"])
-              (resolve-parse-failures-safely! db connection-id folder-name nil known-message-id (:known-failures options))
-              :skipped)
+          (let [location (try (int/fetch-email-location db known-message-id) (catch Throwable _ nil))
+                ;; Stored from THIS folder by an earlier run (still here until moved), or a duplicate of an
+                ;; e-mail that was stored from another folder or account.
+                outcome (if (= folder-name (:folder location)) :skipped-here :skipped-elsewhere)]
+            (t/log! :debug ["Email number" n "(" known-message-id ") already in database — skipping (" (name outcome) ")"])
+            (resolve-parse-failures-safely! db connection-id folder-name nil known-message-id (:known-failures options))
+            outcome)
           (let [email-message (int/nth-email-from-folder client n folder)
                 {:keys [status]} (incoming-email-workflow email-message connection-id folder options context)]
             (finish-processed-email! db email-message status connection-id folder-name nil options))))
@@ -715,16 +719,15 @@
    (999 on older builds), large enough to keep the round trips few."
   200)
 
-(defn move-parse-batch-emails!
-  "Move every e-mail of a parse batch that has a category into that category's IMAP folder: the fix for
-   a batch that was parsed with 'move' unchecked. E-mails without a category stay where they are.
-   Works in chunks over ONE dedicated IMAP connection (see int/move-emails-by-id). progress-fn is
-   called with the running summary after every chunk; the final summary
-   {:batch-id :total :uncategorized :moved :not-found :failed} is returned."
-  [{:keys [db client] :as context} batch-id connection-id progress-fn]
-  (let [message-ids (int/fetch-parse-batch-message-ids db batch-id)
-        chunks (partition-all batch-move-chunk-size message-ids)
-        summary (atom {:batch-id batch-id :total 0 :uncategorized 0 :moved 0 :not-found 0 :failed 0})]
+(defn move-emails-to-category-folders!
+  "Move every listed stored e-mail that has a category into that category's IMAP folder on the given
+   connection. E-mails without a category stay where they are. Works in chunks over ONE dedicated IMAP
+   connection (see int/move-emails-by-id). progress-fn is called with the running summary after every
+   chunk; the final summary {:total :uncategorized :moved :not-found :failed} (merged into
+   base-summary) is returned."
+  [{:keys [db client]} connection-id message-ids base-summary progress-fn]
+  (let [chunks (partition-all batch-move-chunk-size message-ids)
+        summary (atom (merge {:total 0 :uncategorized 0 :moved 0 :not-found 0 :failed 0} base-summary))]
     (doseq [chunk chunks
             :let [emails (int/fetch-emails db {:entity :enriched-email :strict true :with-bodies false}
                                            {:where [:in :headers.message-id (vec chunk)]})
@@ -733,7 +736,7 @@
                   results (if (seq moves)
                             (try (int/move-emails-by-id client connection-id moves)
                                  (catch Exception e
-                                   (t/log! {:level :error :error e} ["Moving a chunk of batch" batch-id "failed"])
+                                   (t/log! {:level :error :error e} ["Moving a chunk of e-mails on connection" connection-id "failed"])
                                    (repeat (count moves) false)))
                             [])]]
       (swap! summary (fn [current]
@@ -748,9 +751,23 @@
       (progress-fn @summary))
     @summary))
 
+(defn move-parse-batch-emails!
+  "Move the categorized e-mails of one parse batch into their category folders: the fix for a batch
+   that was parsed with 'move' unchecked."
+  [{:keys [db] :as context} batch-id connection-id progress-fn]
+  (move-emails-to-category-folders! context connection-id (int/fetch-parse-batch-message-ids db batch-id)
+                                    {:batch-id batch-id} progress-fn))
+
+(defn move-folder-emails!
+  "Move every stored, categorized e-mail whose recorded location is the given folder into its category
+   folder - regardless of which parse run (or the live monitor) stored it."
+  [{:keys [db] :as context} connection-id folder progress-fn]
+  (move-emails-to-category-folders! context connection-id (int/fetch-categorized-message-ids-in-folder db connection-id folder)
+                                    {:folder folder} progress-fn))
+
 (defn- empty-folder-summary [folder-name message-count batch-size]
   {:folder folder-name :message-count message-count :batch-size batch-size
-   :processed 0 :skipped 0 :errors 0 :examined 0 :remaining 0})
+   :processed 0 :skipped 0 :skipped-elsewhere 0 :errors 0 :examined 0 :remaining 0})
 
 (def ^:private prefetch-chunk-size
   "Sequence numbers whose envelopes are fetched with one IMAP command before they are examined."
@@ -796,11 +813,14 @@
                              (prefetch-identities-safely! client folder chunk)
                              (set chunk)))
               outcome (process-nth-email-from-folder client n folder-name folder options context bulk)
-              counter (case outcome :processed :processed :skipped :skipped :errors)]
+              counter (case outcome :processed :processed (:skipped :skipped-here :skipped-elsewhere) :skipped :errors)]
           (recur (rest remaining-numbers)
                  prefetched
                  (if (= :errors counter) (inc consecutive-errors) 0)
-                 (-> summary (update counter inc) (update :examined inc))))))))
+                 (-> summary
+                     (update counter inc)
+                     (update :examined inc)
+                     (cond-> (= :skipped-elsewhere outcome) (update :skipped-elsewhere inc)))))))))
 
 (defn read-emails-from-folder
   "Read emails from a folder and process them. Returns the number of messages in the folder.
@@ -819,8 +839,9 @@
    - :batch-id, an identifier under which every NEWLY saved e-mail is recorded (int/record-parse-batch-email)
      so the run can be reviewed afterwards as a filtered e-mail list.
    - :on-complete, a function called with a summary map once the background thread has finished:
-     {:folder :message-count :batch-size :processed :skipped :errors :examined :remaining} where
-     :remaining is the number of (older) messages that were not examined because the batch was full."
+     {:folder :message-count :batch-size :processed :skipped :skipped-elsewhere :errors :examined :remaining}
+     where :remaining is the number of (older) messages that were not examined because the batch was
+     full and :skipped-elsewhere the part of :skipped that was stored from another folder (duplicates)."
   [connection-data folder-name options {:keys [client db] :as context}]
   (let [bulk (int/open-folder-for-bulk-read client connection-data folder-name)
         folder (:folder bulk)
