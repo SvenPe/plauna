@@ -99,7 +99,8 @@
   (let [fingerprint (apply str (repeat 32 "ab"))
         html (markup/login-page {:login-name "root" :mtls-candidate {:fingerprint fingerprint}})]
     (is (str/includes? html "name=\"login-name\""))
-    (is (str/includes? html "value=\"root\""))
+    (is (not (str/includes? html "value=\"root\""))
+        "The configured login name is one of the two secrets asked for and is never pre-filled for anonymous visitors")
     (is (str/includes? html "autocomplete=\"username\""))
     (is (str/includes? html "name=\"password\""))
     (is (not (str/includes? html "add-mtls-certificate")))
@@ -263,3 +264,10 @@
       (is (str/includes? html "E-mails Still in Their Original Folders"))
       (is (str/includes? html "Move 640 to category folders"))
       (is (= 1 (count (re-seq #"to category folders</button>" html))) "A folder without categorized e-mails has no move button"))))
+
+(deftest statistics-merge-values-that-share-a-label
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [html (markup/statistics-overall [] [] [{:language nil :count 2} {:language "n/a" :count 3} {:language "eng" :count 1}] [])]
+      (is (= 1 (count (re-seq #"Not detected" html))) "NULL and n/a languages become one bar")
+      (is (str/includes? html "\"count\":5"))))
+  "A chart never shows the same label twice")

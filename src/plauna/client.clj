@@ -11,17 +11,15 @@
    [clojure.core.async :as async])
   (:import
    (plauna.core.email Header Body-Part Participant Email)
-   (clojure.lang PersistentVector)
    (jakarta.mail Store Session Folder BodyPart Multipart Message Message$RecipientType Flags$Flag AuthenticationFailedException MessagingException FetchProfile FetchProfile$Item)
-   (jakarta.mail.internet InternetAddress MailDateFormat MimeMessage MimeUtility)
+   (jakarta.mail.internet InternetAddress MailDateFormat MimeMessage MimePart MimeUtility)
    (org.eclipse.angus.mail.imap IMAPFolder IMAPMessage)
    (jakarta.mail.event ConnectionAdapter ConnectionEvent MessageCountAdapter MessageCountEvent MessageCountListener)
    (jakarta.mail.search MessageIDTerm)
    (java.lang AutoCloseable)
    (java.util Properties UUID)
-   (java.util.concurrent Executors)
    (org.eclipse.angus.mail.imap IdleManager IMAPStore)
-   (java.util.concurrent Executors TimeUnit ScheduledExecutorService ScheduledFuture)))
+   (java.util.concurrent Executors ExecutorService TimeUnit ScheduledExecutorService ScheduledFuture ThreadFactory)))
 
 (set! *warn-on-reflection* true)
 
@@ -64,11 +62,23 @@
 
 (defn check-ssl-certs? [connection-config] (get connection-config :check-ssl-certs true))
 
+(def imap-connect-timeout-millis
+  "Bound on establishing the TCP connection. Without it an unreachable host blocks the caller for the
+   operating system's default (minutes) - on the health-check pool or a request thread."
+  "15000")
+
+(def imap-read-timeout-millis
+  "Bound on a single socket read. IDLE is not affected (the IdleManager waits on a selector), but every
+   command and every body fetch is: five seconds was too little for large messages on slow links and
+   turned a slow server into a 'lost' connection."
+  "30000")
+
 (defn default-imap-properties ^Properties [connection-config]
   (doto (new Properties)
     (.setProperty "mail.imap.port" (port connection-config))
     (.setProperty "mail.imap.usesocketchannels" "true")
-    (.setProperty "mail.imap.timeout" "5000")
+    (.setProperty "mail.imap.connectiontimeout" imap-connect-timeout-millis)
+    (.setProperty "mail.imap.timeout" imap-read-timeout-millis)
     (.setProperty "mail.imap.partialfetch" "false")
     (.setProperty "mail.imap.fetchsize" "1048576")))
 
@@ -82,7 +92,11 @@
   (let [security-key (security connection-config)]
     (fn [^Properties properties]
       (cond (= security-key "ssl") (doto properties (.setProperty "mail.imap.ssl.enable" "true"))
-            (= security-key "starttls") (doto properties (.setProperty "mail.imap.starttls.enable" "true"))
+            ;; starttls.required: without it the library silently continues in plaintext (sending the
+            ;; password) when the server does not offer STARTTLS.
+            (= security-key "starttls") (doto properties
+                                          (.setProperty "mail.imap.starttls.enable" "true")
+                                          (.setProperty "mail.imap.starttls.required" "true"))
             (= security-key "plain") properties
             :else (doto properties (.setProperty "mail.imap.ssl.enable" "true"))))))
 
@@ -156,9 +170,11 @@
 (defn swap-new-period-check [identifier future]
   ;; Cancel any health check already scheduled for this connection before replacing it; otherwise a
   ;; reconnect orphans the previous ScheduledFuture, which keeps running forever on the shared executor.
-  (when-let [^ScheduledFuture existing (get @health-checks identifier)]
-    (.cancel existing true))
-  (swap! health-checks assoc identifier future))
+  ;; swap-vals! makes the replacement atomic, so two concurrent schedulers cannot both keep their future.
+  (let [[before _] (swap-vals! health-checks assoc identifier future)]
+    (when-let [^ScheduledFuture existing (get before identifier)]
+      (when-not (identical? existing future)
+        (.cancel existing true)))))
 
 ;; Primitives
 
@@ -169,24 +185,56 @@
 (defn id-from-config [config]
   (str (UUID/nameUUIDFromBytes (.getBytes ^String (str (hash (clean-config config)))))))
 
+(defn- close-folder-without-expunge!
+  "Close an IMAP folder WITHOUT expunging. Folder.close() with no argument is close(true): it would
+   permanently remove every message the user has flagged \\Deleted in a mail client but not yet
+   expunged - in the monitored INBOX or in a category folder - which is not Plauna's decision to make."
+  [^Folder folder]
+  (when (and (some? folder) (.isOpen folder))
+    (.close folder false)))
+
+(defn- attempt-close-step!
+  "Run one teardown step, logging instead of propagating: closing a connection must run every step
+   even when an earlier one fails (e.g. a folder that became invalid after the store dropped)."
+  [label f]
+  (try (f)
+       (catch Throwable e
+         (t/log! {:level :warn :error e} ["Error while" label "- continuing with the remaining teardown steps."]))))
+
 (defrecord ConnectionData [config ^Store store ^Folder folder ^IdleManager idle-manager capabilities ^MessageCountListener message-count-listener]
   AutoCloseable
   (close [this]
     (t/log! :info "Closing the idle manager, removing from health checks, closing the folder and the store.")
-    (.stop idle-manager)
-    (stop-monitoring this)
+    (attempt-close-step! "stopping the idle manager" #(when idle-manager (.stop idle-manager)))
+    (attempt-close-step! "removing the message listener" #(stop-monitoring this))
     (swap! health-checks dissoc (:id config))
-    (when (.isOpen folder)
-      (.close folder))
-    (.close store)))
+    (attempt-close-step! "closing the monitored folder" #(close-folder-without-expunge! folder))
+    (attempt-close-step! "closing the store" #(when store (.close store)))))
 
 (defn get-connections [] (vals @connections))
 
 (defn connection-data-from-id ^ConnectionData [id]
   (get @connections id))
 
-(defn add-to-connections [^ConnectionData connection-data]
-  (swap! connections conj {(:id (.config connection-data)) connection-data}))
+(declare disconnect)
+
+(declare forget-disconnected-cache!)
+
+(defn add-to-connections
+  "Register connection-data under its id. A different ConnectionData registered before (a second
+   'connect' while the first is still live) is closed first: otherwise its store, idle manager and
+   message listener would keep running unreachable from the UI and every new e-mail would be handled
+   twice."
+  [^ConnectionData connection-data]
+  (let [id (:id (.config connection-data))
+        [before _] (swap-vals! connections assoc id connection-data)
+        previous (get before id)]
+    (when (and (some? previous) (not (identical? previous connection-data)))
+      (t/log! :info ["Replacing the existing connection registration of" id "- closing the previous one."])
+      (try (disconnect previous)
+           (catch Exception e (t/log! {:level :warn :error e} ["Could not close the replaced connection" id]))))
+    (forget-disconnected-cache!)
+    @connections))
 
 ;; Construct email from message
 
@@ -235,26 +283,33 @@
 ;; raw-header fallback below (see envelope-or-raw-headers).
 (defmulti create-body-part (fn [body-part _ _] (type body-part)))
 
+(defn- transfer-encoding
+  "The Content-Transfer-Encoding of a message or part from the BODYSTRUCTURE the server already sent.
+   Reading it through getHeader instead would fetch the part's header block: one extra round trip per
+   part and per message."
+  [^MimePart part]
+  (try (.getEncoding part) (catch Exception _ nil)))
+
 (defmethod create-body-part String [content ^IMAPMessage message message-id]
-  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) content (.getFileName message) (.getDisposition message)))
+  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (transfer-encoding message) content (.getFileName message) (.getDisposition message)))
 
 (defmethod create-body-part BodyPart [^BodyPart bodypart ^IMAPMessage message message-id]
-  (let [content-type (.getContentType bodypart)
-        content (.getContent bodypart)]
-    (if (instance? Multipart content)
-      (create-body-part content message message-id)
-      (new Body-Part message-id (charset content-type) (mime-type content-type) (first (.getHeader bodypart "Content-transfer-encoding"))
-           ;; Only persist textual content (as a String). For attachments (PDFs, images, ...) JavaMail
-           ;; returns the content as an InputStream; storing that bloats the DB and, on MariaDB, fails the
-           ;; insert outright (leaving a header with no body parts). Attachments are intentionally not
-           ;; stored, mirroring the mbox parser.
-           (when (and (text? content-type) (string? content)) content)
-           (.getFileName bodypart) (disposition (.getDisposition bodypart))))))
+  (let [content-type (.getContentType bodypart)]
+    (if (.isMimeType bodypart "multipart/*")
+      (create-body-part (.getContent bodypart) message message-id)
+      ;; Only textual content is persisted (as a String). Attachments (PDFs, images, ...) are never
+      ;; downloaded: getContent would transfer the complete part from the server only for its bytes to
+      ;; be dropped here. Storing them would bloat the DB and, on MariaDB, fail the insert outright.
+      ;; Attachments are intentionally not stored, mirroring the mbox parser.
+      (let [content (when (text? content-type) (.getContent bodypart))]
+        (new Body-Part message-id (charset content-type) (mime-type content-type) (transfer-encoding bodypart)
+             (when (string? content) content)
+             (.getFileName bodypart) (disposition (.getDisposition bodypart)))))))
 
 (defmethod create-body-part :default [_ ^IMAPMessage message message-id]
   ;; A non-multipart message whose body is neither a String nor a recognised part (e.g. a bare
   ;; attachment): keep its metadata but do not store the (binary) content.
-  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (first (.getHeader message "Content-transfer-encoding")) nil (.getFileName message) (.getDisposition message)))
+  (new Body-Part message-id (charset (.getContentType message)) (mime-type (.getContentType message)) (transfer-encoding message) nil (.getFileName message) (.getDisposition message)))
 
 (defmethod create-body-part Multipart [^Multipart multipart ^IMAPMessage message message-id]
   (mapv (fn [i] (create-body-part (.getBodyPart multipart i) message message-id))
@@ -364,11 +419,20 @@
   (try (envelope-message-id message)
        (catch MessagingException _ (:message-id (header-from-raw-headers message)))))
 
+(defn- message-content
+  "What create-body-part should build the body from: the Multipart of a multipart message (built from the
+   BODYSTRUCTURE, no body download), the text of a single text part, or a placeholder for a single
+   binary part whose bytes are never downloaded because only text is stored."
+  [^IMAPMessage message]
+  (cond (.isMimeType message "multipart/*") (.getContent message)
+        (text? (.getContentType message)) (.getContent message)
+        :else ::binary-content))
+
 (defn message->email [^IMAPMessage message]
   (let [[header participants] (envelope-or-raw-headers message)]
     (new Email
          header
-         (realize-body-parts (create-body-part (.getContent message) message (:message-id header)))
+         (realize-body-parts (create-body-part (message-content message) message (:message-id header)))
          participants)))
 
 ;; Calls
@@ -380,28 +444,83 @@
 (defn capabilities [^Store store]
   (filterv some? (mapv #(capability-name store %) ["MOVE"])))
 
+(declare new-idle-manager)
+
+(defn- ensure-idle-manager!
+  "The registered ConnectionData of the connection, with a fresh IdleManager when the current one has
+   stopped running (its selector thread died): .watch would otherwise fail with 'IdleManager is not
+   running' at every health check and new mail would never be delivered again."
+  ^ConnectionData [^ConnectionData connection-data]
+  (when (some? connection-data)
+    (let [^IdleManager current (:idle-manager connection-data)]
+      (if (and (some? current) (.isRunning current))
+        connection-data
+        (let [id (-> connection-data :config :id)
+              ^IdleManager fresh (new-idle-manager (:config connection-data))
+              replacement (assoc connection-data :idle-manager fresh)
+              ;; Only replace the registration that is still current, so a concurrent reconnect is not undone.
+              after (swap! connections (fn [registry] (if (identical? (get registry id) connection-data) (assoc registry id replacement) registry)))]
+          (if (identical? (get after id) replacement)
+            (do (t/log! :warn ["The IDLE manager of connection" id "was not running any more. Started a new one."])
+                replacement)
+            ;; Lost the race against a concurrent reconnect: the manager just created would run
+            ;; unreferenced forever, so stop it and use whatever is registered now.
+            (do (.stop fresh)
+                (get after id))))))))
+
 (defn start-idling-for-id [id]
-  (let [^ConnectionData connection-data (connection-data-from-id id)]
-    (t/log! :debug ["Starting to idle for id:" id "using connection-data" connection-data])
+  (when-let [^ConnectionData connection-data (ensure-idle-manager! (connection-data-from-id id))]
+    (t/log! :debug ["Starting to idle for id:" id])
     (.watch ^IdleManager (.idle-manager connection-data) (.folder connection-data))))
+
+(defn- record-monitor-failure!
+  "Keep a trace of a new message the monitor could not read, so it is listed with the folder's
+   failures and can be retried by UID. Best effort: identification must never fail the caller."
+  [context connection-id ^IMAPFolder folder folder-name ^IMAPMessage message ^Exception error]
+  (try
+    (let [attempt (fn [f] (try (f) (catch Exception _ nil)))]
+      (int/record-parse-failure (:db context)
+                                {:connection-id connection-id
+                                 :folder folder-name
+                                 :uid (attempt #(.getUID folder message))
+                                 :message-number (attempt #(.getMessageNumber message))
+                                 :message-id (attempt #(message-id-of message))
+                                 :subject (attempt #(try (.getSubject message)
+                                                         (catch MessagingException _ (decode-header-text (raw-header message "Subject")))))
+                                 :error (str (.getMessage error))}))
+    (catch Throwable inner
+      (t/log! {:level :warn :error inner} ["Could not record the failure of a new message in" folder-name]))))
 
 (defn message-count-listener [connection-id folder folder-name context]
   (proxy [MessageCountAdapter] []
     (messagesAdded [^MessageCountEvent event]
       (t/log! :debug "Received new message event.")
-      (doseq [message ^IMAPMessage (.getMessages event)]
-        (t/log! :debug ["Processing message:" message])
-        (.setPeek ^IMAPMessage message true)
-        (let [parsed-email (message->email message)
-              process (app/handle-incoming-imap-email parsed-email
-                                                      {:connection-id connection-id :origin-folder folder :message message :move? true}
-                                                      context)]
-          (if (= :error (:result process))
-            (t/log! :error ["An error occured while handling incoming message" (:exception process)])
-            (t/log! :info ["The email with subject" (-> parsed-email :header :subject) "was handled successfully"])))
-        (let [conn-data ^ConnectionData (connection-data-from-id connection-id)]
-          (t/log! :debug ["Idling on the folder" folder-name "while waiting for new messages."])
-          (.watch ^IdleManager (.idle-manager conn-data) (.folder conn-data)))))))
+      (try
+        (doseq [^IMAPMessage message (.getMessages event)]
+          (try
+            (t/log! :debug ["Processing message:" message])
+            (.setPeek message true)
+            (let [parsed-email (message->email message)
+                  process (app/handle-incoming-imap-email parsed-email
+                                                          {:connection-id connection-id :origin-folder folder :message message :move? true}
+                                                          context)]
+              (if (= :error (:result process))
+                (t/log! :error ["An error occured while handling incoming message" (:exception process)])
+                (t/log! :info ["The email with subject" (-> parsed-email :header :subject) "was handled successfully"])))
+            (catch Exception e
+              ;; The mail library's event queue swallows listener exceptions silently. Without this catch
+              ;; one unreadable message would abort the other new messages of the same event.
+              (t/log! {:level :error :error e} ["A new message in" folder-name "could not be read or processed; recording it as a failure and continuing with the next one."])
+              (record-monitor-failure! context connection-id folder folder-name message e))))
+        (finally
+          ;; Re-arm IDLE exactly once, whatever happened above. Otherwise new mail would only be noticed
+          ;; again at the next health check.
+          (try
+            (when-let [conn-data ^ConnectionData (connection-data-from-id connection-id)]
+              (t/log! :debug ["Idling on the folder" folder-name "while waiting for new messages."])
+              (.watch ^IdleManager (.idle-manager conn-data) (.folder conn-data)))
+            (catch Exception e
+              (t/log! {:level :error :error e} ["Could not resume IDLE on" folder-name "- the next health check will retry."]))))))))
 
 (defn open-folder-in-store [^Store store ^String folder-name]
   (let [folder ^IMAPFolder (.getFolder store folder-name)]
@@ -418,10 +537,13 @@
     (t/log! :debug ["Copied" message])
     (.setFlag message Flags$Flag/DELETED true)
     (t/log! :debug ["Set DELETED flag for" message])
-    ;; Expunge ONLY the message we copied. The no-arg expunge would remove every DELETED-flagged
-    ;; message in the folder, including unrelated ones a concurrent operation may have flagged.
-    (.expunge ^IMAPFolder source-folder (into-array Message [message]))
-    (t/log! :debug ["Expunged source folder"])
+    ;; Expunge ONLY the message we copied (UID EXPUNGE, which needs the UIDPLUS extension). The no-arg
+    ;; expunge would remove every DELETED-flagged message in the folder, including unrelated ones the
+    ;; user flagged in a mail client. Without UIDPLUS the copy stays flagged until a client expunges.
+    (if (.hasCapability ^IMAPStore (.getStore source-folder) "UIDPLUS")
+      (do (.expunge ^IMAPFolder source-folder (into-array Message [message]))
+          (t/log! :debug ["Expunged the copied message from the source folder"]))
+      (t/log! :info ["The server supports neither MOVE nor UIDPLUS: the copied message stays in" (.getFullName source-folder) "flagged as deleted until a mail client expunges the folder."]))
     true
     (catch Exception e (t/log! {:level :error :error e} ["There was an error copying and deleting the message" message])
            false)))
@@ -437,34 +559,55 @@
   (let [real-default (if (s/blank? default) "INBOX" default)]
     (if (nil? folder-name) real-default (default-category-folder-name store folder-name))))
 
+(defn- ensure-folder-exists!
+  "Create a target folder the server does not have yet (a custom category destination that was never
+   created). Returns true when the folder exists afterwards."
+  [^IMAPFolder folder]
+  (or (.exists folder)
+      (do (t/log! :info ["Creating the missing IMAP folder" (.getFullName folder)])
+          (.create folder Folder/HOLDS_MESSAGES))))
+
+(defn- move-supported? [^Store store]
+  (.hasCapability ^IMAPStore store "MOVE"))
+
 (defn move-message
-  "Find the proper location for the email and move it there. Returns the name of the folder to which the email was moved."
+  "Find the proper location for the email and move it there. Returns the name of the folder to which
+   the email was moved, or nil when the move did not complete (the message is then still in the
+   source folder). Never throws: the e-mail has already been saved when this runs, and a failed move
+   must not be mistaken for an unreadable message."
   [connection-id ^Message message ^Folder source-folder ^String target-name]
   (let [connection-data (connection-data-from-id connection-id)
         ;; Resolve and open the target folder from the SAME Store as the source folder. moveMessages and
         ;; the copy fallback cannot operate across two different Stores, and during a bulk parse the source
         ;; lives in a dedicated bulk-read Store rather than the monitor's Store.
         store ^Store (.getStore source-folder)
-        capabilities ^PersistentVector (:capabilities connection-data)
-        structured-folder (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))
-        target-folder ^IMAPFolder (.getFolder ^Store store ^String structured-folder)]
-    (cond
-      (= (.getFullName source-folder) structured-folder)
-      (do (t/log! :debug ["Target folder" structured-folder "is the same as the source folder. Leaving the message in place."])
-          structured-folder)
+        structured-folder (inbox-or-category-folder-name store target-name (-> connection-data :config :folder))]
+    (try
+      (let [target-folder ^IMAPFolder (.getFolder ^Store store ^String structured-folder)]
+        (cond
+          (= (.getFullName source-folder) structured-folder)
+          (do (t/log! :debug ["Target folder" structured-folder "is the same as the source folder. Leaving the message in place."])
+              structured-folder)
 
-      (.contains capabilities :move)
-      (do (t/log! :debug ["Moving message from" source-folder "to" target-folder])
-          (.setPeek ^IMAPMessage message true)
-          (.moveMessages ^IMAPFolder source-folder (into-array Message [message]) target-folder)
-          structured-folder)
+          (not (ensure-folder-exists! target-folder))
+          (do (t/log! :warn ["The target folder" structured-folder "does not exist and could not be created. Leaving the message in place."])
+              nil)
 
-      :else
-      (do (t/log! :debug "Server does not support the IMAP MOVE command. Using copy and delete as fallback.")
-          ;; Only report the new folder if the copy+delete actually succeeded, so a failed
-          ;; fallback is never recorded as a completed move.
-          (when (copy-message message source-folder target-folder)
-            structured-folder)))))
+          (move-supported? store)
+          (do (t/log! :debug ["Moving message from" source-folder "to" target-folder])
+              (.setPeek ^IMAPMessage message true)
+              (.moveMessages ^IMAPFolder source-folder (into-array Message [message]) target-folder)
+              structured-folder)
+
+          :else
+          (do (t/log! :debug "Server does not support the IMAP MOVE command. Using copy and delete as fallback.")
+              ;; Only report the new folder if the copy+delete actually succeeded, so a failed
+              ;; fallback is never recorded as a completed move.
+              (when (copy-message message source-folder target-folder)
+                structured-folder))))
+      (catch Exception e
+        (t/log! {:level :warn :error e} ["Moving a message from" (.getFullName source-folder) "to" structured-folder "failed. The message stays where it is."])
+        nil))))
 
 (defn monitor->map [monitor]
   (if (nil? monitor)
@@ -479,47 +622,94 @@
 
 (defn connected? [^ConnectionData connection-data] (.isConnected ^Store (:store connection-data)))
 
-(defn disconnected-connections
-  "Returns configured connections (from DB) that are not currently connected.
-   A connection is disconnected when it has no active ConnectionData or its store reports false."
-  []
+(def disconnected-cache-millis
+  "How long the disconnected-connections result is reused. It is computed for the warning banner of
+   EVERY page, and computing it costs a database query plus one IMAP NOOP per connection
+   (IMAPStore.isConnected pings the server)."
+  5000)
+
+(defonce ^:private disconnected-cache (atom nil))
+
+(defn- compute-disconnected-connections []
   (let [active @connections]
     (filterv (fn [conn]
                (let [cd (get active (:id conn))]
                  (or (nil? cd) (not (connected? cd)))))
              (db/get-connections))))
 
+(defn disconnected-connections
+  "Returns configured connections (from DB) that are not currently connected.
+   A connection is disconnected when it has no active ConnectionData or its store reports false.
+   The result is cached briefly, see disconnected-cache-millis."
+  []
+  (let [now (System/currentTimeMillis)
+        cached @disconnected-cache]
+    (if (and cached (< (- now (:at cached)) disconnected-cache-millis))
+      (:value cached)
+      (let [value (compute-disconnected-connections)]
+        (reset! disconnected-cache {:at now :value value})
+        value))))
+
+(defn forget-disconnected-cache!
+  "Drop the cached banner state, e.g. right after a connection was added, connected or removed."
+  []
+  (reset! disconnected-cache nil))
+
 (defn- set-message-as-peek [^IMAPMessage message] (.setPeek message true))
 
 (defn- set-messages-as-peek [messages] (doseq [message messages] (set-message-as-peek message)))
 
+(defn- move-found-messages!
+  "Move already located messages between two open folders of the same Store: with the MOVE command
+   when the server has it, otherwise by copy + delete (the library itself has no fallback and fails
+   with a BAD response on servers without MOVE). Returns true when every message ended up in target."
+  [^IMAPFolder source-folder ^IMAPFolder target-folder found-messages]
+  (set-messages-as-peek found-messages)
+  (if (move-supported? (.getStore source-folder))
+    (do (.moveMessages source-folder (into-array Message found-messages) target-folder)
+        true)
+    (do (t/log! :debug "Server does not support the IMAP MOVE command. Using copy and delete as fallback.")
+        (every? true? (mapv #(copy-message % source-folder target-folder) found-messages)))))
+
 (defn- move-message-between-open-folders!
   "Search message-id in source-folder and move it to target-folder; both folders are already open on
-   the same Store. Records the new location. Returns true or :not-found."
+   the same Store. Records the new location. Returns true, :not-found, or false when the move did not
+   complete."
   [connection-id ^IMAPFolder source-folder ^IMAPFolder target-folder ^String source-folder-name ^String target-folder-name message-id]
   (let [found-messages (.search source-folder (MessageIDTerm. message-id))]
     (t/log! :debug ["Found" (count found-messages) "messages when searched for the message-id:" message-id])
     (if (some? (seq found-messages))
       (do
-        (set-messages-as-peek found-messages)
         (t/log! :debug ["Moving e-mail from" source-folder-name "to" target-folder-name "using a dedicated IMAP connection"])
-        (.moveMessages source-folder (into-array Message found-messages) target-folder)
-        (db/update-email-folder message-id target-folder-name)
-        (db/update-email-connection message-id connection-id)
-        true)
+        (if (move-found-messages! source-folder target-folder found-messages)
+          (do (db/update-email-folder message-id target-folder-name)
+              (db/update-email-connection message-id connection-id)
+              true)
+          false))
       (do (t/log! :info ["No messages found in" source-folder-name "for" message-id])
           :not-found))))
 
 (defn move-message-on-dedicated-store!
   "Move message-id between two folders using a short-lived Store that is independent of IdleManager.
-   The Store and both folders are always closed after the attempt."
+   The Store and both folders are always closed after the attempt - without expunging: with-open would
+   call Folder.close(), which is close(true) and permanently deletes every message the user has
+   flagged for deletion in a mail client."
   [connection-config source-folder-name target-folder-name message-id]
   (when (oauth2? connection-config)
     (refresh-access-token connection-config))
-  (with-open [^Store move-store (login connection-config)
-              ^IMAPFolder target-folder (open-folder-in-store move-store target-folder-name)
-              ^IMAPFolder source-folder (open-folder-in-store move-store source-folder-name)]
-    (move-message-between-open-folders! (:id connection-config) source-folder target-folder source-folder-name target-folder-name message-id)))
+  (with-open [^Store move-store (login connection-config)]
+    (let [open-folders (atom [])
+          open! (fn ^IMAPFolder [^String folder-name]
+                  (let [folder (open-folder-in-store move-store folder-name)]
+                    (swap! open-folders conj folder)
+                    folder))]
+      (try
+        (let [target-folder (open! target-folder-name)
+              source-folder (open! source-folder-name)]
+          (move-message-between-open-folders! (:id connection-config) source-folder target-folder source-folder-name target-folder-name message-id))
+        (finally
+          (doseq [folder @open-folders]
+            (attempt-close-step! "closing a move folder" #(close-folder-without-expunge! folder))))))))
 
 (defn- resolve-move-folders
   "[source-folder-name target-folder-name] for moving message-id into category target-name on the
@@ -605,21 +795,25 @@
 
 (defn refresh-access-token [connection-config]
   (let [provider (db/get-auth-provider (:auth-provider connection-config))
-        token-data (db/get-oauth-tokens (:id connection-config))
-        result (try {:token (oauth/exchange-refresh-token-for-access-token provider (:refresh-token token-data))}
-                    (catch Exception e {:error e}))]
-    (cond
-      (some? (:token result))
-      (db/update-access-token (:id connection-config) (:token result))
+        token-data (db/get-oauth-tokens (:id connection-config))]
+    (if (s/blank? (:refresh-token token-data))
+      ;; Nothing to refresh with (never authorized, or the token was deleted after an invalid_grant):
+      ;; asking the provider with a nil token would only produce a misleading 'transient error'.
+      (t/log! :warn ["Connection" (:user connection-config) "has no stored OAuth refresh token. Log in again from the Connections page."])
+      (let [result (try {:token (oauth/exchange-refresh-token-for-access-token provider (:refresh-token token-data))}
+                        (catch Exception e {:error e}))]
+        (cond
+          (some? (:token result))
+          (db/update-access-token (:id connection-config) (:token result))
 
-      (invalid-grant-error? (:error result))
-      (do (t/log! :info ["Refresh token was rejected by the provider (invalid_grant). Deleting the stored token; the user must log in manually again."])
-          (db/delete-access-token (:id connection-config)))
+          (invalid-grant-error? (:error result))
+          (do (t/log! :info ["Refresh token was rejected by the provider (invalid_grant). Deleting the stored token; the user must log in manually again."])
+              (db/delete-access-token (:id connection-config)))
 
-      :else
-      ;; Transient failure (network, 5xx, timeout, or empty response): keep the refresh token and retry on the next cycle.
-      (t/log! {:level :error :error (:error result)}
-              ["Could not refresh the access token due to a transient error. Keeping the stored refresh token to retry later."]))))
+          :else
+          ;; Transient failure (network, 5xx, timeout, or empty response): keep the refresh token and retry on the next cycle.
+          (t/log! {:level :error :error (:error result)}
+                  ["Could not refresh the access token due to a transient error. Keeping the stored refresh token to retry later."]))))))
 
 (defn monitor-folder-name [folder-name]
   (if (or (nil? folder-name) (s/blank? folder-name)) "INBOX" folder-name))
@@ -688,19 +882,39 @@
       (when (unexpected-store-close? id (.getSource event))
         (recover-dropped-connection! id context)))))
 
+(defonce ^:private idle-executor
+  ;; Shared by every connection's IdleManager, which only uses it to run its selector loop. One pool
+  ;; instead of one per connect avoids leaking a thread pool on every (re)connect; daemon threads never
+  ;; keep the JVM alive after the shutdown hook.
+  (Executors/newCachedThreadPool
+   (reify ThreadFactory
+     (newThread [_ runnable]
+       (doto (Thread. ^Runnable runnable "plauna-imap-idle") (.setDaemon true))))))
+
+(defn- new-idle-manager ^IdleManager [connection-config]
+  (IdleManager. (config->session connection-config) idle-executor))
+
 (defn construct-connection-data [connection-config context]
-  (let [idle-manager (IdleManager. (config->session connection-config) (Executors/newCachedThreadPool))
-        store (login connection-config)
-        id (:id connection-config)
-        folder-name-to-monitor (monitor-folder-name (:folder connection-config))
-        folder (open-folder-in-store store folder-name-to-monitor)
-        listener (message-count-listener id folder folder-name-to-monitor context)
-        connection-data (->ConnectionData connection-config store folder idle-manager (capabilities store) listener)]
-    ;; A fresh, deliberately opened store: earlier intentional closes of this account are history.
-    (swap! intentional-closes disj id)
-    (.addConnectionListener ^Store store (store-connection-listener id context))
-    (add-to-connections connection-data)
-    connection-data))
+  (let [id (:id connection-config)
+        store (login connection-config)]
+    (try
+      (let [folder-name-to-monitor (monitor-folder-name (:folder connection-config))
+            folder (open-folder-in-store store folder-name-to-monitor)
+            ;; Created only once login and folder open succeeded: an IdleManager starts a selector thread
+            ;; that a failed connect attempt would otherwise leak every time.
+            idle-manager (new-idle-manager connection-config)
+            listener (message-count-listener id folder folder-name-to-monitor context)
+            connection-data (->ConnectionData connection-config store folder idle-manager (capabilities store) listener)]
+        (.addConnectionListener ^Store store (store-connection-listener id context))
+        ;; Registering may close a previous registration of this id (marking that close as intentional),
+        ;; so only afterwards is the fresh, deliberately opened store cleared of earlier intentional closes.
+        (add-to-connections connection-data)
+        (swap! intentional-closes disj id)
+        connection-data)
+      (catch Exception e
+        ;; Opening the monitored folder failed: do not leak the connected store.
+        (try (.close ^Store store) (catch Exception _ nil))
+        (throw e)))))
 
 (def backfill-message-limit
   "On every (re)connect, re-read at most this many of the most recent messages from the monitored
@@ -732,7 +946,8 @@
   ;; asynchronously and must not be mistaken for a dropped connection.
   (when-let [id (get-in connection-data [:config :id])]
     (swap! intentional-closes conj id))
-  (.close connection-data))
+  (try (.close connection-data)
+       (finally (forget-disconnected-cache!))))
 
 (defn remove-connection!
   "Close a connection's live resources (monitor, folder, store) and drop it from the runtime
@@ -747,15 +962,25 @@
     (swap! connections dissoc id)
     ;; Nothing is registered under this id any more, so the store listener ignores its CLOSED event by
     ;; itself; the marker would otherwise outlive the connection.
-    (swap! intentional-closes disj id)))
+    (swap! intentional-closes disj id)
+    (forget-disconnected-cache!)))
 
-(defn disconnect-all [] (doseq [connection (vals @connections)] (disconnect connection)))
+(defn disconnect-all
+  "Close every registered connection. One connection that fails to close must not keep the others open."
+  []
+  (doseq [connection (vals @connections)]
+    (try (disconnect connection)
+         (catch Exception e
+           (t/log! {:level :warn :error e} ["Error while disconnecting" (get-in connection [:config :id])])))))
 
-(defn stop-health-checks! []
+(defn stop-health-checks!
+  "Cancel the periodic health checks and shut down the client's executors (health checks and IDLE)."
+  []
   (doseq [[_ ^ScheduledFuture scheduled] @health-checks]
     (.cancel scheduled true))
   (reset! health-checks {})
-  (.shutdownNow ^ScheduledExecutorService executor-service))
+  (.shutdownNow ^ScheduledExecutorService executor-service)
+  (.shutdownNow ^ExecutorService idle-executor))
 
 (defn reconnect [^ConnectionData connection-data]
   (try
@@ -807,37 +1032,51 @@
    IDLE. Shared by the periodic health check and the store's connection listener; the two are
    serialized per connection so a drop is never repaired twice at once."
   [^ConnectionData connection-data context]
-  (locking connection-data
+  ;; The lock is the Store, not the record: replacing the IdleManager (ensure-idle-manager!) creates a
+  ;; new record for the same store, and the health check's closure still holds the old one.
+  (locking (:store connection-data)
    (let [^Store store (:store connection-data)
         ^Folder folder (:folder connection-data)
-        config (:config connection-data)]
+        config (:config connection-data)
+        registered (connection-data-from-id (:id config))]
+    (if-not (and (some? registered) (identical? store (:store registered)))
+      ;; A stale health check of a connection that was reconnected or removed meanwhile: touching the
+      ;; old store would only re-open a zombie IMAP session nobody listens to.
+      (t/log! :debug ["Skipping the health check of a replaced connection" (:id config)])
     (try
       (t/log! :debug ["Checking if the connection for" (:user config) "is open"])
-      (if (.isConnected store)
-        (t/log! :debug "Store is still connected.")
-        (do
-          (t/log! :warn "Connection lost. Reconnecting to email server...")
-          (reconnect connection-data)
-          ;; The monitor was down for a while, so mail may have arrived without an IDLE push.
-          ;; Back-fill it now that we're back (only if the reconnect actually restored the store).
-          (when (.isConnected store)
-            (backfill-monitored-folder! connection-data context))))
-      (t/log! :debug ["Checking if the folder " (:folder config) "is open"])
-      (if (.isOpen folder)
-        (t/log! :debug "Folder is still open.")
-        (do (t/log! :info "Folder is closed. Opening it again.")
-            (.open folder Folder/READ_WRITE)))
-      (t/log! :debug "Idling and waiting for messages after a health check.")
-      (start-idling-for-id (:id config))
+      (let [reconnected? (if (.isConnected store)
+                           (do (t/log! :debug "Store is still connected.") false)
+                           (do (t/log! :warn "Connection lost. Reconnecting to email server...")
+                               (reconnect connection-data)
+                               (.isConnected store)))
+            _ (t/log! :debug ["Checking if the folder " (:folder config) "is open"])
+            reopened? (if (.isOpen folder)
+                        (do (t/log! :debug "Folder is still open.") false)
+                        (do (t/log! :info "Folder is closed. Opening it again.")
+                            (.open folder Folder/READ_WRITE)
+                            true))]
+        ;; While the store was down OR the folder was closed, no IDLE push could arrive and re-opening a
+        ;; folder does not replay what arrived meanwhile: back-fill in both cases.
+        (when (or reconnected? reopened?)
+          (backfill-monitored-folder! connection-data context))
+        (t/log! :debug "Idling and waiting for messages after a health check.")
+        (start-idling-for-id (:id config)))
       (catch Exception e
-        (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state."))))))
+        (t/log! {:level :error :error e} "There was an error during health check. The connection is probably in a broken state.")))))))
 
 (defn schedule-health-checks [^ConnectionData connection-data context]
   (let [config (:config connection-data)
         scheduled-future (.scheduleAtFixedRate ^ScheduledExecutorService executor-service
                                                #(restore-connection-if-needed! connection-data context)
                                                120 (p/client-health-check-interval) TimeUnit/SECONDS)]
-    (swap-new-period-check (:id config) scheduled-future)
+    ;; Two connects for the same id can interleave (the UI and the startup retry): only the connection
+    ;; that is registered right now may own the health check; a check for a replaced (closed) store
+    ;; would keep re-opening a zombie IMAP session.
+    (if (identical? (connection-data-from-id (:id config)) connection-data)
+      (swap-new-period-check (:id config) scheduled-future)
+      (do (t/log! :info ["Connection" (:id config) "was replaced while connecting; not scheduling a health check for the replaced one."])
+          (.cancel ^ScheduledFuture scheduled-future true)))
     connection-data))
 
 (defn folder-from-connection [connection-data folder-name]

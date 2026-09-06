@@ -11,6 +11,7 @@
             [honey.sql.helpers :refer [insert-into upsert values on-conflict do-update-set]]
             [next.jdbc.sql.builder :as builder]
             [plauna.util.page :as page]
+            [plauna.util.sql :as sql]
             [taoensso.telemere :as t]
             [plauna.interfaces :as int]
             [clojure.core.async :as async])
@@ -208,10 +209,13 @@
   ([conn metadata]
    (when (seq metadata)
      (if (mariadb?)
-       (doseq [m metadata]
+       ;; One multi-row upsert per 200 e-mails instead of one round trip per e-mail.
+       (doseq [chunk (partition-all 200 metadata)]
          (jdbc/execute! conn
-           ["INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence, connection_id) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence), connection_id = COALESCE(VALUES(connection_id), connection_id)"
-            (:message-id m) (:language m) (:language-confidence m) (:category-id m) (:category-confidence m) (:connection-id m)]))
+           (into [(str "INSERT INTO metadata (message_id, language, language_confidence, category, category_confidence, connection_id) VALUES "
+                       (string/join ", " (repeat (count chunk) "(?, ?, ?, ?, ?, ?)"))
+                       " ON DUPLICATE KEY UPDATE language = VALUES(language), language_confidence = VALUES(language_confidence), category = VALUES(category), category_confidence = VALUES(category_confidence), connection_id = COALESCE(VALUES(connection_id), connection_id)")]
+                 (mapcat (juxt :message-id :language :language-confidence :category-id :category-confidence :connection-id) chunk))))
        (jdbc/execute! conn
                       (->> (builder/for-insert-multi
                             :metadata
@@ -222,20 +226,56 @@
 
 (def batch-size 500)
 
-(defn empty-buffer [] {:headers [] :bodies [] :participants [] :metadata []})
+(defn empty-buffer [] {:headers [] :bodies [] :participants [] :metadata [] :count 0})
 
-(defn add-to-buffer [e-mail buffer]
-  (let [updated-buffer
-        (-> (update buffer :headers conj (:header e-mail))
-            (update :bodies concat (:body e-mail))
-            (update :participants concat (:participants e-mail)))]
-    (if (some? (:metadata e-mail))
-      (update updated-buffer :metadata conj (:metadata e-mail))
-      updated-buffer)))
+(defn buffer-size
+  "How many e-mails a buffer holds (headers plus metadata-only entries)."
+  [buffer]
+  (or (:count buffer) (count (:headers buffer))))
+
+(defn add-to-buffer
+  "Queue one e-mail for the next batch save. With metadata-only? (the re-enrichment of an e-mail that
+   is already stored, see the :metadata-only event option) only its metadata is queued: the header is
+   there already, and re-saving the bodies would add a duplicate row for every attachment because the
+   UNIQUE constraint on bodies does not cover their NULL content."
+  ([e-mail buffer] (add-to-buffer e-mail buffer false))
+  ([e-mail buffer metadata-only?]
+   (let [with-metadata (fn [b] (if (some? (:metadata e-mail)) (update b :metadata conj (:metadata e-mail)) b))]
+     (-> (if metadata-only?
+           buffer
+           (-> buffer
+               (update :headers conj (:header e-mail))
+               (update :bodies into (:body e-mail))
+               (update :participants into (:participants e-mail))))
+         with-metadata
+         (update :count (fnil inc 0))))))
 
 (defn- bodyless-message-ids [headers bodies]
   (let [covered (set (map :message-id bodies))]
     (vec (remove covered (map :message-id headers)))))
+
+(def body-insert-max-rows 100)
+
+(def body-insert-max-chars
+  "Body content per INSERT statement. MariaDB rejects a statement larger than max_allowed_packet
+   (16 MB by default) - one oversized multi-row INSERT would then lose the complete batch of up to 500
+   e-mails. 3 M characters stay below that even when every character needs four UTF-8 bytes."
+  (* 3 1024 1024))
+
+(defn chunk-bodies
+  "Split body rows into groups that fit one INSERT (see body-insert-max-chars); order is preserved."
+  [bodies]
+  (loop [remaining (seq bodies) current [] size 0 chunks []]
+    (if-let [body (first remaining)]
+      (let [len (count (str (:content body)))]
+        (if (and (seq current)
+                 (or (>= (count current) body-insert-max-rows)
+                     (> (+ size len) body-insert-max-chars)))
+          (recur remaining [] 0 (conj chunks current))
+          (recur (rest remaining) (conj current body) (+ size len) chunks)))
+      (if (seq current) (conj chunks current) chunks))))
+
+(def ^:private participant-insert-max-rows 500)
 
 (defn save-emails-in-buffer
   "Persist everything in the buffer in ONE transaction: either the whole batch commits or nothing
@@ -245,25 +285,58 @@
    are picked up again by a later backfill or re-parse."
   [buffer]
   (jdbc/with-transaction [tx (ds)]
-    (save-headers tx (:headers buffer))
-    (let [missing (bodyless-message-ids (:headers buffer) (:bodies buffer))]
-      (when (seq missing)
-        (t/log! :warn ["No body parts parsed for message ID(s):" missing])))
-    (when (seq (:bodies buffer)) (save-bodies tx (:bodies buffer)))
-    (when (seq (:participants buffer))
-      (save-contacts tx (:participants buffer))
-      (save-communications tx (:participants buffer)))
+    (when (seq (:headers buffer))
+      (save-headers tx (:headers buffer))
+      (let [missing (bodyless-message-ids (:headers buffer) (:bodies buffer))]
+        (when (seq missing)
+          (t/log! :warn ["No body parts parsed for message ID(s):" missing]))))
+    (doseq [chunk (chunk-bodies (:bodies buffer))]
+      (save-bodies tx chunk))
+    (doseq [chunk (partition-all participant-insert-max-rows (:participants buffer))]
+      (save-contacts tx chunk)
+      (save-communications tx chunk))
     (when (seq (:metadata buffer)) (update-metadata-batch tx (:metadata buffer)))))
+
+(defn buffer->single-email-buffers
+  "Split a batch buffer into one buffer per e-mail (by message id), so a failed batch can be retried
+   e-mail by e-mail. Metadata-only entries (re-enrichment) have no header and become buffers of their own."
+  [buffer]
+  (let [bodies (group-by :message-id (:bodies buffer))
+        participants (group-by :message-id (:participants buffer))
+        metadata (group-by :message-id (:metadata buffer))
+        header-ids (set (map :message-id (:headers buffer)))]
+    (concat
+     (map (fn [header]
+            (let [id (:message-id header)]
+              {:headers [header] :bodies (vec (get bodies id)) :participants (vec (get participants id))
+               :metadata (vec (get metadata id)) :count 1}))
+          (:headers buffer))
+     (map (fn [m] {:headers [] :bodies [] :participants [] :metadata [m] :count 1})
+          (remove #(contains? header-ids (:message-id %)) (:metadata buffer))))))
 
 (defn- save-buffer-logging-errors!
   "Keep the database event loop alive when a batch save fails: the transaction has already rolled
-   back, so nothing partial was written and the messages remain recoverable."
+   back, so nothing partial was written. A failed batch of several e-mails is retried one e-mail at a
+   time, so a single row the database rejects (a column limit on MariaDB, a constraint) costs that one
+   e-mail and not the other 499 of an import."
   [buffer]
   (try
     (save-emails-in-buffer buffer)
     (catch Exception e
-      (t/log! {:level :error :error e}
-              ["Saving an email batch failed and was rolled back. The messages were not written and will be picked up by a later backfill or re-parse:" (.getMessage e)]))))
+      (if (<= (buffer-size buffer) 1)
+        (t/log! {:level :error :error e}
+                ["Saving e-mail" (or (some :message-id (:headers buffer)) (some :message-id (:metadata buffer)))
+                 "failed and was rolled back. It was not written and will be picked up by a later backfill or re-parse:" (.getMessage e)])
+        (do (t/log! {:level :warn :error e}
+                    ["Saving a batch of" (buffer-size buffer) "e-mails failed and was rolled back; retrying them one by one so a single rejected e-mail does not discard the others:" (.getMessage e)])
+            (doseq [single (buffer->single-email-buffers buffer)]
+              (save-buffer-logging-errors! single)))))))
+
+(defn- metadata-only-event?
+  "True for a re-enrichment of an e-mail that is already stored (see plauna.server's language
+   re-detection): only the metadata row is written."
+  [event]
+  (true? (get-in event [:options :metadata-only])))
 
 (defn database-event-loop [publisher]
   (let [parsed-chan (async/chan)
@@ -277,30 +350,41 @@
     ;; JDBC is blocking work and must not occupy core.async's shared go-dispatch pool. A dedicated
     ;; thread also lets shutdown block until the final partial buffer has been flushed.
     (async/thread
-      (loop [event (async/<!! local-chan)
-             buffer (empty-buffer)]
-        (cond
-          (nil? event)
-          (do
-            (when (seq (:headers buffer))
-              (t/log! :info ["Database event loop is stopping; flushing" (count (:headers buffer)) "buffered email(s)."])
-              (save-buffer-logging-errors! buffer))
-            :stopped)
-
-          (= :timed-out event)
-          (do (when (seq (:headers buffer))
-                (t/log! :debug ["Received timeout. Saving everything in the buffer."])
+      (try
+        (loop [event (async/<!! local-chan)
+               buffer (empty-buffer)]
+          (cond
+            (nil? event)
+            (do
+              (when (pos? (buffer-size buffer))
+                (t/log! :info ["Database event loop is stopping; flushing" (buffer-size buffer) "buffered email(s)."])
                 (save-buffer-logging-errors! buffer))
-              (recur (async/<!! local-chan) (empty-buffer)))
+              :stopped)
 
-          (>= (count (:headers buffer)) batch-size)
-          (do (t/log! :debug ["DB buffer full. Emptying"])
-              (save-buffer-logging-errors! (add-to-buffer (:payload event) buffer))
-              (recur (async/<!! local-chan) (empty-buffer)))
+            (= :timed-out event)
+            (do (when (pos? (buffer-size buffer))
+                  (t/log! :debug ["Received timeout. Saving everything in the buffer."])
+                  (save-buffer-logging-errors! buffer))
+                (recur (async/<!! local-chan) (empty-buffer)))
 
-          :else
-          (recur (async-utils/fetch-or-timeout!! local-chan 1000)
-                 (add-to-buffer (:payload event) buffer)))))))
+            (>= (buffer-size buffer) batch-size)
+            (do (t/log! :debug ["DB buffer full. Emptying"])
+                (save-buffer-logging-errors! (add-to-buffer (:payload event) buffer (metadata-only-event? event)))
+                (recur (async/<!! local-chan) (empty-buffer)))
+
+            :else
+            (recur (async-utils/fetch-or-timeout!! local-chan 1000)
+                   (add-to-buffer (:payload event) buffer (metadata-only-event? event)))))
+        (catch Throwable t
+          (t/log! {:level :error :error t} "The database event loop crashed. Its subscriptions are released so the supervisor's restart can take over.")
+          :crashed)
+        (finally
+          ;; A dead loop must not stay subscribed: the publisher would block on its unread channels and
+          ;; stall every producer of :parsed-email / :enriched-email events.
+          (async/unsub publisher :parsed-email parsed-chan)
+          (async/unsub publisher :enriched-email enriched-chan)
+          (async/close! parsed-chan)
+          (async/close! enriched-chan))))))
 
 (defn honey-time-buckets []
   (if (mariadb?)
@@ -451,6 +535,28 @@
   (jdbc/execute! (ds) (honey/format {:update :parse-batches
                                      :set {:status "aborted" :finished-at (epoch-seconds)}
                                      :where [:= :status "running"]})))
+
+(defn abort-parse-batch!
+  "Mark one run as aborted: it never got to process anything (e.g. its folder could not be opened)."
+  [id]
+  (jdbc/execute! (ds) (honey/format {:update :parse-batches
+                                     :set {:status "aborted" :finished-at (epoch-seconds)}
+                                     :where [:= :id id]})))
+
+(defn any-emails?
+  "True when at least one e-mail is stored. Cheap, unlike aggregating the mailbox by year."
+  []
+  (some? (jdbc/execute-one! (ds) ["SELECT 1 FROM headers LIMIT 1"])))
+
+(defn content-match-message-ids
+  "The message ids whose body content contains search-text literally: the SQLite body search, resolved
+   once so the e-mail list's statements can inline the ids instead of each rescanning every body."
+  [search-text]
+  (mapv :message-id
+        (jdbc/execute! (ds) (honey/format {:select-distinct [:message-id]
+                                           :from [:bodies]
+                                           :where (sql/like-contains :content search-text)})
+                       builder-function-kebab)))
 
 (defn parse-batch [id]
   (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:parse-batches] :where [:= :id id]}) builder-function-kebab))
@@ -919,7 +1025,11 @@
                           db-connection->model
                           (jdbc/execute! (ds) (honey/format {:select [:*] :from [:connections]}) builder-function-kebab)))
 
-(defn get-connection [id] (db-connection->model (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:connections] :where [:= :id id]}) builder-function-kebab)))
+(defn get-connection
+  "The stored connection with the given id, or nil when there is none (instead of a record of nils)."
+  [id]
+  (some-> (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:connections] :where [:= :id id]}) builder-function-kebab)
+          db-connection->model))
 
 (defn get-oauth-tokens [connection-id] (jdbc/execute-one! (ds) (honey/format {:select [:*] :from [:oauth-tokens] :where [:= :connection-id connection-id]}) builder-function-kebab))
 
@@ -1028,6 +1138,7 @@
   (fetch-email-location [_ message-id] (email-location message-id))
   (fetch-categorized-message-ids-in-folder [_ connection-id folder] (categorized-message-ids-in-folder connection-id folder))
   (fetch-parse-batch [_ id] (parse-batch id))
+  (fetch-content-match-ids [_ search-text] (content-match-message-ids search-text))
   (save-email [_ email]
     ;; One transaction per email, and failures propagate: a partially-saved email whose header
     ;; already exists would otherwise be skipped by every future backfill (see save-emails-in-buffer).

@@ -23,6 +23,7 @@
   (fetch-email-location [this message-id] "Where a stored e-mail is known to live: {:folder ... :connection-id ...}, or nil.")
   (fetch-categorized-message-ids-in-folder [this connection-id folder] "The Message-IDs of stored, categorized e-mails whose recorded location is the given folder of the connection.")
   (fetch-parse-batch [this id] "Get one folder parse run by id, or nil.")
+  (fetch-content-match-ids [this search-text] "The message ids whose body content contains search-text literally (used to resolve a body search once per page instead of once per statement). nil when the lookup is not available.")
   (save-email [this email]))
 
 (defprotocol EmailClient

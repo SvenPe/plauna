@@ -81,7 +81,13 @@
       (if (st/blank? iso3) language iso3))
     (catch Exception _ language)))
 
-(defn detect-language [^String text]
+(def undetected-language {:code "n/a" :confidence 0.0})
+
+(defn detect-language
+  "The detected language of text as {:code :confidence}; undetected-language for text that is too short,
+   below the confidence threshold, or that the detector cannot handle. Never throws: an e-mail whose
+   language cannot be told must still be saved."
+  [^String text]
   (when (some? text)
     (try
       (if (> (count text) 3)
@@ -92,11 +98,14 @@
               lang-code (lang-code-set3 best-lang)]
           {:code (if (< confidence (p/language-detection-threshold)) "n/a" lang-code)
            :confidence confidence})
-        {:code "n/a" :confidence 0.0})
-      (catch com.cybozu.labs.langdetect.NoFeatureInTextException e
-        (t/log! {:level :error :error e} "There was an error when detecting the language")
+        undetected-language)
+      (catch com.cybozu.labs.langdetect.NoFeatureInTextException _
+        (t/log! :debug ["No language features in text:" text])
+        undetected-language)
+      (catch Exception e
+        (t/log! {:level :warn :error e} "The language detector failed; treating the language as undetected.")
         (t/log! :debug ["The following text threw an exception:" text])
-        {:code "n/a" :confidence 0.0}))))
+        undetected-language))))
 
 (defn training-data-stream [file]
   (-> (MarkableFileInputStreamFactory. file)
@@ -129,27 +138,34 @@
     (when (< -1 separator (dec (count address)))
       (subs address (inc separator)))))
 
+(defn body-text
+  "The plain text of the e-mail's training body part (HTML tags and RTF markup removed), or nil without
+   a text part. The cleaning is the expensive step of feature extraction; callers that also need the text
+   for language detection pass it on instead of cleaning twice."
+  [email]
+  (when-let [body-part (training-body-part email)]
+    (tt/clean-text-content (:content body-part) (core-email/text-content-type body-part))))
+
 (defn classification-feature-groups
   "Build the exact same namespaced features for training and prediction. Keeping sender address,
    domain, subject and body in separate namespaces prevents an identical word from being treated as
-   the same signal everywhere."
-  [email]
-  (let [addresses (sender-addresses email)
-        subject (get-in email [:header :subject])
-        body-part (training-body-part email)
-        body-text (when body-part
-                    (tt/clean-text-content (:content body-part)
-                                           (core-email/text-content-type body-part)))]
-    {:sender (concat (map #(str "sender-address:" %) addresses)
-                     (keep #(when-let [domain (sender-domain %)]
-                              (str "sender-domain:" domain))
-                           addresses))
-     :subject (map #(str "subject:" %) (normalized-words subject))
-     :body (map #(str "body:" %) (take max-body-features (normalized-words body-text)))}))
+   the same signal everywhere. cleaned-body, when given, is the result of body-text for this e-mail."
+  ([email] (classification-feature-groups email (body-text email)))
+  ([email cleaned-body]
+   (let [addresses (sender-addresses email)
+         subject (get-in email [:header :subject])]
+     {:sender (concat (map #(str "sender-address:" %) addresses)
+                      (keep #(when-let [domain (sender-domain %)]
+                               (str "sender-domain:" domain))
+                            addresses))
+      :subject (map #(str "subject:" %) (normalized-words subject))
+      :body (map #(str "body:" %) (take max-body-features (normalized-words cleaned-body)))})))
 
-(defn classification-tokens [email]
-  (let [{:keys [sender subject body]} (classification-feature-groups email)]
-    (vec (concat sender subject body))))
+(defn classification-tokens
+  ([email] (classification-tokens email (body-text email)))
+  ([email cleaned-body]
+   (let [{:keys [sender subject body]} (classification-feature-groups email cleaned-body)]
+     (vec (concat sender subject body)))))
 
 (defn legacy-classification-tokens
   "Reproduce the pre-migration prediction input for a legacy train-<lang>.bin model. Those models do
@@ -164,10 +180,13 @@
           (vec (remove st/blank? (st/split (normalize content) #" ")))))
       [])))
 
-(defn classification-tokens-for-model [email language-code ^File model-file]
-  (if (= (.getName model-file) (str "train-" language-code ".bin"))
-    (legacy-classification-tokens email)
-    (classification-tokens email)))
+(defn classification-tokens-for-model
+  ([email language-code ^File model-file]
+   (classification-tokens-for-model email language-code model-file (body-text email)))
+  ([email language-code ^File model-file cleaned-body]
+   (if (= (.getName model-file) (str "train-" language-code ".bin"))
+     (legacy-classification-tokens email)
+     (classification-tokens email cleaned-body))))
 
 (def training-tokens-version
   "Bump whenever classification-feature-groups or the normalizers change: cached training_tokens rows
@@ -186,12 +205,16 @@
    the first whitespace-delimited token as the label, so a name like \"Work Projects\" would be
    trained as \"Work\" and never resolve back to a category. IDs are single tokens by construction."
   [pairs]
-  (transduce
-   (comp (filter (fn [[category tokens]] (and (some? category) (not (st/blank? tokens)))))
-         (map (fn [[category tokens]] (str category " " tokens "\n"))))
-   str
-   ""
-   pairs))
+  ;; A StringBuilder instead of repeated str: concatenating growing strings is quadratic in the size of
+  ;; the page (200 e-mails of a few KB each).
+  (let [builder (StringBuilder.)]
+    (doseq [[category tokens] pairs
+            :when (and (some? category) (not (st/blank? tokens)))]
+      (.append builder (str category))
+      (.append builder " ")
+      (.append builder ^String tokens)
+      (.append builder "\n"))
+    (.toString builder)))
 
 (def training-iterations
   "Upper bound of optimisation iterations per model. MaxEnt may stop earlier once it converges;
@@ -289,9 +312,37 @@
           (mapv #(future (train-one %)))
           (mapv deref)))))
 
+(defonce ^:private categorizer-cache
+  ;; {absolute-path {:stamp [lastModified length] :categorizer DocumentCategorizerME}}. Deserializing a
+  ;; model costs tens of milliseconds to seconds and used to happen for EVERY categorized e-mail. Models
+  ;; are replaced atomically (files/write-model-file-atomically!), so a changed stamp means a new model.
+  ;; DocumentCategorizerME.categorize is stateless and safe to share between threads.
+  (atom {}))
+
+(defn- model-stamp [^File model-file]
+  [(.lastModified model-file) (.length model-file)])
+
+(defn categorizer-for
+  "The (cached) categorizer for a model file, reloaded when the file changed."
+  ^DocumentCategorizerME [^File model-file]
+  (let [path (.getAbsolutePath model-file)
+        stamp (model-stamp model-file)
+        cached (get @categorizer-cache path)]
+    (if (and cached (= stamp (:stamp cached)))
+      (:categorizer cached)
+      (let [categorizer (DocumentCategorizerME. (DoccatModel. model-file))]
+        (t/log! :info ["Loaded categorization model" path])
+        (swap! categorizer-cache assoc path {:stamp stamp :categorizer categorizer})
+        categorizer))))
+
+(defn forget-cached-models!
+  "Drop every cached model (tests and diagnostics; production relies on the file stamp)."
+  []
+  (reset! categorizer-cache {}))
+
 (defn categorize-tokens [tokens ^File model-file]
   (if (and (.exists model-file) (seq tokens))
-    (let [doccat (DocumentCategorizerME. (DoccatModel. model-file))
+    (let [doccat (categorizer-for model-file)
           cat-results (.categorize doccat (into-array String tokens))
           best-category (.getBestCategory doccat cat-results)
           best-probability (get cat-results (.getIndex doccat best-category))]
@@ -307,51 +358,99 @@
   (when (some? body-part)
     (normalize (tt/clean-text-content (:content body-part) (core-email/text-content-type body-part)))))
 
+;; ── Reference data cache ─────────────────────────────────────────────────────────
+;; The activated training languages and the category table change only through the administration
+;; pages, yet categorization asked the database for them once per e-mail - thousands of tiny queries
+;; during an import. They are cached briefly; the administration routes clear the cache on every change.
+
+(def reference-cache-millis 5000)
+
+(defonce ^:private reference-cache (atom {}))
+
+(defn clear-reference-cache! [] (reset! reference-cache {}))
+
+(defn- cached-reference [key load-fn]
+  (let [now (System/currentTimeMillis)
+        entry (get @reference-cache key)]
+    (if (and entry (< (- now (long (:at entry))) reference-cache-millis))
+      (:value entry)
+      (let [value (load-fn)]
+        (swap! reference-cache assoc key {:at now :value value})
+        value))))
+
+(defn- activated-languages []
+  (cached-reference :activated-languages #(mapv :language (db/get-activated-language-preferences))))
+
+(defn- categories-by-id []
+  (cached-reference :categories-by-id #(into {} (map (juxt :id identity)) (db/get-categories))))
+
+(defn- categories-by-name []
+  (cached-reference :categories-by-name #(into {} (map (juxt :name identity)) (db/get-categories))))
+
 (defn label->category
   "Resolve a model label to its category row. Labels are category ids (see format-training-lines);
    fall back to a name lookup so models trained before ids were used as labels keep working until
    the next re-training. Returns nil when the label matches no existing category."
   [label]
   (when (some? label)
-    (or (when-let [id (parse-long (str label))] (db/category-by-id id))
-        (db/category-by-name label))))
+    (or (when-let [id (parse-long (str label))] (get (categories-by-id) id))
+        (get (categories-by-name) label))))
 
-(defn category-for-email [email language-code]
-  (when (and (some? email) (some? language-code))
-    (let [allowed-languages (mapv :language (db/get-activated-language-preferences))]
-      (when (some #(= language-code %) allowed-languages)
-        (let [model-file (files/model-file language-code (p/categorization-model))
-              tokens (classification-tokens-for-model email language-code model-file)]
-          (categorize-tokens tokens model-file))))))
+(defn category-for-email
+  "The model's category for the e-mail in the given language, or nil. cleaned-body (optional) is the
+   result of body-text for this e-mail, so the caller's language detection and the feature extraction
+   share one HTML cleaning pass."
+  ([email language-code] (category-for-email email language-code (body-text email)))
+  ([email language-code cleaned-body]
+   (when (and (some? email) (some? language-code))
+     (when (some #(= language-code %) (activated-languages))
+       (let [model-file (files/model-file language-code (p/categorization-model))
+             tokens (classification-tokens-for-model email language-code model-file cleaned-body)]
+         (categorize-tokens tokens model-file))))))
+
+(defn detect-language-and-categorize-email
+  "Detect the language of an e-mail and, for an activated language with a model, its category. The
+   HTML body is cleaned once for both. A failure in either step yields an e-mail without that piece
+   of metadata instead of an exception: the e-mail itself must always reach the database."
+  [email]
+  (let [cleaned-body (try (body-text email)
+                          (catch Exception e
+                            (t/log! {:level :warn :error e} ["Could not extract the body text of" (-> email :header :message-id)])
+                            nil))
+        ;; No text at all leaves the language unknown (NULL), as before; text whose language cannot be
+        ;; told is "n/a".
+        language-result (if cleaned-body (detect-language (normalize cleaned-body)) {:code nil :confidence nil})
+        category-result (try (category-for-email email (:code language-result) cleaned-body)
+                             (catch Exception e
+                               (t/log! {:level :warn :error e} ["Categorizing" (-> email :header :message-id) "failed; saving it without a category."])
+                               nil))
+        category (label->category (:name category-result))]
+    (core-email/construct-enriched-email email
+                                         {:language (:code language-result) :language-confidence (:confidence language-result)}
+                                         {:category (:name category) :category-confidence (:confidence category-result) :category-id (:id category)})))
 
 (defn detect-language-and-categorize-event [event]
-  (let [email (:payload event)
-        body-part-to-train-on (core-email/body-part-for-mime-type "text/html" email)
-        training-content (normalize-body-part body-part-to-train-on)
-        language-result (detect-language training-content)
-        category-result (category-for-email email (:code language-result))
-        category (label->category (:name category-result))]
-    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category) :category-confidence (:confidence category-result) :category-id (:id category)})))
+  (detect-language-and-categorize-email (:payload event)))
 
-(defn detect-language-and-categorize-email [email]
-  (let [body-part-to-train-on (core-email/body-part-for-mime-type "text/html" email)
-        training-content (normalize-body-part body-part-to-train-on)
-        language-result (detect-language training-content)
-        category-result (category-for-email email (:code language-result))
-        category (label->category (:name category-result))]
-    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (:name category) :category-confidence (:confidence category-result) :category-id (:id category)})))
+(defn language-result
+  "The detected language of an e-mail's training body part as {:code :confidence}: both nil without any
+   text, \"n/a\" when the text's language cannot be told (also when the detector fails)."
+  [email]
+  (let [training-content (try (normalize-body-part (core-email/body-part-for-mime-type "text/html" email))
+                              (catch Exception e
+                                (t/log! {:level :warn :error e} ["Could not extract the body text of" (-> email :header :message-id)])
+                                nil))]
+    (if training-content
+      (detect-language training-content)
+      {:code nil :confidence nil})))
 
 (defn detect-language-event [event]
   (let [email (:payload event)
-        body-part-to-train-on (core-email/body-part-for-mime-type "text/html" email)
-        training-content (normalize-body-part body-part-to-train-on)
-        language-result (try (detect-language training-content) (catch Exception e (t/log! {:level :error :error e} [(.getMessage e) "\nText causing the exception:" training-content])))]
-    (core-email/construct-enriched-email email {:language (:code language-result) :language-confidence (:confidence language-result)} {:category (-> email :metadata :category) :category-confidence (-> email :metadata :category-confidence) :category-id (-> email :metadata :category-id)})))
-
-(defn language-result [email]
-  (let [body-part-to-train-on (core-email/body-part-for-mime-type "text/html" email)
-        training-content (normalize-body-part body-part-to-train-on)]
-    (try (detect-language training-content) (catch Exception e (t/log! {:level :error :error e} [(.getMessage e) "\nText causing the exception:" training-content])))))
+        language-result (language-result email)]
+    (core-email/construct-enriched-email email
+                                         {:language (:code language-result) :language-confidence (:confidence language-result)}
+                                         {:category (-> email :metadata :category) :category-confidence (-> email :metadata :category-confidence) :category-id (-> email :metadata :category-id)}
+                                         (-> email :metadata :connection-id))))
 
 (defmulti handle-enrichment :type)
 

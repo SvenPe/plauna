@@ -156,3 +156,44 @@
                :body [{:mime-type "text/plain" :content "please pay"}]}]
     (is (= (clojure.string/join " " (analysis/classification-tokens email)) (analysis/training-tokens-text email)))
     (is (clojure.string/includes? (analysis/training-tokens-text email) "sender-domain:example.com"))))
+
+(deftest categorization-models-are-loaded-once-and-reloaded-when-the-file-changes
+  (let [training-file (java.io.File/createTempFile "plauna-training-" ".train")
+        model-file (java.io.File/createTempFile "plauna-model-" ".bin")]
+    (try
+      (spit training-file (str "1 sender-domain:shop.example subject:invoice body:payment\n"
+                               "2 sender-domain:friends.example subject:dinner body:tomorrow\n"))
+      (let [trained (first (analysis/train-data [{:language "eng" :file training-file}] "naive-bayes"))]
+        (with-open [os (io/output-stream model-file)]
+          (analysis/serialize-and-write-model! (:model trained) os)))
+      (analysis/forget-cached-models!)
+      (let [first-load (analysis/categorizer-for model-file)]
+        (is (identical? first-load (analysis/categorizer-for model-file))
+            "The deserialized model is reused for the next e-mail instead of being read from disk again")
+        (is (= "1" (:name (analysis/categorize-tokens ["sender-domain:shop.example" "subject:invoice" "body:payment"] model-file))))
+        (.setLastModified model-file (+ (.lastModified model-file) 5000))
+        (is (not (identical? first-load (analysis/categorizer-for model-file)))
+            "A replaced model file (new stamp) is loaded afresh"))
+      (finally
+        (analysis/forget-cached-models!)
+        (io/delete-file training-file true)
+        (io/delete-file model-file true))))
+  "Categorizing thousands of e-mails deserializes each model once, not once per e-mail")
+
+(deftest language-detection-never-throws
+  (with-redefs [cld.core/detect (fn [_] (throw (RuntimeException. "detector exploded")))]
+    (is (= analysis/undetected-language (analysis/detect-language "some text that is long enough"))))
+  (is (= analysis/undetected-language (analysis/detect-language "ab")) "Too short to detect")
+  (is (nil? (analysis/detect-language nil)))
+  "A detector failure marks the language as undetected instead of dropping the e-mail")
+
+(deftest a-failing-categorization-still-yields-the-email
+  (with-redefs [analysis/category-for-email (fn [& _] (throw (ex-info "model broken" {})))]
+    (let [enriched (analysis/detect-language-and-categorize-email
+                    {:header {:message-id "x" :subject "Hello"}
+                     :body [{:mime-type "text/plain" :content "Hello world, this is a short english text about invoices."}]
+                     :participants []})]
+      (is (= "x" (-> enriched :header :message-id)))
+      (is (nil? (-> enriched :metadata :category)))
+      (is (some? (-> enriched :metadata :language)) "The language was still detected")))
+  "An exception in the categorizer must not lose the e-mail in the enrichment pipeline")

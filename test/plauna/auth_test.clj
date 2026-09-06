@@ -220,3 +220,32 @@ bzuLfe5C33mbwSNMdxoMu/9snkZOnkLj4oHIyDrEWQ7LkAVv+Lqx0RRp0EU1AOek
       (finally
         (auth/initialize-mtls!))))
   "UI-managed mTLS settings survive a normal Plauna restart")
+
+(deftest login-name-mismatch-still-costs-a-password-check
+  (let [checked (atom 0)]
+    (with-redefs [settings/fetch-setting (fn [key] (when (= key :web-login-name) "alice"))
+                  auth/verify-web-password? (fn [_] (swap! checked inc) true)]
+      (is (false? (auth/verify-web-credentials? "root" "whatever")))
+      (is (= 1 @checked) "A wrong login name does not short-circuit before the (slow) password check")))
+  "The response time does not reveal whether the login name was right")
+
+(deftest login-attempts-slow-down-after-failures
+  (auth/record-login-success!)
+  (is (zero? (auth/login-delay-millis)))
+  (auth/record-login-failure!)
+  (is (= 250 (auth/login-delay-millis)))
+  (dotimes [_ 3] (auth/record-login-failure!))
+  (is (= 4000 (auth/login-delay-millis)))
+  (dotimes [_ 5] (auth/record-login-failure!))
+  (is (= auth/max-login-delay-millis (auth/login-delay-millis)) "The brake is capped so the administrator is never locked out")
+  (auth/record-login-success!)
+  (is (zero? (auth/login-delay-millis)) "A successful login clears the brake"))
+
+(deftest attempts-during-the-pause-are-refused-without-a-password-check
+  (auth/record-login-success!)
+  (is (zero? (auth/login-wait-remaining-millis)))
+  (dotimes [_ 4] (auth/record-login-failure!))
+  (let [remaining (auth/login-wait-remaining-millis)]
+    (is (< 3500 remaining 4001) "Right after four failures the whole 4 s pause is still ahead"))
+  (auth/record-login-success!)
+  (is (zero? (auth/login-wait-remaining-millis))))

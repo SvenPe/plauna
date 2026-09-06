@@ -17,15 +17,20 @@
 
 (defn channel-limiter
   "Backpressure for a producing operation: the producer puts a token on :bucket before each event it
-   sends, and a go-loop drains one token per published target-type event, so the producer can never
-   run more than the bucket size ahead of the consumers.
-   Returns a handle {:bucket ... :target ... :type ...}. The producer MUST call close-limiter! when
+   sends, and a go-loop drains one token per published event of the target type(s), so the producer
+   can never run more than the bucket size ahead of the consumers. target-types is one event type or
+   a set of them: a producer whose input can be DROPPED downstream (an unparseable mbox message never
+   becomes a :parsed-enrichable-email) must also listen to the event the consumer emits for a drop,
+   otherwise the orphaned tokens fill the bucket and the producer blocks forever.
+   Returns a handle {:bucket ... :target ... :types ...}. The producer MUST call close-limiter! when
    it finishes (try/finally): the subscription and its go-loop otherwise leak, and every future event
-   of this type keeps being delivered to the abandoned subscriber."
-  [target-type]
-  (let [bucket-channel (chan @limiter-limit)
+   of these types keeps being delivered to the abandoned subscriber."
+  [target-types]
+  (let [types (if (set? target-types) target-types #{target-types})
+        bucket-channel (chan @limiter-limit)
         target-channel (chan)]
-    (sub @main-publisher target-type target-channel)
+    (doseq [target-type types]
+      (sub @main-publisher target-type target-channel))
     (go-loop []
       (when-some [_ (<! target-channel)]
         ;; Consume a token without blocking: pub/mult only deliver the next event once ALL
@@ -33,13 +38,14 @@
         ;; The producer puts its token before its event, so the token is normally already here.
         (async/poll! bucket-channel)
         (recur)))
-    {:bucket bucket-channel :target target-channel :type target-type}))
+    {:bucket bucket-channel :target target-channel :types types}))
 
 (defn close-limiter!
   "Unsubscribe and close a limiter created by channel-limiter, ending its go-loop. Events published
    after this simply skip the limiter; any in-flight ones no longer need tokens."
-  [{:keys [bucket target type]}]
-  (async/unsub @main-publisher type target)
+  [{:keys [bucket target types]}]
+  (doseq [target-type types]
+    (async/unsub @main-publisher target-type target))
   (close! target)
   (close! bucket))
 

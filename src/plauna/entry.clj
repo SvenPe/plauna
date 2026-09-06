@@ -59,26 +59,117 @@
         (t/log! :warn ["Timed out waiting for event worker" key "to stop."]))))
   (reset! event-loop-workers {}))
 
+(defn- connect-and-prepare!
+  "Connect one stored connection and create the category folders on it. Returns true when it is
+   connected. Failures are logged, never propagated: one unreachable or misbehaving mail server must
+   not keep the web server and the event loops from starting."
+  [context id]
+  (try
+    (let [connection-result (app/connect-to-client context id)]
+      (if (= :ok (:result connection-result))
+        (do (client/create-category-folders! (get @client/connections id) (mapv :name (db/get-categories)))
+            true)
+        (do (t/log! :info ["Connection" id "is not connected; not creating its category folders."])
+            false)))
+    (catch Exception e
+      (t/log! {:level :error :error e} ["Connecting to" id "failed."])
+      false)))
+
 (defn start-imap-client
   [context]
   (let [connections-in-db (db/get-connections)]
     (if (seq connections-in-db)
       (do (t/log! :debug ["Connections table contains" (count connections-in-db) "connection configuration(s)."])
           (doseq [client-config connections-in-db]
-            (let [connection-result (app/connect-to-client context (:id client-config))]
-              (if (= :ok (:result connection-result))
-                (client/create-category-folders! (get @client/connections (:id client-config)) (mapv :name (db/get-categories)))
-                (t/log! :info ["Not connected, not creating folders."])))))
+            (connect-and-prepare! context (:id client-config))))
       (do (t/log! :debug "Connections table in the db is empty. Trying to read connections from the config file.")
           (doseq [client-config (:clients (-> context :config :email))]
             (t/log! :info ["Adding connection data from the config file to the database. Next time Plauna will use the data from the database."])
-            (let [connection-with-id (core.email/construct-imap-connection-from-config-file (conj client-config {:id (client/id-from-config client-config)}))]
-              (db/add-connection connection-with-id)
-              (let [connection-result (app/connect-to-client context (:id connection-with-id))]
-                (if (= :ok (:result connection-result))
-                  (client/create-category-folders! (get @client/connections (:id connection-with-id)) (mapv :name (db/get-categories)))
-                  (t/log! :info ["Connection failed for config:" client-config]))))))))
+            (try
+              (let [connection-with-id (core.email/construct-imap-connection-from-config-file (conj client-config {:id (client/id-from-config client-config)}))]
+                (db/add-connection connection-with-id)
+                (connect-and-prepare! context (:id connection-with-id)))
+              (catch Exception e
+                (t/log! {:level :error :error e} ["Could not add the connection from the config file:" (dissoc client-config :secret)])))))))
   (t/log! :debug "Listening to new emails from listen-channel"))
+
+;; ── Connection retries ─────────────────────────────────────────────────────────
+;; A connection that could not be established at startup (the mail server was still booting, DNS was
+;; not ready) has no ConnectionData and therefore no health check that would ever reconnect it. This
+;; task retries such connections periodically, so a restart of Plauna and its mail server in the wrong
+;; order heals by itself.
+
+(defonce ^:private connection-retry-scheduler (atom nil))
+
+(def connection-retry-interval-seconds 120)
+
+(def connection-retry-max-backoff-seconds
+  "Longest pause between two retries of the same connection. The pause doubles after every failed
+   attempt (2, 4, 8 ... minutes), so a wrong password or a revoked token does not hammer the provider
+   every two minutes forever - providers lock accounts for that - while a server that is merely down
+   is still tried again within the hour."
+  3600)
+
+(defonce ^:private connection-retry-state
+  ;; {connection-id {:attempts n :next-at epoch-millis}}
+  (atom {}))
+
+(defn next-retry-delay-seconds
+  "The pause before retry number attempts (1-based): the interval doubled per earlier failure, capped."
+  [attempts]
+  (min connection-retry-max-backoff-seconds
+       (* connection-retry-interval-seconds (long (Math/pow 2 (dec (max 1 attempts)))))))
+
+(defn- due-for-retry? [id now]
+  (let [{:keys [next-at]} (get @connection-retry-state id)]
+    (or (nil? next-at) (>= now (long next-at)))))
+
+(defn- note-retry-outcome! [id connected? now]
+  (if connected?
+    (swap! connection-retry-state dissoc id)
+    (swap! connection-retry-state update id
+           (fn [{:keys [attempts]}]
+             (let [attempts (inc (long (or attempts 0)))]
+               {:attempts attempts :next-at (+ now (* 1000 (next-retry-delay-seconds attempts)))})))))
+
+(defn- retry-unconnected-connections!
+  "Connect every stored connection that has no live registration and whose back-off pause is over -
+   except OAuth connections that still need the manual login (they would only produce a warning every
+   time)."
+  [context]
+  (let [now (System/currentTimeMillis)]
+    (doseq [connection (db/get-connections)
+            :let [id (:id connection)]
+            :when (nil? (client/connection-data-from-id id))
+            :when (due-for-retry? id now)
+            :when (or (not= "oauth2" (:auth-type connection))
+                      (some? (:refresh-token (db/get-oauth-tokens id))))]
+      (t/log! :info ["Retrying the connection to" (:host connection) "as" (:user connection)])
+      (let [connected? (connect-and-prepare! context id)]
+        (note-retry-outcome! id connected? now)
+        (when connected?
+          (client/forget-disconnected-cache!))))))
+
+(defn start-connection-retries! [context]
+  (when (nil? @connection-retry-scheduler)
+    (let [executor (java.util.concurrent.Executors/newSingleThreadScheduledExecutor
+                    (reify java.util.concurrent.ThreadFactory
+                      (newThread [_ runnable]
+                        (doto (Thread. ^Runnable runnable "plauna-connection-retry") (.setDaemon true)))))]
+      (.scheduleWithFixedDelay executor
+                               ^Runnable (fn []
+                                           (try (retry-unconnected-connections! context)
+                                                (catch Throwable e
+                                                  (t/log! {:level :error :error e} "Retrying unconnected connections failed."))))
+                               (long connection-retry-interval-seconds)
+                               (long connection-retry-interval-seconds)
+                               java.util.concurrent.TimeUnit/SECONDS)
+      (reset! connection-retry-scheduler executor))))
+
+(defn stop-connection-retries! []
+  (when-let [^java.util.concurrent.ScheduledExecutorService executor @connection-retry-scheduler]
+    (.shutdownNow executor)
+    (reset! connection-retry-scheduler nil)))
 
 (defn- register-shutdown-hook!
   "Ensure automatic training, IMAP connections, the web server, and the watchdog are torn down cleanly on SIGTERM
@@ -91,6 +182,7 @@
                 (t/log! :info "Shutdown signal received. Stopping Plauna gracefully.")
                 (doseq [[label teardown]
                         [["automatic training" server/stop-training-scheduler!]
+                         ["connection retries" stop-connection-retries!]
                          ["web server" server/stop-server]
                          ["IMAP connections" client/disconnect-all]
                          ["IMAP health checks" client/stop-health-checks!]
@@ -130,6 +222,7 @@
       (t/set-min-level! (preferences/log-level))
       (diagnostics/start-watchdog! 60)
       (start-imap-client context)
+      (start-connection-retries! context)
       (events/start-event-loops event-register)
       (server/start-server context)
       (server/start-training-scheduler!))))

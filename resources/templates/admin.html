@@ -36,7 +36,7 @@
       <p>Running: {{data.repl.status}}</p>
       {% if data.repl.status %}<p>Port: {{data.repl.port}} </p>{% endif %}
       <form>
-        <input name="redirect-url" type="hidden" value="admin">
+        <input name="redirect-url" type="hidden" value="/admin">
       {% if data.repl.status %}
         <input name="operation" type="hidden" value="stop">
         <button class="btn btn-outline-primary" type="submit" formmethod="post" formaction="repl">Stop REPL</button>

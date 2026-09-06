@@ -66,6 +66,12 @@
 
 (defn add-to-messages [message] (swap! global-messages (fn [messages] (conj messages message))))
 
+(defn take-messages!
+  "Atomically remove and return the pending toasts. A read followed by a separate reset would lose a
+   toast that a background job (parse, move, training) adds in between."
+  []
+  (first (swap-vals! global-messages (constantly []))))
+
 (defn interleave-all [& seqs]
   (reduce (fn [acc index] (into acc (map #(get % index) seqs)))
           []
@@ -107,8 +113,10 @@
    Anything else (an absolute URL, protocol-relative URL, or nil) falls back to `default`, preventing an
    attacker-supplied redirect-url from turning into an open redirect."
   [target default]
+  ;; A backslash is excluded as second character too: browsers normalise \"/\\\\evil.example\" to the
+  ;; protocol-relative \"//evil.example\".
   (if (and (string? target)
-           (re-matches #"/[^/].*|/" target))
+           (re-matches #"/(?:[^/\\].*)?" target))
     target
     default))
 
@@ -139,6 +147,96 @@
   ([request messages]
    (swap! global-messages (fn [m] (conj m messages)))
    {:status 303 :headers {"Location" (safe-redirect-path (get-in request [:params :redirect-url]) (:uri request))}}))
+
+(defn not-found-response [text] {:status 404 :headers html-headers :body (str "Not found: " text)})
+
+(defn bad-request-response [text] {:status 400 :headers html-headers :body (str "Invalid request: " text)})
+
+(defn- decode-message-id
+  "The Message-ID encoded in an /emails/:id URL, or nil when the id is not valid base64."
+  [id]
+  (try (String. ^bytes (base64-decode id) "UTF-8")
+       (catch Exception _ nil)))
+
+(def session-max-age-millis
+  "A login is good for this long; afterwards the browser has to log in again even with a valid cookie."
+  (* 30 24 60 60 1000))
+
+(defn authenticate-session
+  "The session of a browser that just proved who it is: marked authenticated for the current credential
+   generation (see p/session-generation) and stamped with the login time."
+  [session]
+  (assoc session
+         :authenticated true
+         :auth-generation (p/session-generation)
+         :authenticated-at (System/currentTimeMillis)))
+
+(defn authenticated-session?
+  "True for a session that logged in with the CURRENT credentials and not too long ago. A password or
+   login-name change bumps the generation and thereby ends every session created before it - the cookie
+   store is stateless, so nothing else could revoke a leaked cookie. Sessions from before the generation
+   existed carry neither field and stay valid until the credentials change."
+  [session]
+  (boolean
+   (and (:authenticated session)
+        (= (long (or (:auth-generation session) 0)) (long (p/session-generation)))
+        (let [at (:authenticated-at session)]
+          (or (nil? at) (< (- (System/currentTimeMillis) (long at)) session-max-age-millis))))))
+
+(def ^:private auth-provider-columns
+  "The columns of auth_providers an administrator may set. Form field names must never double as SQL
+   identifiers, so everything else a request carries is dropped."
+  [:name :auth_url :token_url :redirect_url :client_id :client_secret :scope])
+
+(defn- auth-provider-fields [params] (select-keys params auth-provider-columns))
+
+(defn- start-mbox-import!
+  "Parse an uploaded mbox on a background thread and report the outcome as a toast. The multipart
+   temp file is moved into Plauna's data folder first: the upload middleware deletes its temp files
+   after a while, which could cut a long import short. The copy is removed when the import ends."
+  [^java.io.File temp-file original-name]
+  (let [target (io/file (files/file-dir) (str "import-" (UUID/randomUUID) ".mbox"))]
+    (io/make-parents target)
+    (when-not (.renameTo temp-file target)
+      (io/copy temp-file target))
+    (async/thread
+      (try
+        (files/read-emails-from-mbox (io/input-stream target) @messaging/main-chan)
+        (add-to-messages {:type :success :content (str "Finished reading the mbox file " original-name ". Its e-mails are being categorized and saved.")})
+        (catch Throwable e
+          (t/log! {:level :error :error e} ["Importing the mbox file" original-name "failed"])
+          (add-to-messages {:type :alert :content (str "Importing the mbox file " original-name " failed. Please see the logs.")}))
+        (finally (io/delete-file target true))))))
+
+(def ^:private redetection-chunk-size 200)
+
+(defn start-language-redetection!
+  "Queue a language detection for every stored e-mail without a language and return how many were
+   queued. The ids are collected first and each e-mail is queued exactly once, on a background thread:
+   paging the 'language IS NULL' set while the detections are still being written asynchronously would
+   queue the same e-mails again and again (and never end when some of them yield no language at all)."
+  []
+  (let [ids (mapv :message-id (db/query-db {:select [:headers.message-id]
+                                             :from [:headers]
+                                             :left-join [:metadata [:= :headers.message-id :metadata.message-id]]
+                                             :where [:= :metadata.language nil]}))]
+    (when (seq ids)
+      (async/thread
+        (let [limiter (messaging/channel-limiter :enriched-email)]
+          (try
+            (t/log! :info ["Re-detecting the language of" (count ids) "e-mail(s) without one."])
+            (doseq [chunk (partition-all redetection-chunk-size ids)
+                    enriched-email (db/fetch-data {:entity :enriched-email :strict false}
+                                                  {:where [:in :headers.message-id (vec chunk)]})]
+              (async/>!! (:bucket limiter) :token)
+              ;; :metadata-only - the e-mails are stored already; only their metadata row is rewritten.
+              (async/>!! @messaging/main-chan {:type :language-detection-request :options {:metadata-only true} :payload enriched-email}))
+            (add-to-messages {:type :success :content (str "Language detection was queued for " (count ids) " e-mail(s).")})
+            (catch Throwable e
+              (t/log! {:level :error :error e} "Re-detecting languages failed.")
+              (add-to-messages {:type :alert :content "Re-detecting languages failed. Please see the logs."}))
+            (finally (messaging/close-limiter! limiter))))))
+    (count ids)))
 
 (defn- normalize-prefs [prefs]
   (mapv #(update % :use_in_training (fn [v] (or (true? v) (= 1 v)))) prefs))
@@ -572,7 +670,18 @@
                            (run-automatic-training!)
                            (when (and (identical? executor @training-scheduler)
                                       (not (.isShutdown executor)))
-                             (schedule-next-daily-training! executor false)))
+                             ;; Re-scheduling reads the preferences again; if that throws (a malformed
+                             ;; time or zone saved meanwhile) the chain must not end silently.
+                             (try
+                               (schedule-next-daily-training! executor false)
+                               (catch Throwable e
+                                 (t/log! {:level :error :error e} "Could not schedule the next automatic training from the preferences; retrying in one hour.")
+                                 (try (.schedule executor
+                                                 ^Runnable (fn [] (when (and (identical? executor @training-scheduler) (not (.isShutdown executor)))
+                                                                    (try (schedule-next-daily-training! executor false)
+                                                                         (catch Throwable inner (t/log! {:level :error :error inner} "Automatic training could not be rescheduled again; it stays off until the preferences are saved or Plauna restarts.")))))
+                                                 (long 1) TimeUnit/HOURS)
+                                      (catch Throwable _ nil))))))
                delay
                TimeUnit/MILLISECONDS)))
 
@@ -633,22 +742,29 @@
      :name       (:name matched)
      :confidence (:confidence category)}))
 
-(defn categorize-uncategorized-n-emails [n]
-  (let [languages-to-use (map :language (db/get-activated-language-preferences))
-        uncategorized-emails (:data (db/fetch-data {:entity :enriched-email :strict false
-                                                    :page {:page 1 :size n}}
-                                                   {:where [:and [:in :language languages-to-use]
-                                                            [:<> :language nil]
-                                                            [:= :category nil]]}))
-        trained-emails (map (fn [email]
-                              (assoc (categorize-email email)
-                                     :message-id (-> email :header :message-id)))
-                            uncategorized-emails)]
-    (doseq [trained-email trained-emails
-            ;; Below-threshold results come back with a nil category; skip them instead of
-            ;; overwriting the row with category nil / confidence 0.
-            :when (some? (:id trained-email))]
-      (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email)))))
+(defn categorize-uncategorized-n-emails
+  "Categorize up to n stored, uncategorized e-mails in the activated training languages. Returns the
+   number of e-mails that received a category. Without an activated language there is nothing to do
+   (and no `IN ()` clause, which MariaDB rejects)."
+  [n]
+  (let [languages-to-use (vec (map :language (db/get-activated-language-preferences)))]
+    (if (empty? languages-to-use)
+      0
+      (let [uncategorized-emails (:data (db/fetch-data {:entity :enriched-email :strict false
+                                                        :page {:page 1 :size n}}
+                                                       {:where [:and [:in :language languages-to-use]
+                                                                [:<> :language nil]
+                                                                [:= :category nil]]}))
+            trained-emails (map (fn [email]
+                                  (assoc (categorize-email email)
+                                         :message-id (-> email :header :message-id)))
+                                uncategorized-emails)]
+        (count
+         (for [trained-email trained-emails
+               ;; Below-threshold results come back with a nil category; skip them instead of
+               ;; overwriting the row with category nil / confidence 0.
+               :when (some? (:id trained-email))]
+           (db/update-metadata-category (:message-id trained-email) (:id trained-email) (:confidence trained-email))))))))
 
 (defn mime-type-statistics []
   ;; Header MIME type represents one value per e-mail. Counting body parts here would count multipart
@@ -851,7 +967,7 @@
     (client/disconnect connection-data))
   (connect-control-response context request id))
 
-(defn empty-global-messages [] (reset! global-messages []))
+(defn empty-global-messages [] (take-messages!))
 
 (defn parse-batch-size
   "Parse the optional batch-size field of the folder parse form. Blank, non-numeric or non-positive
@@ -895,18 +1011,31 @@
       (start-fn batch-id (assoc options
                                 :batch-id batch-id
                                 :on-complete (fn [summary]
-                                               (db/finish-parse-batch! batch-id summary)
+                                               ;; The row must never stay 'running' (the connection page would
+                                               ;; reload itself every 10 s until a restart), and the toast must
+                                               ;; reach the user even when storing the counts fails.
+                                               (try (db/finish-parse-batch! batch-id summary)
+                                                    (catch Exception e
+                                                      (t/log! {:level :error :error e} ["Could not store the result of parse run" batch-id])
+                                                      (try (db/abort-parse-batch! batch-id) (catch Exception _ nil))))
                                                (add-to-messages (summary-message-fn (assoc summary :batch-id batch-id))))))
       (catch Exception e
-        ;; Opening the folder failed before any thread started: close the run so it is not shown as running.
-        (db/finish-parse-batch! batch-id {})
+        ;; Opening the folder failed before any thread started: the run never examined anything, so it
+        ;; is aborted rather than shown as finished with zero counts.
+        (try (db/abort-parse-batch! batch-id) (catch Exception _ nil))
         (throw e)))))
 
 (defn- start-folder-parse!
   "Register a parse run, start it and return the number of messages in the folder. The run's summary
-   is stored when the background thread finishes and surfaced as a toast with a review link."
+   is stored when the background thread finishes and surfaced as a toast with a review link.
+   Throws when the connection is not active or the folder cannot be opened - the route turns that
+   into an alert."
   [context id folder move? batch-size assigned-category]
   (let [conn-data (client/connection-data-from-id id)]
+    (when (or (nil? conn-data) (not (client/connected? conn-data)))
+      (throw (ex-info "The connection is not active. Connect first, then parse." {:type :inactive-connection})))
+    (when (st/blank? folder)
+      (throw (ex-info "No folder given." {:type :no-folder})))
     (run-as-parse-batch! id folder batch-size
                          {:move? move?
                           :batch-size batch-size
@@ -1087,34 +1216,47 @@
            :body "saved-not-moved"})))))
 
 (defmacro result-with-messages [markup-call messages-var]
-  `(if (seq @~messages-var)
-     (let [messages# @~messages-var]
-       (reset! ~messages-var [])
-       (~@markup-call messages#))
-     ~markup-call))
+  `(let [messages# (first (swap-vals! ~messages-var (constantly [])))]
+     (if (seq messages#)
+       (~@markup-call messages#)
+       ~markup-call)))
 
 (defn make-routes [context]
   (comp/routes
 
-   (route/resources "/")
-
    (comp/GET "/login" request
-     (if (get-in request [:session :authenticated])
+     ;; The configured login name is deliberately NOT pre-filled: it is one of the two secrets the login
+     ;; asks for, and the page is the only one an anonymous visitor can see.
+     (if (authenticated-session? (:session request))
        (redirect "/")
-       (success-html-with-body
-        (markup/login-page {:login-name (auth/web-login-name)}))))
+       (success-html-with-body (markup/login-page {}))))
 
    (comp/POST "/login" request
-     (let [login-name     (-> request :params :login-name)
-           password       (-> request :params :password)
-           authenticated (or (get-in request [:session :authenticated])
-                             (auth/verify-web-credentials? login-name password))]
-       (if authenticated
-         (-> (redirect "/")
-             (assoc :session (assoc (:session request) :authenticated true)))
-         (success-html-with-body
-          (markup/login-page {:error "Invalid login name or password."
-                              :login-name (auth/web-login-name)})))))
+     (let [login-name (-> request :params :login-name)
+           password   (-> request :params :password)]
+       (cond
+         (authenticated-session? (:session request))
+         (redirect "/")
+
+         ;; Brake after recent failures (see auth/login-wait-remaining-millis): an attempt that arrives
+         ;; before the pause is over is refused without checking anything - no PBKDF2 work for the
+         ;; guesser, and no request thread parked in a sleep.
+         (pos? (auth/login-wait-remaining-millis))
+         (let [seconds (long (Math/ceil (/ (auth/login-wait-remaining-millis) 1000.0)))]
+           {:status 429
+            :headers (assoc html-headers "Retry-After" (str (max 1 seconds)))
+            :body (markup/login-page {:error (str "Too many failed login attempts. Please wait " (max 1 seconds) " second(s) and try again.")})})
+
+         (auth/verify-web-credentials? login-name password)
+         (do (auth/record-login-success!)
+             (-> (redirect "/")
+                 (assoc :session (authenticate-session (:session request)))))
+
+         :else
+         (do (auth/record-login-failure!)
+             (t/log! :warn "Rejected a web login attempt: wrong login name or password.")
+             (success-html-with-body
+              (markup/login-page {:error "Invalid login name or password."}))))))
 
    (comp/GET "/logout" {}
      (-> (redirect "/login") (assoc :session nil)))
@@ -1212,7 +1354,11 @@
          (redirect-request request {:type :alert :content "Current password is incorrect."})
          (try
            (auth/set-login-name! login-name)
-           (redirect-request request {:type :success :content "Login name changed successfully."})
+           ;; Every other session was established with the old credentials: end them all, and renew
+           ;; this one so the administrator stays logged in.
+           (p/bump-session-generation!)
+           (assoc (redirect-request request {:type :success :content "Login name changed successfully."})
+                  :session (authenticate-session (:session request)))
            (catch clojure.lang.ExceptionInfo e
              (redirect-request request {:type :alert :content (.getMessage e)}))))))
 
@@ -1230,13 +1376,16 @@
 
          :else
          (do (auth/set-password! new-password)
-             (redirect-request request {:type :success :content "Password changed successfully."})))))
+             ;; A changed password must end every other session (a leaked cookie stays valid otherwise);
+             ;; the administrator's own session is renewed.
+             (p/bump-session-generation!)
+             (assoc (redirect-request request {:type :success :content "Password changed successfully. Other browsers have been logged out."})
+                    :session (authenticate-session (:session request)))))))
 
    (comp/GET "/admin/mtls" request
-     (let [messages @global-messages
+     (let [messages (take-messages!)
            state    (assoc (auth/mtls-admin-state)
                            :current-certificate (auth/mtls-admin-certificate-state request))]
-       (reset! global-messages [])
        (success-html-with-body
         (if (seq messages)
           (markup/mtls-page state messages)
@@ -1249,28 +1398,23 @@
        (catch clojure.lang.ExceptionInfo e
          (redirect-request request {:type :alert :content (.getMessage e)}))))
 
-   (comp/GET "/" {} (let [data (db/yearly-email-stats)]
-                      (if (> (count data) 0)
-                        {:status  302
-                         :headers {"Location" "/emails"}}
-                        {:status  302
-                         :headers {"Location" "/admin"}})))
+   (comp/GET "/" {} {:status  302
+                     :headers {"Location" (if (db/any-emails?) "/emails" "/admin")}})
 
    (comp/GET "/admin" {}
-     (if (seq @global-messages)
-       (let [messages @global-messages]
-         (swap! global-messages (fn [_] []))
-         (success-html-with-body (markup/administration {:repl (get-status-repl-server)} messages)))
-       (success-html-with-body (markup/administration {:repl (get-status-repl-server)}))))
+     (success-html-with-body (result-with-messages (markup/administration {:repl (get-status-repl-server)}) global-messages)))
 
    (comp/POST "/emails/parse" request
-     (let [temp-file (get-in request [:params :filename :tempfile])]
-       (files/read-emails-from-mbox (io/input-stream temp-file) @messaging/main-chan)
-       (redirect-request request {:type :success :content (str "Starting to parse file: " temp-file)})))
+     (let [upload (get-in request [:params :filename])
+           ^java.io.File temp-file (when (map? upload) (:tempfile upload))]
+       (if (or (nil? temp-file) (not (.exists temp-file)) (zero? (.length temp-file)))
+         (redirect-request request {:type :alert :content "Please choose a non-empty mbox file to upload."})
+         (do (start-mbox-import! temp-file (str (:filename upload)))
+             (redirect-request request {:type :success :content (str "Importing the mbox file " (:filename upload) " in the background. Its e-mails appear in the list as they are processed; a message reports when the file has been read completely.")})))))
 
    (comp/GET "/admin/categories" {}
      (let [categories (db/get-categories)]
-       (success-html-with-body (markup/categories-page categories))))
+       (success-html-with-body (result-with-messages (markup/categories-page categories) global-messages))))
 
    (comp/GET "/admin/languages" {}
      (success-html-with-body
@@ -1329,26 +1473,28 @@
                                 (vectorize (:id params))
                                 (vectorize (:language params)))]
          (db/update-language-preference preference)))
+     ;; Categorization caches the activated languages briefly; a change must apply at once.
+     (analysis/clear-reference-cache!)
      (let [language-preferences (language-preferences)]
        (success-html-with-body (markup/languages-admin-page language-preferences))))
 
    (comp/POST "/admin/categories" {params :params}
-     (app/create-new-category! context (:name params) (:destination-folder params) (:color params))
-     {:status  301
-      :headers {"Location" "/admin/categories"}
-      :body    (markup/administration {:repl (get-status-repl-server)})})
+     (if-let [problem (app/category-name-problem (:name params))]
+       (do (add-to-messages {:type :alert :content problem})
+           (redirect "/admin/categories" 303))
+       (do (app/create-new-category! context (st/trim (:name params)) (:destination-folder params) (:color params))
+           (analysis/clear-reference-cache!)
+           (redirect "/admin/categories" 303))))
 
    (comp/POST "/admin/categories/:id" {route-params :route-params params :params}
      (app/update-category! context (:id route-params) (:name params) (:destination-folder params) (:color params))
-     {:status  301
-      :headers {"Location" "/admin/categories"}
-      :body    (markup/administration {:repl (get-status-repl-server)})})
+     (analysis/clear-reference-cache!)
+     (redirect "/admin/categories" 303))
 
    (comp/DELETE "/admin/categories/:id" {route-params :route-params}
      (db/delete-category-by-id (Integer/parseInt (:id route-params)))
-     {:status  301
-      :headers {"Location" "/admin/categories"}
-      :body    (markup/administration {:repl (get-status-repl-server)})})
+     (analysis/clear-reference-cache!)
+     (redirect "/admin/categories" 303))
 
    (comp/POST "/admin/database" {}
      (files/check-and-create-database-file)
@@ -1376,8 +1522,12 @@
      ;; and avoid leaving an empty string that confuses enriched-only filters.
      (let [{:keys [message-id language]} (:params request)
            lang (when (seq language) language)]
-       (db/update-metadata-language message-id lang 1.0)
-       {:status 204}))
+       (if (and (seq message-id) (db/email-exists? message-id))
+         (do (db/update-metadata-language message-id lang 1.0)
+             {:status 204})
+         ;; metadata.message_id references headers: without the e-mail the insert would fail with a
+         ;; constraint violation and a 500.
+         {:status 404 :headers {"Content-Type" "text/plain; charset=UTF-8"} :body "email-not-found"})))
 
    (comp/POST "/metadata" request
      ;; The n/a category is submitted as a blank string; only enter the move branch for a real
@@ -1414,9 +1564,10 @@
       :body (generate-string (training-status))})
 
    (comp/POST "/training/new" request
-     (let [n (get (:route-params request) :new 20)]
-       (categorize-uncategorized-n-emails n)
-       (redirect-request request)))
+     ;; The number of e-mails is an optional form field (`count`); the route has no path parameter.
+     (let [n (-> (or (parse-long (str (get-in request [:params :count]))) 20) (max 1) (min 500))
+           categorized (categorize-uncategorized-n-emails n)]
+       (redirect-request request {:type :success :content (str "Categorized " categorized " of up to " n " uncategorized e-mail(s).")})))
 
    (comp/GET "/emails" {params :params}
      (let [parse-fn (template->request-parameters emails-template)
@@ -1457,22 +1608,28 @@
          (redirect (str "/admin/connections/" (:connection-id batch)) 303))))
 
    (comp/GET "/emails/:id" [id]
-     (let [decoded-id (new String ^"[B" (base64-decode id))
-           email-data (add-sanitized-text-to-enriched-email (enriched-email-by-message-id decoded-id))
-           categories (conj (db/get-categories) {:id nil :name "n/a"})]
-       (success-html-with-body (result-with-messages (markup/list-email-contents email-data categories) global-messages))))
+     (if-let [decoded-id (decode-message-id id)]
+       (if-let [email (enriched-email-by-message-id decoded-id)]
+         (let [email-data (add-sanitized-text-to-enriched-email email)
+               categories (conj (db/get-categories) {:id nil :name "n/a"})]
+           (success-html-with-body (result-with-messages (markup/list-email-contents email-data categories) global-messages)))
+         (not-found-response "This e-mail is not stored (any more)."))
+       (bad-request-response "Invalid e-mail id.")))
 
    (comp/DELETE "/emails/:id" [id]
-     (db/delete-email-by-message-id (new String ^"[B" (base64-decode id)))
-     {:status  200})
+     (if-let [decoded-id (decode-message-id id)]
+       (do (db/delete-email-by-message-id decoded-id)
+           {:status 200})
+       (bad-request-response "Invalid e-mail id.")))
 
    (comp/POST "/emails/:id/refetch" [id :as request]
-     (add-to-messages (refetch-email-and-fill! (new String ^"[B" (base64-decode id))))
-     (redirect-to-referer request))
+     (if-let [decoded-id (decode-message-id id)]
+       (do (add-to-messages (refetch-email-and-fill! decoded-id))
+           (redirect-to-referer request))
+       (bad-request-response "Invalid e-mail id.")))
 
    (comp/GET "/admin/connections" _
-     (let [messages @global-messages]
-       (empty-global-messages)
+     (let [messages (take-messages!)]
        (if (seq messages)
          (success-html-with-body (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)) messages))
          (success-html-with-body (markup/connections-list (mapv (fn [conn] (merge conn (client/monitor->map (get @client/connections (:id conn))))) (db/get-connections)))))))
@@ -1507,7 +1664,8 @@
 
    (comp/POST "/admin/auth-providers" request
      (let [params (:params request)]
-       (db/add-auth-provider (dissoc params :redirect-url))
+       ;; Only the known columns reach the INSERT: the form field names must not double as SQL identifiers.
+       (db/add-auth-provider (auth-provider-fields params))
        (if (= "/admin/connections/" (:redirect-url params))
          (redirect-request (assoc-in request [:params :redirect-url] "/admin/new-connection"))
          (redirect-request request))))
@@ -1515,7 +1673,12 @@
    (comp/PUT "/admin/auth-providers/:id" request
      (let [params (:params request)
            existing (db/get-auth-provider (:id params))]
-       (db/update-auth-provider (auth-provider-update-from-params params existing))))
+       (db/update-auth-provider (-> (auth-provider-fields params)
+                                    (auth-provider-update-from-params existing)
+                                    (assoc :id (:id params))))
+       ;; The handler used to end with the JDBC result vector, which Compojure cannot render (a 500
+       ;; after a successful update).
+       {:status 204}))
 
    (comp/GET "/admin/connections/:id/activity" request
      {:status 200
@@ -1547,11 +1710,10 @@
    (comp/GET "/admin/connections/:id" [id]
      (let [conn-info (merge (connection-information id) (connection-parse-batches id) (connection-parse-failures id) (connection-folder-emails id))
            providers (without-provider-secrets (db/get-auth-providers))
-           categories (db/get-categories)]
-       (if (seq @global-messages)
-         (let [messages @global-messages]
-           (swap! global-messages (fn [_] []))
-           (success-html-with-body (markup/connection (assoc conn-info :auth-providers providers) (connection-folders conn-info) messages categories)))
+           categories (db/get-categories)
+           messages (take-messages!)]
+       (if (seq messages)
+         (success-html-with-body (markup/connection (assoc conn-info :auth-providers providers) (connection-folders conn-info) messages categories))
          (success-html-with-body (markup/connection (assoc conn-info :auth-providers providers) (connection-folders conn-info) categories)))))
 
    (comp/PUT "/admin/connections/:id" request
@@ -1564,31 +1726,35 @@
      (let [id (:id (:route-params request))
            operation (:operation (:params request))]
        (cond (= "reconnect" operation) (reconnect-control-response context request id)
-             (= "disconnect" operation) (do (client/disconnect (client/connection-data-from-id id)) (redirect-request request))
+             (= "disconnect" operation) (do (if-let [connection-data (client/connection-data-from-id id)]
+                                              (client/disconnect connection-data)
+                                              (t/log! :info ["Connection" id "is not registered; nothing to disconnect."]))
+                                            (client/forget-disconnected-cache!)
+                                            (redirect-request request))
              (= "connect" operation) (connect-control-response context request id)
              (= "parse" operation) (let [params (:params request)
                                          folder (:folder params)
                                          move (some? (:move params))
                                          batch-size (parse-batch-size (:batch-size params))
-                                         assigned-category (when-not (st/blank? (:assigned-category params)) (db/category-by-id (:assigned-category params)))
-                                         message-count (start-folder-parse! context id folder move batch-size assigned-category)]
-                                     (swap! global-messages (fn [mess] (conj mess {:type :success :content (str "Started parsing " folder " asynchronously. There are " message-count " emails in the folder. "
-                                                                                                                (if batch-size
-                                                                                                                  (str "Batch size: " batch-size " new e-mails; already stored e-mails are skipped and do not count. ")
-                                                                                                                  "Batch size: unlimited (whole folder). ")
-                                                                                                                "Move folders after parsing: " move)})))
-                                     (redirect-request request)))))
+                                         assigned-category (when-not (st/blank? (:assigned-category params)) (db/category-by-id (:assigned-category params)))]
+                                     (try
+                                       (let [message-count (start-folder-parse! context id folder move batch-size assigned-category)]
+                                         (redirect-request request {:type :success :content (str "Started parsing " folder " asynchronously. There are " message-count " emails in the folder. "
+                                                                                                (if batch-size
+                                                                                                  (str "Batch size: " batch-size " new e-mails; already stored e-mails are skipped and do not count. ")
+                                                                                                  "Batch size: unlimited (whole folder). ")
+                                                                                                "Move folders after parsing: " move)}))
+                                       (catch clojure.lang.ExceptionInfo e
+                                         (redirect-request request {:type :alert :content (.getMessage e)}))
+                                       (catch Exception e
+                                         ;; Typically the folder does not exist or the store dropped: an alert, not an error page.
+                                         (t/log! {:level :warn :error e} ["Could not start parsing folder" folder "of connection" id])
+                                         (redirect-request request {:type :alert :content (str "Could not start parsing " folder ": " (.getMessage e))}))))
+             :else (redirect-request request {:type :alert :content (str "Unknown connection operation: " operation)}))))
 
    (comp/POST "/metadata/languages" request
-     (let [limiter (messaging/channel-limiter :enriched-email)
-           process-fn (fn [enriched-emails]
-                        (doseq [enriched-email enriched-emails]
-                          (async/>!! (:bucket limiter) :token)
-                          (async/>!! @messaging/main-chan {:type :language-detection-request :options {} :payload enriched-email})))]
-       (try
-         (core-email/iterate-over-all-pages db/fetch-data process-fn {:entity :enriched-email :strict false :page {:page 1 :size 500}} {:where [:= :language nil]} true)
-         (finally (messaging/close-limiter! limiter))))
-     (redirect-request request))
+     (let [queued (start-language-redetection!)]
+       (redirect-request request {:type :info :content (str "Re-detecting the language of " queued " e-mail(s) without one in the background.")})))
 
    (comp/POST "/repl" request
      (let [operation (get-in request [:params :operation])]
@@ -1618,7 +1784,10 @@
              (assoc (redirect "/admin/connections")
                     :session (dissoc session :oauth-csrf :connection-id :provider-id :provider))))))
 
-   (route/resources "/")))
+   (route/resources "/")
+
+   ;; Without this, an unknown URL makes the routes return nil, which the server answers with a 500.
+   (route/not-found (not-found-response "There is no such page."))))
 
 (defn upload-progress [_ bytes-read content-length item-count]
   (t/log! {:level :info
@@ -1638,21 +1807,50 @@
       (= uri "/plauna-banner.png")
       (= uri "/site.webmanifest")))
 
+(def ^:private state-changing-methods #{:post :put :delete :patch})
+
+(defn- request-host
+  "The host the browser addressed: the reverse proxy's X-Forwarded-Host when present, else Host."
+  [request]
+  (or (get-in request [:headers "x-forwarded-host"]) (get-in request [:headers "host"])))
+
+(defn cross-site-request?
+  "True when a state-changing request carries an Origin header naming a different site than the one the
+   browser addressed. Browsers always send Origin on cross-site POSTs; requests without one (non-browser
+   clients) are not judged."
+  [request]
+  (let [origin (get-in request [:headers "origin"])]
+    (boolean
+     (and origin
+          (contains? state-changing-methods (:request-method request))
+          (or (= "null" origin)
+              (not= (try (.getAuthority (java.net.URI. ^String origin)) (catch Exception _ nil))
+                    (request-host request)))))))
+
 (defn wrap-authentication
   "Require a logged-in session or an allowlisted mTLS client certificate for every non-public
    request. A successful certificate authentication is promoted to the normal signed browser
-   session; invalid or unconfigured proxy headers fall back to the password login."
+   session; invalid or unconfigured proxy headers fall back to the password login.
+   Sessions end when the password or login name changes (see authenticated-session?).
+   A certificate-authenticated state-changing request from another site is refused: the browser
+   presents the client certificate to the proxy for cross-site requests too, so the SameSite rule that
+   protects cookie sessions against CSRF does not cover this login path."
   [handler]
   (fn [request]
-    (let [already-authenticated?     (get-in request [:session :authenticated])
+    (let [already-authenticated?     (authenticated-session? (:session request))
           certificate-authenticated? (and (not already-authenticated?)
                                           (auth/mtls-request-authorized? request))
           authenticated-request      (if certificate-authenticated?
-                                       (assoc-in request [:session :authenticated] true)
+                                       (assoc request :session (authenticate-session (:session request)))
                                        request)]
-      (if (or (public-path? (:uri request))
-              already-authenticated?
-              certificate-authenticated?)
+      (cond
+        (and certificate-authenticated? (cross-site-request? request))
+        (do (t/log! :warn ["Refused a cross-site" (name (:request-method request)) "to" (:uri request) "authenticated only by a client certificate."])
+            {:status 403 :headers html-headers :body "Cross-site request refused."})
+
+        (or (public-path? (:uri request))
+            already-authenticated?
+            certificate-authenticated?)
         (let [response (handler authenticated-request)]
           ;; Ring only persists a modified request session when the response carries :session.
           ;; Respect explicit route decisions such as /logout setting it to nil.
@@ -1661,6 +1859,8 @@
                    (not (contains? response :session)))
             (assoc response :session (:session authenticated-request))
             response))
+
+        :else
         (redirect "/login")))))
 
 (defn wrap-exception-handling
@@ -1697,13 +1897,16 @@
         response))))
 
 (defn app [context] (-> (fn [req] ((make-routes context) req))
-                        wrap-authentication
                         wrap-keyword-params
                         (wrap-multipart-params {:progress-fn upload-progress})
                         wrap-params
+                        ;; Authentication runs BEFORE the body is parsed: an anonymous request must not be
+                        ;; able to make the server read (and spool to disk) an arbitrarily large multipart
+                        ;; upload. Authentication only needs the session and the headers.
+                        wrap-authentication
                         wrap-exception-handling
                         wrap-static-asset-revalidation
-                        (wrap-session {:store (cookie-store {:key (settings/session-key)})
+                        (wrap-session {:store (cookie-store {:key (.getBytes ^String (settings/session-key) "UTF-8")})
                                        ;; HttpOnly keeps the cookie out of JS; SameSite=Lax blocks forged
                                        ;; cross-site POSTs (CSRF) while still allowing the OAuth provider's
                                        ;; top-level redirect back to /oauth2/callback to carry the session.

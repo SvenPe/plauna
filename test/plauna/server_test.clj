@@ -179,8 +179,11 @@
                              :headers {}})]
       (is (= 200 (:status response)))
       (is (= "secret" (:body response)))
-      (is (= {:oauth-csrf "keep-me" :authenticated true} (:session response))
-          "The signed browser session is established without discarding other session state")))
+      (is (= {:oauth-csrf "keep-me" :authenticated true}
+             (select-keys (:session response) [:oauth-csrf :authenticated]))
+          "The signed browser session is established without discarding other session state")
+      (is (contains? (:session response) :auth-generation) "The promoted session is bound to the current credential generation")
+      (is (number? (get-in response [:session :authenticated-at])) "The promoted session carries its login time")))
   "An allowlisted client certificate bypasses the password and creates a normal session")
 
 (deftest wrap-authentication-does-not-trust-unapproved-mtls-request
@@ -214,6 +217,7 @@
   "Saving through the admin endpoint uses PRG and activates the settings immediately")
 
 (deftest password-login-requires-the-configured-login-name
+  (auth/record-login-success!)
   (with-redefs [auth/verify-web-credentials? #(and (= "alice" %1) (= "admin-password" %2))
                 auth/web-login-name (constantly "alice")]
     (let [valid-response ((server/make-routes {})
@@ -233,9 +237,12 @@
   "A correct password cannot authenticate under a different login name")
 
 (deftest login-name-change-requires-the-current-password
-  (let [saved (atom nil)]
+  (let [saved (atom nil)
+        bumped (atom 0)]
     (with-redefs [auth/verify-web-password? #(= "admin-password" %)
-                  auth/set-login-name! #(reset! saved %)]
+                  auth/set-login-name! #(reset! saved %)
+                  preferences/bump-session-generation! (fn [] (swap! bumped inc))
+                  preferences/session-generation (fn [] @bumped)]
       (let [response ((server/make-routes {})
                       {:request-method :post
                        :uri "/admin/login-name"
@@ -244,7 +251,9 @@
                                 :redirect-url "/admin"}
                        :session {:authenticated true}})]
         (is (= "alice" @saved))
-        (is (= 303 (:status response)))))
+        (is (= 303 (:status response)))
+        (is (= 1 @bumped) "Changing the login name ends every other session")
+        (is (= 1 (get-in response [:session :auth-generation])) "The administrator's own session is renewed for the new generation")))
     (reset! saved nil)
     (with-redefs [auth/verify-web-password? (constantly false)
                   auth/set-login-name! #(reset! saved %)]
@@ -650,3 +659,107 @@
     (is (= :info (:type message)))
     (is (str/includes? (:content message) "Moved 90 of 95 categorized e-mail(s) of the folder Old"))
     (is (str/includes? (:content message) "5 were not found"))))
+
+(deftest safe-redirect-path-rejects-backslash-protocol-relative-targets
+  (is (= "/emails" (server/safe-redirect-path "/emails" "/")))
+  (is (= "/" (server/safe-redirect-path "/" "/x")))
+  (is (= "/x" (server/safe-redirect-path "//evil.example" "/x")))
+  (is (= "/x" (server/safe-redirect-path "/\\evil.example" "/x")) "Browsers read /\\host as //host")
+  (is (= "/x" (server/safe-redirect-path "https://evil.example" "/x")))
+  (is (= "/x" (server/safe-redirect-path nil "/x"))))
+
+(deftest cross-site-state-changing-requests-are-recognised
+  (is (true? (server/cross-site-request? {:request-method :post :headers {"origin" "https://evil.example" "host" "plauna.example"}})))
+  (is (false? (server/cross-site-request? {:request-method :post :headers {"origin" "https://plauna.example" "host" "plauna.example"}})))
+  (is (false? (server/cross-site-request? {:request-method :post :headers {"origin" "https://plauna.example" "host" "plauna:8080" "x-forwarded-host" "plauna.example"}}))
+      "Behind a reverse proxy the forwarded host counts")
+  (is (false? (server/cross-site-request? {:request-method :get :headers {"origin" "https://evil.example" "host" "plauna.example"}})) "Reads are not judged")
+  (is (false? (server/cross-site-request? {:request-method :post :headers {"host" "plauna.example"}})) "Non-browser clients send no Origin"))
+
+(deftest certificate-authenticated-cross-site-posts-are-refused
+  (with-redefs [auth/mtls-request-authorized? (constantly true)]
+    (let [handler (server/wrap-authentication ok-handler)]
+      (is (= 403 (:status (handler {:uri "/admin/categories" :request-method :post :session {}
+                                    :headers {"origin" "https://evil.example" "host" "plauna.example"}}))))
+      (is (= 200 (:status (handler {:uri "/admin/categories" :request-method :post :session {}
+                                    :headers {"origin" "https://plauna.example" "host" "plauna.example"}}))))))
+  "The browser presents the client certificate for cross-site requests too, so SameSite cannot protect this login path")
+
+(deftest sessions-end-when-the-credential-generation-changes
+  (with-redefs [preferences/session-generation (fn [] 3)]
+    (let [handler (server/wrap-authentication ok-handler)
+          now (System/currentTimeMillis)]
+      (is (= 200 (:status (handler {:uri "/emails" :session {:authenticated true :auth-generation 3 :authenticated-at now}}))))
+      (is (= 302 (:status (handler {:uri "/emails" :session {:authenticated true :auth-generation 2 :authenticated-at now}})))
+          "A session from before a password change is no longer accepted")
+      (is (= 302 (:status (handler {:uri "/emails" :session {:authenticated true :auth-generation 3 :authenticated-at (- now server/session-max-age-millis 1000)}})))
+          "A login older than the maximum age is no longer accepted")
+      (is (= 302 (:status (handler {:uri "/emails" :session {:authenticated true}})))
+          "A session from before generations existed counts as generation 0")))
+  "A leaked cookie is worthless after the password changes or a month has passed")
+
+(deftest pending-toasts-are-taken-atomically
+  (server/empty-global-messages)
+  (server/add-to-messages {:type :info :content "one"})
+  (server/add-to-messages {:type :info :content "two"})
+  (let [taken (server/take-messages!)]
+    (is (= ["one" "two"] (mapv :content taken)))
+    (is (empty? (server/take-messages!)) "Taking empties the queue in the same step")))
+
+(deftest categorizing-without-activated-languages-does-nothing
+  (with-redefs [db/get-activated-language-preferences (constantly [])
+                db/fetch-data (fn [& _] (throw (ex-info "must not query with an empty IN list" {})))]
+    (is (= 0 (server/categorize-uncategorized-n-emails 20))))
+  "No activated language means no `IN ()` clause and no work")
+
+(deftest unknown-urls-and-malformed-email-ids-get-proper-status-codes
+  (with-redefs [client/disconnected-connections (fn [] [])]
+    (let [routes (server/make-routes {})]
+      (is (= 404 (:status (routes {:request-method :get :uri "/no/such/page" :session {:authenticated true}}))))
+      (is (= 400 (:status (routes {:request-method :get :uri "/emails/not*base64!" :session {:authenticated true}}))))
+      (is (= 400 (:status (routes {:request-method :delete :uri "/emails/not*base64!" :session {:authenticated true}}))))))
+  "An unknown page is a 404 and a garbled e-mail id a 400, never a 500")
+
+(deftest auth-provider-update-answers-204-and-writes-only-known-columns
+  (let [updated (atom nil)]
+    (with-redefs [db/get-auth-provider (fn [_] {:id 7 :client-secret "keep-me"})
+                  db/update-auth-provider (fn [provider] (reset! updated provider))]
+      (let [response ((server/make-routes {})
+                      {:request-method :put :uri "/admin/auth-providers/7"
+                       :params {:name "Google" :client_id "cid" :client_secret "" :scope "mail" :auth_url "a" :token_url "t" :redirect_url "r" :evil "DROP TABLE" :redirect-url "/x"}
+                       :session {:authenticated true}})]
+        (is (= 204 (:status response)))
+        (is (= {:id "7" :name "Google" :client_id "cid" :client_secret "keep-me" :scope "mail" :auth_url "a" :token_url "t" :redirect_url "r"} @updated)
+            "Unknown form fields never reach the SQL, and a blank secret keeps the stored one"))))
+  "The provider update no longer returns the JDBC result (which rendered as a 500)")
+
+(deftest connection-controls-answer-unknown-operations-and-inactive-connections-with-alerts
+  (server/empty-global-messages)
+  (with-redefs [client/connection-data-from-id (fn [_] nil)]
+    (let [routes (server/make-routes {})
+          control (fn [params] (routes {:request-method :post :uri "/admin/connections/c1/controls"
+                                        :params (assoc params :redirect-url "/admin/connections/c1")
+                                        :session {:authenticated true}}))
+          unknown (control {:operation "explode"})
+          disconnect (control {:operation "disconnect"})
+          parse (control {:operation "parse" :folder "INBOX"})]
+      (is (= 303 (:status unknown)))
+      (is (= 303 (:status disconnect)) "Disconnecting an unregistered connection is a no-op, not a 500")
+      (is (= 303 (:status parse)))
+      (let [messages (server/take-messages!)]
+        (is (some #(str/includes? (:content %) "Unknown connection operation") messages))
+        (is (some #(str/includes? (:content %) "not active") messages) "Parsing on an inactive connection is refused with an alert"))))
+  "Connection controls never answer ordinary mistakes with an error page")
+
+(deftest login-attempts-during-the-brake-are-refused-with-429
+  (auth/record-login-success!)
+  (with-redefs [auth/verify-web-credentials? (fn [_ _] false)]
+    (let [routes (server/make-routes {})
+          attempt (fn [] (routes {:request-method :post :uri "/login" :params {:login-name "x" :password "y"} :session {}}))]
+      (is (= 200 (:status (attempt))) "The first wrong guess is answered normally")
+      (let [second-response (attempt)]
+        (is (= 429 (:status second-response)) "A guess arriving inside the pause is refused outright")
+        (is (some? (get-in second-response [:headers "Retry-After"])))
+        (is (str/includes? (:body second-response) "Too many failed login attempts")))))
+  (auth/record-login-success!)
+  "The brake refuses fast retries instead of parking a request thread")

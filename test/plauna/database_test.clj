@@ -279,3 +279,57 @@
   (db/create-parse-batch! {:id "batch-skip" :connection-id "conn-s" :folder "Old" :batch-size 100})
   (db/finish-parse-batch! "batch-skip" {:processed 1 :skipped 10 :skipped-elsewhere 4 :errors 0 :remaining 0})
   (is (= [10 4] ((juxt :skipped :skipped-elsewhere) (db/parse-batch "batch-skip")))))
+
+(deftest body-inserts-are-chunked-by-rows-and-size
+  (let [small (repeat 250 {:message-id "m" :content "x"})
+        chunks (db/chunk-bodies small)]
+    (is (= [100 100 50] (mapv count chunks)))
+    (is (= 250 (reduce + (map count chunks)))))
+  (let [big-content (apply str (repeat (* 2 1024 1024) "y"))
+        chunks (db/chunk-bodies [{:content big-content} {:content big-content} {:content "small"}])]
+    (is (= [1 2] (mapv count chunks)) "Two 2M bodies never share one statement (MariaDB max_allowed_packet); a small one still joins"))
+  (is (= [] (db/chunk-bodies [])))
+  "One multi-row INSERT never grows beyond what MariaDB accepts")
+
+(deftest a-failed-batch-is-retried-email-by-email
+  (let [saved (atom [])
+        attempts (atom 0)
+        buffer (->> (db/empty-buffer)
+                    (db/add-to-buffer {:header {:message-id "ok-1"} :body [{:message-id "ok-1" :content "a"}] :participants [] :metadata {:message-id "ok-1"}})
+                    (db/add-to-buffer {:header {:message-id "bad"} :body [] :participants []})
+                    (db/add-to-buffer {:header {:message-id "ok-2"} :body [] :participants []}))]
+    (with-redefs [db/save-emails-in-buffer (fn [b]
+                                             (swap! attempts inc)
+                                             (when (some #(= "bad" (:message-id %)) (:headers b))
+                                               (throw (ex-info "column too long" {})))
+                                             (swap! saved conj (mapv :message-id (:headers b))))]
+      (#'db/save-buffer-logging-errors! buffer))
+    (is (= [["ok-1"] ["ok-2"]] @saved) "The two good e-mails are saved individually; only the rejected one is lost")
+    (is (= 4 @attempts) "One batch attempt plus one attempt per e-mail"))
+  "A row the database rejects costs that e-mail, not the other 499 of the batch")
+
+(deftest metadata-only-events-buffer-nothing-but-metadata
+  (let [buffer (db/add-to-buffer {:header {:message-id "m"} :body [{:message-id "m"}] :participants [{:message-id "m"}] :metadata {:message-id "m" :language "eng"}}
+                                 (db/empty-buffer)
+                                 true)]
+    (is (empty? (:headers buffer)))
+    (is (empty? (:bodies buffer)))
+    (is (= [{:message-id "m" :language "eng"}] (:metadata buffer)))
+    (is (= 1 (db/buffer-size buffer)))
+    (is (= [{:headers [] :bodies [] :participants [] :metadata [{:message-id "m" :language "eng"}] :count 1}]
+           (db/buffer->single-email-buffers buffer))))
+  "Re-enriching a stored e-mail rewrites its metadata without re-inserting bodies (and duplicating attachment rows)")
+
+(deftest unknown-connection-id-yields-nil
+  (is (nil? (db/get-connection "no-such-connection"))))
+
+(deftest content-search-ids-are-resolved-literally
+  (db/save-emails-in-buffer
+   (db/add-to-buffer {:header {:message-id "search-1" :subject "s" :date 1 :mime-type "text/plain" :in-reply-to nil}
+                      :body [{:message-id "search-1" :mime-type "text/plain" :charset "utf-8" :transfer-encoding nil
+                              :content "the needle_in a haystack" :filename nil :content-disposition nil}]
+                      :participants []}
+                     (db/empty-buffer)))
+  (is (= ["search-1"] (db/content-match-message-ids "needle_in")))
+  (is (= [] (db/content-match-message-ids "needle%in")) "LIKE wildcards in the search text are literal")
+  "The one-time body search resolution finds exactly the bodies containing the text")

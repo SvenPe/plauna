@@ -15,15 +15,26 @@
    :categorization-algorithm     "naive-bayes"
    :client-health-check-interval 60
    :automatic-training-time      "02:00"
-   :time-zone                    (.getId (ZoneId/systemDefault))})
+   :time-zone                    (.getId (ZoneId/systemDefault))
+   :session-generation           0})
 
 (defn- settings-path []
   (str (files/file-dir) "/settings.json"))
 
-(defn load-settings []
+(defn load-settings
+  "The settings map: defaults overlaid with settings.json. A file that is not valid JSON is reported
+   with its path instead of a bare parser error, and is never silently replaced by defaults - that
+   would discard the session key, the login name and the mTLS configuration."
+  []
   (let [f (io/file (settings-path))]
     (if (.exists f)
-      (merge defaults (json/parse-string (slurp f) true))
+      (let [parsed (try (json/parse-string (slurp f) true)
+                        (catch Exception e
+                          (throw (ex-info (str "The settings file " (settings-path) " is not valid JSON. Fix or remove it, then start Plauna again.")
+                                          {:path (settings-path)} e))))]
+        (when-not (map? parsed)
+          (throw (ex-info (str "The settings file " (settings-path) " must contain a JSON object.") {:path (settings-path)})))
+        (merge defaults parsed))
       defaults)))
 
 (defn save-settings! [m]

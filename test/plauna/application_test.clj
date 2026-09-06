@@ -282,14 +282,22 @@
   "Return an error result of something goes wrong with the database")
 
 (deftest handle-incoming-email-client-exception
-  (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
+  ;; The e-mail is saved BEFORE the move. A move that throws (missing target folder, dropped
+  ;; connection) must therefore not turn the stored e-mail into an error / a parse failure: it is
+  ;; processed, and its current folder is recorded exactly like for a move that returned nil.
+  (let [recorded (atom nil)
+        analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
         db (reify int/DB
              (email-exists? [_ _] false)
-             (save-email [_ _] true))
-        client (reify int/EmailClient (move-email-to-category [_ _ _ _ _] (throw (ex-info "test exception" {}))))
-        test-result (app/handle-incoming-imap-email {} {:move? true} {:analyzer analyzer :db db :client client})]
-    (is (= :error (:result test-result))))
-  "Return error if move=true and something goes wrong in the client")
+             (save-email [_ _] true)
+             (update-email-folder [_ message-id folder] (reset! recorded [message-id folder])))
+        client (reify int/EmailClient
+                 (move-email-to-category [_ _ _ _ _] (throw (ex-info "test exception" {})))
+                 (current-folder-name [_ folder] (str folder)))
+        test-result (app/handle-incoming-imap-email {:header {:message-id "throw-1"}} {:move? true :origin-folder :inbox} {:analyzer analyzer :db db :client client})]
+    (is (= :ok (:result test-result)))
+    (is (= ["throw-1" ":inbox"] @recorded) "The e-mail stays findable in its source folder"))
+  "A client exception during the move does not fail an e-mail that is already saved")
 
 (deftest handle-incoming-email-client-exception-move-false
   (let [analyzer (reify int/Analyzer (enrich-email [_ _] {:metadata {:category "test"}}))
@@ -691,25 +699,25 @@
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :from-keys-exclude ["key-1"] :page 1 :size 20})
-    (is (= {:where [:in :headers.message-id
-                    {:select [:communications.message-id] :from [:communications]
-                     :where [:and [:in :communications.type ["sender" ":sender"]]
-                                  [:not-in :communications.contact-key ["key-1"]]]}]
+    (is (= {:where [:not [:in :headers.message-id
+                          {:select [:communications.message-id] :from [:communications]
+                           :where [:and [:in :communications.type ["sender" ":sender"]]
+                                        [:in :communications.contact-key ["key-1"]]]}]]
             :order-by [[:date :desc]]}
            @captured)))
-  "Excluded senders are translated into a message-id semi-join matching every other sender")
+  "Excluded senders hide exactly the e-mails involving them; an e-mail without any sender row (Cc-only, unparseable From) is kept, like the subject filter keeps missing subjects")
 
 (deftest fetch-emails-applies-to-keys-exclude-filter
   (let [captured (atom nil)
         db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
     (app/fetch-emails {:db db} {:filter "all" :to-keys-exclude ["key-3"] :page 1 :size 20})
-    (is (= {:where [:in :headers.message-id
-                    {:select [:communications.message-id] :from [:communications]
-                     :where [:and [:in :communications.type ["receiver" ":receiver"]]
-                                  [:not-in :communications.contact-key ["key-3"]]]}]
+    (is (= {:where [:not [:in :headers.message-id
+                          {:select [:communications.message-id] :from [:communications]
+                           :where [:and [:in :communications.type ["receiver" ":receiver"]]
+                                        [:in :communications.contact-key ["key-3"]]]}]]
             :order-by [[:date :desc]]}
            @captured)))
-  "Excluded recipients are translated into a message-id semi-join matching every other recipient")
+  "Excluded recipients hide exactly the e-mails addressed to them; an e-mail where the user was only in Cc is not hidden by unchecking somebody else")
 
 (deftest fetch-emails-from-keys-include-wins-over-exclude
   (let [captured (atom nil)
@@ -1162,3 +1170,50 @@
         summary (app/move-folder-emails! {:db db :client client} "conn-1" "Newsletter_Alt" (fn [_] nil))]
     (is (= ["conn-1" "Newsletter_Alt"] @asked))
     (is (= {:folder "Newsletter_Alt" :total 1 :uncategorized 0 :moved 1 :not-found 0 :failed 0} summary))))
+
+(deftest category-filter-with-only-unknown-tokens-matches-nothing-without-an-empty-in
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :category-ids ["abc"] :page 1 :size 20})
+    (is (= [:= 1 0] (:where @captured)) "Only unknown categories were selected: nothing can match, and no `IN ()` is rendered")
+    (app/fetch-emails {:db db} {:filter "all" :category-ids-exclude ["abc"] :page 1 :size 20})
+    (is (not (contains? @captured :where)) "Excluding only unknown categories excludes nothing"))
+  "A hand-crafted category filter never produces an empty IN list (a syntax error on MariaDB)")
+
+(deftest malformed-date-filters-are-ignored-instead-of-failing-the-list
+  (let [captured (atom nil)
+        db (stub-emails-db #(reset! captured %) {:data [] :total 0})]
+    (app/fetch-emails {:db db} {:filter "all" :date-from "2024-1-1" :date-to "today" :page 1 :size 20})
+    (is (not (contains? @captured :where)))
+    (app/fetch-emails {:db db :time-zone "UTC"} {:filter "all" :date-from "nonsense" :date-to "2024-01-02" :page 1 :size 20})
+    (is (= [:< :headers.date 1704240000] (:where @captured)) "The valid bound still applies"))
+  "A date the browser or a bookmark could not format as ISO is dropped like a blank field")
+
+(deftest sqlite-body-search-is-resolved-once-and-inlined
+  (let [captured (atom nil)
+        lookups (atom 0)
+        db (reify int/DB
+             (fetch-categories [_] [])
+             (fetch-distinct-subjects [_ _] [])
+             (fetch-distinct-senders [_ _] [])
+             (fetch-distinct-recipients [_ _] [])
+             (fetch-header-categories [_ _] [])
+             (fetch-content-match-ids [_ text] (swap! lookups inc) (if (= "invoice" text) ["m-1" "m-2"] []))
+             (fetch-emails [_ _ customization] (reset! captured customization) {:data [] :total 0}))]
+    (app/fetch-emails {:db db :db-type :sqlite} {:filter "all" :search-text "invoice" :page 1 :size 20})
+    (is (= 1 @lookups) "The bodies table is scanned once per page load, not once per statement")
+    (is (= [:in :headers.message-id ["m-1" "m-2"]] (:where @captured)))
+    (app/fetch-emails {:db db :db-type :sqlite} {:filter "all" :search-text "nothing" :page 1 :size 20})
+    (is (= [:= 1 0] (:where @captured)) "No match means an empty list, without a subquery"))
+  "On SQLite the LIKE scan over every body runs once and its ids are inlined into the list, count and checklist queries")
+
+(deftest category-names-must-be-usable-as-imap-folder-names
+  (is (nil? (app/category-name-problem "Invoices")))
+  (is (nil? (app/category-name-problem "  Family & Friends ")))
+  (is (some? (app/category-name-problem "")))
+  (is (some? (app/category-name-problem "   ")))
+  (is (some? (app/category-name-problem nil)))
+  (is (some? (app/category-name-problem "Work/Projects")))
+  (is (some? (app/category-name-problem "News*")))
+  (is (some? (app/category-name-problem "Tab\there")))
+  "Category names become IMAP folder names and must not carry separators, wildcards or control characters")

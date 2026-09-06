@@ -42,7 +42,9 @@ You can parse your e-mails from mbox files or directly by connecting to your IMA
 
 - Each e-mail remembers the IMAP account and folder it was read from, so moving or re-fetching it goes straight to that account instead of guessing from the recipient address and trying every connection.
 
-- Immediate recovery from dropped IMAP connections: besides the periodic health check, Plauna listens for the server closing the connection and reconnects (with catch-up of missed mail) a few seconds later.
+- Immediate recovery from dropped IMAP connections: besides the periodic health check, Plauna listens for the server closing the connection and reconnects (with catch-up of missed mail) a few seconds later. A connection that could not be established at startup (the mail server was still booting) is retried automatically, with a pause that doubles after every failed attempt (2, 4, 8 ... minutes, at most an hour), so a wrong password does not flood the provider with logins.
+
+- Plauna never downloads attachments: only the text parts of a message are fetched from the IMAP server, so a mailbox full of large attachments is read as quickly as one without.
 
 - Automatic catch-up on reconnect: because live monitoring relies on IMAP IDLE (which only pushes mail that arrives while connected), every time a connection is (re)established - at startup, after a manual reconnect, or after the health check restores a dropped connection - Plauna re-reads the most recent messages in the monitored folder to save and categorize anything that arrived while it was offline. Already-stored e-mails are skipped, so nothing is duplicated. For a gap larger than that window, use the manual folder Parse.
 
@@ -98,6 +100,8 @@ This produces =target/plauna-standalone.jar=. Run it with Java 21 or later (requ
 The web UI is protected by one configurable login name and password (see "Web UI Password Protection" below). There are no separate user accounts - Plauna is made to be used by self-hosters who own and use the service themselves.
 
 The password protects the UI, but Plauna still has no transport encryption of its own and is meant to run inside a trusted, isolated network.
+
+After wrong guesses the login imposes a growing pause (a quarter of a second after the first failure, up to five seconds after a burst); an attempt arriving inside the pause is refused with "429 Too Many Requests" without checking the password, so a guessing script gets a few attempts per minute while the administrator is never locked out. The login page does not reveal the configured login name, and a session ends automatically when the password or login name changes or 30 days after the login. Requests authenticated only by an mTLS client certificate are refused when a browser sends them from another site (the =Origin= header names a different host), because the SameSite rule that protects cookie sessions against cross-site request forgery does not cover that login path.
 
 The Docker image runs Plauna as the unprivileged =plauna= user.
 
@@ -171,6 +175,8 @@ Example file with the user-facing keys (the initial =time-zone= is the host syst
 - =automatic-training-time= — local wall-clock time for the daily model training; default =02:00=.
 - =time-zone= — IANA time zone used for training schedules, displayed dates and date filters; the system time zone is used initially.
 
+Plauna also keeps a few internal values in this file (the session signing key, the time of the last successful training and a =session-generation= counter that ends all sessions when the credentials change). If the file is ever damaged so that it is no longer valid JSON, Plauna refuses to start and names the file instead of silently replacing it with defaults - that would discard the login name, the session key and the mTLS configuration.
+
 Plauna keeps Naive Bayes and MaxEnt model files side by side. When you select a different model under "Admin" → "Preferences", Plauna opens a confirmation dialog. For the first switch, keep the option to use the current category assignments enabled and enter =Start training= exactly. Plauna then treats the current assignments as correct training examples. The previous model remains active until training of the complete target model succeeds; a failed switch therefore does not leave categorization without a usable model.
 
 Both newly trained algorithms use namespaced features for sender address, sender domain, subject and up to 500 normalized body tokens. The displayed category confidence is the selected model's combined probability across those features, not three separate confidence values. A category or language changed manually is stored with 100% confidence because it represents an explicit user decision rather than a model prediction.
@@ -192,9 +198,11 @@ When the same runtime value is provided more than once, Plauna uses the followin
 The whole web UI is protected by one login name and password. The login name defaults to =root= for
 new and existing installations and can be changed under "Admin" -> "Login Settings". When you open
 Plauna you are redirected to a login page. After logging in, a signed session cookie keeps you signed
-in until you log out (via the "Logout" link in the navigation bar) or the browser discards the cookie.
-The signing key is persisted in =settings.json=, so a normal Plauna restart does not invalidate the
-session.
+in until you log out (via the "Logout" link in the navigation bar), the browser discards the cookie,
+the password or login name is changed, or 30 days have passed since the login. The signing key is
+persisted in =settings.json=, so a normal Plauna restart does not invalidate the session. The login
+page asks for the login name without pre-filling it: together with the password it is one of the two
+values a visitor has to know.
 
 *** How the password is determined
 
@@ -221,7 +229,8 @@ Go to "Admin" -> "Login Settings". The login name and password have separate for
 require the current password again. Login names are case-sensitive. A new password must contain at
 least 8 characters and be entered twice. If =PLAUNA_PASSWORD= is set, the page warns you that a
 password change will be reset to the environment variable's value on the next restart. The login
-name remains the value selected in the UI.
+name remains the value selected in the UI. Either change logs out every other browser that was
+signed in with the old credentials; your own session is renewed.
 
 *** Docker example
 
@@ -348,7 +357,7 @@ After you set up your configuration, go to the "Connections" page and click on "
 
 When you start Plauna, it starts a web server on the port which you specified (defaults to 8080) and connects to the IMAP servers that you configured. You can use Plauna without configuring any IMAP servers but you would be missing out on the "move e-mail" functionality. On your very first start, the database is empty. You need to fill it with e-mails. There are three non-exclusive ways of doing this:
 
-1. Go to "Admin". Under "Parse E-mails from Mbox", select an mbox file and click "Upload". You can see your e-mails under the "E-mails" tab shortly afterwards.
+1. Go to "Admin". Under "Parse E-mails from Mbox", select an mbox file and click "Upload". The file is read in the background - the page answers right away and a message on the next page load tells you when the file has been read completely - and your e-mails appear under the "E-mails" tab as they are processed. Messages are passed to the MIME parser byte for byte, so 8-bit bodies in Latin-1 or Windows-1252 keep their umlauts; fragments that are not e-mails are skipped.
 
 2. Go to "Admin" → "IMAP Connections", open an account, select a folder under "Parse E-mails from Folders", decide whether the messages should be moved after categorization, and click "Parse E-mails". You may also assign one category to the whole folder instead of using automatic category detection.
 
@@ -371,13 +380,13 @@ When you start Plauna, it starts a web server on the port which you specified (d
    
 ** Language Detection
 
-Plauna automatically detects the language of an e-mail when parsing it. Under "Admin" → "Languages", select the languages that should be used for training and categorization. Only languages that have already occurred in parsed e-mails appear there.
+Plauna automatically detects the language of an e-mail when parsing it. Under "Admin" → "Languages", select the languages that should be used for training and categorization. Only languages that have already occurred in parsed e-mails appear there. E-mails whose language could not be determined keep no language (shown as "n/a" or "Not detected"); a detector failure never prevents the e-mail itself from being saved. Re-running the language detection for every e-mail without a language (=POST /metadata/languages=) queues each of those e-mails exactly once and works in the background.
 
 ** Categorization
 
 *** Create Categories
 
-Go to "Admin" -> "Categories" to create and delete categories. When you create a category, Plauna tries to create its folder on every active IMAP connection. Deleting a category clears that category from affected Plauna metadata, but does not delete the corresponding folder or messages from the IMAP server. Plauna creates folders and moves messages as part of categorization; category administration itself does not remove server-side folders or messages.
+Go to "Admin" -> "Categories" to create and delete categories. A category name becomes an IMAP folder name, so it must not be empty, longer than 100 characters, or contain the characters =/= =\= =*= =%= or double quotes (they are hierarchy separators and wildcards in IMAP folder names). When you create a category, Plauna tries to create its folder on every active IMAP connection. Deleting a category clears that category from affected Plauna metadata, but does not delete the corresponding folder or messages from the IMAP server. Plauna creates folders and moves messages as part of categorization; category administration itself does not remove server-side folders or messages.
 
 *** Destination Folders
 
@@ -540,6 +549,7 @@ On the first start after upgrading to a version with FULLTEXT support, Flyway cr
 - Environment variables always override the saved =db-config.edn= file.
 - If MariaDB is configured but unreachable at startup, Plauna logs an error and falls back to SQLite automatically. Check the startup log so an unavailable server does not go unnoticed; the fallback may contain an older or empty data set.
 - Migrations are idempotent: running "Start Migration" again skips rows that are already present.
+- The migration copies every table, including the folder parse runs, the recorded read failures and the cached training features. Rows are streamed and inserted in chunks, so a large mailbox does not need to fit into memory; a row MariaDB rejects is logged and skipped without discarding the rest.
 - The SQLite file remains untouched after migration; you can keep it as a backup.
 - Plauna reads MariaDB's effective =innodb_ft_min_token_size=. Terms below that limit and words on the default InnoDB stopword list use a literal fallback, preserving correct search results.
 

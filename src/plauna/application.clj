@@ -5,17 +5,12 @@
             [clojure.string :as str]
             [plauna.core.email :as core-email]
             [plauna.preferences :as preferences]
-            [plauna.util.page :as page]))
+            [plauna.util.page :as page]
+            [plauna.util.sql :as sql]))
 
-(defn- escape-like
-  "Escape LIKE wildcards (% and _) and the escape character itself so user input matches literally.
-   Must be paired with an explicit ESCAPE '\\' in the LIKE expression: SQLite has no default escape
-   character, so without it '_' matches any character and '%' matches everything."
-  [text]
-  (str/replace text #"([\\%_])" "\\\\$1"))
-
-(defn- like-contains [column text]
-  [:like column [:escape (str "%" (escape-like text) "%") "\\"]])
+(def ^:private like-contains
+  "See plauna.util.sql/like-contains: the same escaping the database layer uses for its own LIKE scans."
+  sql/like-contains)
 
 (def ^:private default-fulltext-min-token-length 3)
 
@@ -93,26 +88,59 @@
       :from [table]
       :where related-condition}]))
 
+(def max-inlined-search-ids
+  "Up to this many body-search matches are inlined as an IN list instead of repeating the LIKE subquery.
+   Well below SQLite's default bind-variable limit (32766), and a bigger result set means the search is
+   not selective anyway."
+  5000)
+
+(defn- resolve-search-ids
+  "SQLite only: the message ids whose body contains search-text, resolved ONCE. The e-mail list runs six
+   statements per page (four checklist scopes, the page, the count) and every one of them would
+   otherwise rescan the whole bodies table with LIKE. nil when unavailable (the caller keeps the subquery)."
+  [db db-type search-text]
+  (when (= :sqlite db-type)
+    (try (int/fetch-content-match-ids db search-text)
+         (catch Exception e
+           (t/log! {:level :warn :error e} "Could not pre-resolve the body search; using the subquery instead.")
+           nil))))
+
 (defn- content->where
   "Build a where-clause matching e-mails whose body content contains search-text. A blank/nil
    search-text adds no filter. When a date filter is active, correlated? selects a date-first EXISTS
    plan; otherwise the matching message ids are resolved once with a non-correlated IN subquery.
-   MariaDB uses its FULLTEXT index; SQLite retains the literal substring search."
-  [search-text correlated? fulltext-min-token-length]
+   MariaDB uses its FULLTEXT index; SQLite retains the literal substring search and, when the ids were
+   resolved up front (resolved-ids, see resolve-search-ids), inlines them."
+  [search-text correlated? fulltext-min-token-length resolved-ids]
   (when-not (str/blank? search-text)
-    (related-message->where :bodies :bodies.message-id
-                            (if fulltext-min-token-length
+    (cond
+      fulltext-min-token-length
+      (related-message->where :bodies :bodies.message-id
                               (maria-fulltext-condition search-text fulltext-min-token-length)
-                              (like-contains :bodies.content search-text))
-                            correlated?)))
+                              correlated?)
+
+      (and (some? resolved-ids) (empty? resolved-ids))
+      [:= 1 0]
+
+      (and (some? resolved-ids) (<= (count resolved-ids) max-inlined-search-ids))
+      [:in :headers.message-id (vec resolved-ids)]
+
+      :else
+      (related-message->where :bodies :bodies.message-id
+                              (like-contains :bodies.content search-text)
+                              correlated?))))
 
 (defn- contact-keys->where
   "Build a where-clause for e-mails with a participant of one of participant-types (e.g.
    [\"sender\" \":sender\"] — legacy rows may store the type with a leading colon, see the defensive
    strip in core.email/construct-participants). selection is {:include [...]} to match only those
-   contact-keys, or {:exclude [...]} to match everything EXCEPT those contact-keys (the checklist UI
-   submits whichever list is shorter — see emails.html's submitFilterForm — so a mailbox with
-   hundreds of senders never has to send hundreds of query parameters just to exclude a few).
+   contact-keys, or {:exclude [...]} to hide the e-mails that involve one of those contact-keys (the
+   checklist UI submits whichever list is shorter — see emails.html's submitFilterForm — so a mailbox
+   with hundreds of senders never has to send hundreds of query parameters just to exclude a few).
+   Exclusion is a NOT over the excluded participants, not a semi-join over the remaining ones: an
+   e-mail with no participant of the type at all (the user was only in Cc, or the sender could not be
+   parsed) is shown while the filter is untouched and must not vanish because ONE named sender was
+   unchecked - the same rule subject-values->where applies to missing subjects.
    Both empty adds no filter, same as every other filter field's 'blank means unfiltered' convention.
    :none? is the explicit empty selection and therefore matches no rows."
   [participant-types {:keys [include exclude none?]} correlated?]
@@ -127,11 +155,11 @@
                             correlated?)
 
     (seq exclude)
-    (related-message->where :communications :communications.message-id
-                            [:and
-                             [:in :communications.type participant-types]
-                             [:not-in :communications.contact-key exclude]]
-                            correlated?)
+    [:not (related-message->where :communications :communications.message-id
+                                  [:and
+                                   [:in :communications.type participant-types]
+                                   [:in :communications.contact-key exclude]]
+                                  correlated?)]
 
     :else nil))
 
@@ -162,6 +190,17 @@
         ^java.time.LocalDate day (if next-day? (.plusDays base 1) base)]
     (.toEpochSecond (.atStartOfDay day zone-id))))
 
+(defn- date-bound
+  "The epoch-second bound for one date field, or nil when the field is blank OR not a valid ISO date
+   (a hand-edited URL or a browser without a native date input): a malformed bound is ignored like an
+   empty one instead of failing the whole e-mail list."
+  [date-str next-day? zone-id]
+  (when-not (str/blank? date-str)
+    (try (date-string->epoch-seconds (str/trim date-str) next-day? zone-id)
+         (catch java.time.format.DateTimeParseException _
+           (t/log! :debug ["Ignoring an unparseable date filter value:" date-str])
+           nil))))
+
 (defn- date->where
   "Build a where-clause filtering headers.date (stored as unix seconds) between the given dates.
    Either bound may be blank/nil. The upper bound is inclusive of the whole 'to' day. Uses the fully
@@ -169,8 +208,8 @@
    the main e-mail-list query) so this fragment can also be reused directly in the checklist filters'
    scoped distinct-value queries — see other-filters-where."
   [date-from date-to zone-id]
-  (let [from (when-not (str/blank? date-from) (date-string->epoch-seconds date-from false zone-id))
-        to (when-not (str/blank? date-to) (date-string->epoch-seconds date-to true zone-id))]
+  (let [from (date-bound date-from false zone-id)
+        to (date-bound date-to true zone-id)]
     (cond
       (and from to) [:and [:>= :headers.date from] [:< :headers.date to]]
       from [:>= :headers.date from]
@@ -208,19 +247,24 @@
    the explicit empty selection and therefore matches no rows."
   [{:keys [include exclude none?]}]
   (let [include-uncategorized? (contains? (set include) uncategorized-token)
-        include-ids (category-tokens->numeric-ids include)
+        include-ids (vec (category-tokens->numeric-ids include))
         exclude-uncategorized? (contains? (set exclude) uncategorized-token)
-        exclude-ids (category-tokens->numeric-ids exclude)]
+        exclude-ids (vec (category-tokens->numeric-ids exclude))]
+    ;; The branches test the PARSED selection: a list made only of unknown tokens (a hand-crafted URL)
+    ;; must never render `IN ()`, which is a syntax error on MariaDB.
     (cond
       none? [:= 1 0]
 
-      (seq include)
+      ;; Only unknown categories were selected: nothing can match them.
+      (and (seq include) (not include-uncategorized?) (empty? include-ids)) [:= 1 0]
+
+      (or include-uncategorized? (seq include-ids))
       (cond
         (and include-uncategorized? (seq include-ids)) [:or [:in :metadata.category include-ids] [:= :metadata.category nil]]
         include-uncategorized? [:= :metadata.category nil]
         :else [:in :metadata.category include-ids])
 
-      (seq exclude)
+      (or exclude-uncategorized? (seq exclude-ids))
       (cond
         ;; Excluding "n/a" too: a real, non-excluded category is required.
         (and exclude-uncategorized? (seq exclude-ids)) [:and [:<> :metadata.category nil] [:not-in :metadata.category exclude-ids]]
@@ -352,13 +396,13 @@
    given every OTHER active filter — e.g. once a category is picked, the From checklist only offers
    senders who actually have mail in that category — the same way Excel's own AutoFilter narrows a
    column's dropdown as other filters are applied."
-  [parameters date-filter fulltext-min-token-length excluding category-selection subject-selection from-selection to-selection]
+  [parameters date-filter content-where excluding category-selection subject-selection from-selection to-selection]
   (let [date-filter-active? (some? date-filter)]
     (combine-wheres
      [date-filter
       (batch->where (:batch parameters))
       (filter->where (:filter parameters))
-      (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
+      content-where
       (when-not (= excluding :subject) (subject-values->where subject-selection))
       (when-not (= excluding :from) (sender-keys->where from-selection date-filter-active?))
       (when-not (= excluding :to) (recipient-keys->where to-selection date-filter-active?))
@@ -396,7 +440,13 @@
         fulltext-min-token-length (when (= :mariadb (:db-type context))
                                     (long (or (:fulltext-min-token-length context)
                                               default-fulltext-min-token-length)))
-        other-where (partial other-filters-where parameters date-filter fulltext-min-token-length)
+        search-text (:search-text parameters)
+        ;; Built once and shared by the checklist scopes, the page query and the count: a body search
+        ;; is the most expensive predicate of the list.
+        content-where (content->where search-text date-filter-active? fulltext-min-token-length
+                                      (when-not (or (str/blank? search-text) fulltext-min-token-length)
+                                        (resolve-search-ids db (:db-type context) search-text)))
+        other-where (partial other-filters-where parameters date-filter content-where)
         cat-list (annotate-checked-by (categories db) category-selection #(or (:id %) uncategorized-token))
         reachable-categories (reachable-category-tokens db (other-where :category category-selection subject-selection from-selection to-selection))
         category-filter-options (filterv #(contains? reachable-categories (str (or (:id %) uncategorized-token))) cat-list)
@@ -407,7 +457,7 @@
         where (combine-wheres [date-filter
                                batch-where
                                (filter->where (:filter parameters))
-                               (content->where (:search-text parameters) date-filter-active? fulltext-min-token-length)
+                               content-where
                                (subject-values->where subject-selection)
                                (sender-keys->where from-selection date-filter-active?)
                                (recipient-keys->where to-selection date-filter-active?)
@@ -469,6 +519,19 @@
                                                    subject-active? from-active? to-active? category-active?))}
        :optional {:categories cat-list :category-filter-options category-filter-options
                   :subjects subject-list :senders sender-list :recipients recipient-list}})))
+
+(defn category-name-problem
+  "Why a category name cannot be used, or nil when it is fine. Category names become IMAP folder names
+   ('Categories/<Name>'), so they must not be blank and must not contain the characters IMAP servers
+   use as hierarchy separators or LIST wildcards, nor control characters."
+  [category-name]
+  (let [trimmed (some-> category-name str str/trim)]
+    (cond
+      (str/blank? trimmed) "The category name must not be empty."
+      (> (count trimmed) 100) "The category name must not exceed 100 characters."
+      (re-find #"[\p{Cntrl}]" trimmed) "The category name must not contain control characters."
+      (re-find #"[/\\*%\"]" trimmed) "The category name must not contain / \\ * % or double quotes: they have a special meaning in IMAP folder names."
+      :else nil)))
 
 (defn create-new-category! [context category destination-folder color]
   (let [db (:db context)
@@ -541,7 +604,13 @@
                                      (when-not (str/blank? current-folder)
                                        (int/update-email-folder db message-id current-folder)))))]
     (if (and (true? move?) (some? category))
-      (let [moved-to-folder (int/move-email-to-category client connection-id (:message email-message) folder category)]
+      ;; The e-mail is already saved when this runs. A move that throws (target folder missing, the
+      ;; connection dropped, a server NO) must therefore never surface as 'the message could not be
+      ;; read': it is logged and the e-mail is recorded in its current folder like any other failed move.
+      (let [moved-to-folder (try (int/move-email-to-category client connection-id (:message email-message) folder category)
+                                 (catch Exception e
+                                   (t/log! {:level :warn :error e} ["Moving the e-mail with subject" (-> email-message :email :header :subject) "to its category folder failed."])
+                                   nil))]
         (if (string? moved-to-folder)
           (do (int/update-email-folder db message-id moved-to-folder)
               (t/log! :debug ["Email with subject:" (-> email-message :email :header :subject) "was successfully moved to the corresponding folder"]))

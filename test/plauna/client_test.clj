@@ -11,59 +11,52 @@
 
 (t/set-ns-filter! {:disallow "plauna.*"})
 
+(defn- expected-properties
+  "The properties every session gets, plus the given key/value pairs."
+  [& kvs]
+  (let [properties (doto (new Properties)
+                     (.setProperty "mail.imap.usesocketchannels" "true")
+                     (.setProperty "mail.imap.connectiontimeout" client/imap-connect-timeout-millis)
+                     (.setProperty "mail.imap.timeout" client/imap-read-timeout-millis)
+                     (.setProperty "mail.imap.partialfetch" "false")
+                     (.setProperty "mail.imap.fetchsize" "1048576"))]
+    (doseq [[k v] (partition 2 kvs)]
+      (.setProperty properties k v))
+    properties))
+
 (deftest ssl-properties-set-correctly
-  (let [session ^Session (client/config->session {:security "ssl" :port 993})
-        expected-properties (doto (new Properties)
-                              (.setProperty "mail.imap.ssl.enable", "true")
-                              (.setProperty "mail.imap.port", "993")
-                              (.setProperty "mail.imap.usesocketchannels" "true")
-                              (.setProperty "mail.imap.timeout" "5000")
-                              (.setProperty "mail.imap.partialfetch" "false")
-                              (.setProperty "mail.imap.fetchsize" "1048576"))]
-    (is (= expected-properties (.getProperties session)))))
+  (let [session ^Session (client/config->session {:security "ssl" :port 993})]
+    (is (= (expected-properties "mail.imap.ssl.enable" "true" "mail.imap.port" "993")
+           (.getProperties session)))))
 
 (deftest starttls-properties-set-correctly
-  (let [session ^Session (client/config->session {:security "starttls" :port 143})
-        expected-properties (doto (new Properties)
-                              (.setProperty "mail.imap.starttls.enable", "true")
-                              (.setProperty "mail.imap.port", "143")
-                              (.setProperty "mail.imap.usesocketchannels" "true")
-                              (.setProperty "mail.imap.timeout" "5000")
-                              (.setProperty "mail.imap.partialfetch" "false")
-                              (.setProperty "mail.imap.fetchsize" "1048576"))]
-    (is (= expected-properties (.getProperties session)))))
+  (let [session ^Session (client/config->session {:security "starttls" :port 143})]
+    (is (= (expected-properties "mail.imap.starttls.enable" "true"
+                                "mail.imap.starttls.required" "true"
+                                "mail.imap.port" "143")
+           (.getProperties session))
+        "STARTTLS is required, never silently downgraded to plaintext")))
 
 (deftest plain-text-properties-set-correctly
-  (let [session ^Session (client/config->session {:security "plain" :port 143})
-        expected-properties (doto (new Properties)
-                              (.setProperty "mail.imap.usesocketchannels" "true")
-                              (.setProperty "mail.imap.port", "143")
-                              (.setProperty "mail.imap.timeout" "5000")
-                              (.setProperty "mail.imap.partialfetch" "false")
-                              (.setProperty "mail.imap.fetchsize" "1048576"))]
-    (is (= expected-properties (.getProperties session)))))
+  (let [session ^Session (client/config->session {:security "plain" :port 143})]
+    (is (= (expected-properties "mail.imap.port" "143") (.getProperties session)))))
 
 (deftest empty-values-return-ssl
-  (let [session ^Session (client/config->session {})
-        expected-properties (doto (new Properties)
-                              (.setProperty "mail.imap.ssl.enable", "true")
-                              (.setProperty "mail.imap.port", "993")
-                              (.setProperty "mail.imap.usesocketchannels" "true")
-                              (.setProperty "mail.imap.timeout" "5000")
-                              (.setProperty "mail.imap.partialfetch" "false")
-                              (.setProperty "mail.imap.fetchsize" "1048576"))]
-    (is (= expected-properties (.getProperties session)))))
+  (let [session ^Session (client/config->session {})]
+    (is (= (expected-properties "mail.imap.ssl.enable" "true" "mail.imap.port" "993")
+           (.getProperties session)))))
 
 (deftest non-compliant-security-values-return-ssl
-  (let [session ^Session (client/config->session {:security "does-not-exist"})
-        expected-properties (doto (new Properties)
-                              (.setProperty "mail.imap.ssl.enable", "true")
-                              (.setProperty "mail.imap.port" "993")
-                              (.setProperty "mail.imap.usesocketchannels" "true")
-                              (.setProperty "mail.imap.timeout" "5000")
-                              (.setProperty "mail.imap.partialfetch" "false")
-                              (.setProperty "mail.imap.fetchsize" "1048576"))]
-    (is (= expected-properties (.getProperties session)))))
+  (let [session ^Session (client/config->session {:security "does-not-exist"})]
+    (is (= (expected-properties "mail.imap.ssl.enable" "true" "mail.imap.port" "993")
+           (.getProperties session)))))
+
+(deftest every-session-has-connect-and-read-timeouts
+  (let [session ^Session (client/config->session {})]
+    (is (= "15000" (.getProperty session "mail.imap.connectiontimeout"))
+        "A connect to an unreachable host must not block a health check for minutes")
+    (is (= "30000" (.getProperty session "mail.imap.timeout"))
+        "A single slow read (a large body on a slow link) must not count as a dead connection")))
 
 (deftest debug-false-on-default
   (let [session ^Session (client/config->session {})]

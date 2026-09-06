@@ -153,22 +153,44 @@
     (events/create-event :parsed-enrichable-email parsed-email nil original-event)
     (events/create-event :parsed-email parsed-email nil original-event)))
 
+(defn discarded-email-event
+  "Published for a :received-email that produced no e-mail (unparseable, or without any identity), so a
+   producer waiting on the outcome of every message it sent (see messaging/channel-limiter) is not left
+   waiting forever."
+  [original-event reason]
+  (events/create-event :discarded-email {:reason reason} nil original-event))
+
+(defn- parse-or-discard
+  "[original-event parsed-email-or-nil]; a parse failure is logged and yields nil instead of killing
+   the pipeline's item."
+  [[original-event payload]]
+  [original-event
+   (try (parse-email (input-stream payload))
+        (catch Exception e
+          (t/log! {:level :error :error e} ["Could not parse a received e-mail; it is discarded:" (.getMessage e)])
+          nil))])
+
 (defn parser-event-loop
   "Listens to :received-email.
 
   Options:
   :enrich - boolean
 
-  If :enrich is true, emits a :parsed-enrichable-email event. Otherwise emits a :parsed-email event."
+  If :enrich is true, emits a :parsed-enrichable-email event. Otherwise emits a :parsed-email event.
+  A message that cannot be parsed, or has no Message-ID and nothing to derive one from, is answered
+  with a :discarded-email event instead."
   [publisher events-channel]
   (let [local-channel (chan 256)]
     (sub publisher :received-email local-channel)
     (async/pipeline 4
                     events-channel
                     (comp (map (fn [event] [event (:payload event)]))
-                          (map (fn [[original-event payload]] [original-event (parse-email (input-stream payload))]))
-                          (filter (fn [[_ parsed-email]] (with-message-id? parsed-email)))
-                          (map (fn [[original-event parsed-email]] (parsed-email-event original-event parsed-email))))
+                          (map parse-or-discard)
+                          (map (fn [[original-event parsed-email]]
+                                 (cond
+                                   (nil? parsed-email) (discarded-email-event original-event :unparseable)
+                                   (with-message-id? parsed-email) (parsed-email-event original-event parsed-email)
+                                   :else (discarded-email-event original-event :no-message-id)))))
                     local-channel
                     true
                     (fn [^Throwable th]

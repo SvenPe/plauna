@@ -140,11 +140,16 @@
 (defn- present-label? [value]
   (and (some? value) (not (str/blank? (str value))) (not= "n/a" value)))
 
-(defn- normalized-breakdown [rows field missing-label]
+(defn- normalized-breakdown
+  "One bar per label, largest first. Rows whose raw value maps to the same label (NULL and \"n/a\" both
+   become missing-label) are merged, so a chart never shows the same label twice."
+  [rows field missing-label]
   (->> rows
        (map (fn [row]
               {field (if (present-label? (get row field)) (str (get row field)) missing-label)
                :count (count-value row)}))
+       (group-by field)
+       (map (fn [[label grouped]] {field label :count (reduce + 0 (map :count grouped))}))
        (sort-by :count >)
        vec))
 
@@ -222,7 +227,9 @@
                       (chart-context "categories" "Categories" "Current category assignments, including uncategorized e-mails."
                                      category-values (breakdown-chart "E-mails by category" category-values :name "Category"))]})))
 
-(defn categories-page [categories] (render "admin-categories.html" {:categories categories :active-nav :admin}))
+(defn categories-page
+  ([categories] (render "admin-categories.html" {:categories categories :active-nav :admin}))
+  ([categories messages] (render "admin-categories.html" {:categories categories :active-nav :admin :messages (mapv type->toast-role messages)})))
 
 (defn languages-admin-page [language-preferences]
   (render "admin-languages.html" {:language-preferences language-preferences :active-nav :admin}))

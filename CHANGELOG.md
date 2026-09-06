@@ -6,6 +6,58 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- Plauna no longer expunges IMAP folders. Closing the monitored folder on disconnect and closing the
+  source and target folders of every recategorization used `Folder.close()`, which is `close(true)`:
+  every message a mail client had flagged for deletion but not yet expunged was permanently removed
+  by Plauna. Folders are now closed without expunging.
+- One unreadable new message no longer stops the other new messages of the same IMAP event from being
+  processed or leaves the monitored folder without IDLE until the next health check. The message is
+  recorded under "Messages That Could Not Be Read" and IDLE is re-armed in any case.
+- An IMAP move that fails after the e-mail was saved (a missing target folder, a dropped connection)
+  is no longer counted as a read failure: the e-mail keeps its category, is recorded in its current
+  folder and belongs to its parse batch. A missing target folder is created on the fly.
+- Recategorizing an e-mail from the list on a server without the IMAP MOVE extension failed; it now
+  falls back to copy and delete like the incoming-mail path. Servers without UIDPLUS leave the copied
+  original flagged as deleted instead of failing the move.
+- Unchecking a single sender or recipient in the "From"/"To" checklist hid every e-mail that had no
+  participant of that type at all (for example e-mails where you were only in Cc). Excluding now
+  hides exactly the e-mails involving the unchecked entries, as the subject filter already did.
+- The e-mail list answered with an error page for a malformed date filter or a category filter made
+  only of unknown values (which rendered an empty `IN ()`, a syntax error on MariaDB). Unparseable
+  dates are ignored and unknown categories match nothing.
+- Saving an OAuth provider from the connection page always ended in a "500" (the update itself had
+  succeeded); the request now answers 204, and only the known provider columns reach the database.
+- Unknown URLs, garbled e-mail ids, an unknown connection operation, "disconnect" on an unregistered
+  connection and starting a folder parse on an inactive or missing connection produced error pages;
+  they now answer with 404/400 or an alert message. A parse whose folder could not be opened is shown
+  as aborted instead of finished with zero counts, and a run whose final counts cannot be stored no
+  longer stays "running" forever. The "Start REPL" form redirected to a non-existent page.
+- "Categorize Fresh Data" failed with a SQL error when no training language was activated, and always
+  processed 20 e-mails regardless of the requested count.
+- The SQLite → MariaDB migration skipped the parse runs, parse batch membership, read failures and
+  cached training features (every table added since the migration was written). It also loaded each
+  table completely into memory and inserted one row per statement; it now streams rows and inserts in
+  chunks, falling back to single rows only for a rejected chunk.
+- Re-running the language detection for e-mails without a language queued the same e-mails over and
+  over (the not-yet-written results were re-read from page one) and duplicated every attachment row of
+  those e-mails; it now queues each e-mail once, in the background, and rewrites only the metadata.
+- Importing an mbox blocked for good once 300 fragments had been dropped by the parser, because the
+  back-pressure tokens of dropped messages were never released. mbox files were also decoded as UTF-8
+  before parsing, which mangled 8-bit Latin-1/Windows-1252 bodies; the bytes are now passed through
+  unchanged. An upload without a file gave an error page; the import runs in the background and
+  reports when the file has been read.
+- A language detector failure or a categorizer failure dropped the e-mail from the import entirely;
+  such e-mails are now saved without the failed piece of metadata.
+- A batch of up to 500 e-mails was lost when MariaDB rejected a single row (a column limit, or the whole
+  multi-row INSERT exceeding `max_allowed_packet`); body inserts are now chunked and a rejected batch
+  is retried e-mail by e-mail. A crashed database event loop no longer leaves stale subscriptions that
+  would stall every producer.
+- Training and model file names were parsed as a fixed three-letter language code; language tags of
+  other lengths (such as `zh-cn`) now round-trip. A statistics chart no longer shows "Not detected"
+  twice when both NULL and "n/a" languages exist.
+- A refresh-token lookup for an OAuth connection without a stored token no longer posts a nil token
+  and reports a "transient error" at every health check. `get-connection` returns nil for an unknown
+  id instead of a record of nils.
 - Messages without a Message-ID header could not be stored ("Column 'message_id' cannot be null").
   They now get a stable substitute id derived from date, sender and subject, identical for IMAP and
   mbox, so they are saved once and recognised as stored afterwards.
@@ -17,6 +69,43 @@ All notable changes to this project will be documented in this file.
   (typically malformed address headers, reported as "Failed to load IMAP envelope"). Such messages
   failed on every backfill and folder parse; Plauna now rebuilds Message-ID, subject, date and
   participants from the raw header block instead, parsing addresses leniently.
+
+### ⚡ Performance
+
+- The categorization model is deserialized once per model file and cached (reloaded when the file
+  changes) instead of being read from disk for every single e-mail.
+- Attachments are no longer downloaded from the IMAP server only to be discarded: only text parts
+  are fetched, and the transfer encoding is read from the BODYSTRUCTURE instead of one extra header
+  fetch per part.
+- The body search on SQLite scans the bodies table once per page load and inlines the matching ids
+  into the list, count and checklist statements instead of repeating the LIKE scan six times.
+- The HTML body is cleaned once for language detection and feature extraction; activated languages
+  and categories are cached briefly instead of being queried per e-mail; MariaDB metadata upserts
+  are written in multi-row statements; training lines are built with a StringBuilder.
+- The "connection not active" banner no longer sends an IMAP NOOP per connection on every page
+  render (the state is cached for five seconds), and the start page no longer aggregates the whole
+  mailbox by year just to decide where to redirect.
+- SQLite gets an index on `headers(subject)` for the Subject checklist.
+
+### 🛡️ Hardening
+
+- IMAP connections get a connect timeout (15 s) and a longer read timeout (30 s instead of 5 s, so a
+  slow body fetch no longer counts as a dead connection). STARTTLS is required when selected instead
+  of silently falling back to plaintext.
+- Wrong login guesses impose a growing pause (attempts inside it are refused with 429 without a
+  password check), the login page no longer pre-fills the login name, a wrong login name costs the
+  same time as a wrong password, and sessions end when the
+  password or login name changes or 30 days after the login. A certificate-authenticated request
+  from another site (cross-site request forgery via mTLS) is refused. Request bodies and uploads are
+  only parsed after authentication. Redirect targets of the form `/\host` are rejected.
+- Category names are validated (no separators, wildcards or control characters).
+- Connections that could not be established at startup are retried with a doubling pause (2, 4,
+  8 ... minutes, at most an hour); a failing connection no longer prevents the web server from
+  starting. A dead IDLE manager is replaced, the
+  health check back-fills mail after re-opening a closed folder, tearing down a connection continues
+  past a failing step, and a "connect" while a connection is already live closes the old one first.
+- Automatic training survives a failure to compute its next run time; a damaged `settings.json` is
+  reported with its path instead of a bare parser error.
 
 ### ✨ Features
 

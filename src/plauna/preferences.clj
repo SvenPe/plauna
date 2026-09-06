@@ -67,6 +67,21 @@
     (java.time.ZoneId/of (time-zone))
     (catch Exception _ (java.time.ZoneId/systemDefault))))
 
+(defn session-generation
+  "Increases whenever the web credentials change; sessions remember the generation they logged in with,
+   so a bump ends every session established with the old credentials. Anything that is not a whole
+   number counts as generation 0."
+  []
+  (w/lookup-or-miss cache
+                    :session-generation
+                    (fn [key]
+                      (let [value (@fetch-fn key)]
+                        (cond (number? value) (long value)
+                              :else (try (Long/parseLong (str value)) (catch Exception _ 0)))))))
+
+(defn bump-session-generation! []
+  (update-preference :session-generation (inc (long (session-generation)))))
+
 (defn last-successful-training-at []
   (some-> (settings/fetch-setting :last-successful-training-at) str java.time.Instant/parse))
 

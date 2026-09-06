@@ -118,10 +118,55 @@
     canonical))
 
 (defn verify-web-credentials?
-  "True only when both the configured login name and active web UI password match."
+  "True only when both the configured login name and active web UI password match. Both checks always
+   run: short-circuiting on the login name would answer a wrong name in microseconds and a right one
+   only after the PBKDF2 work, telling an attacker which names are worth trying."
   [login-name plaintext]
-  (and (constant-time-string= (web-login-name) login-name)
-       (verify-web-password? plaintext)))
+  (let [name-ok? (constant-time-string= (web-login-name) login-name)
+        password-ok? (verify-web-password? plaintext)]
+    (and name-ok? password-ok?)))
+
+;; ── Login throttling ────────────────────────────────────────────────────────────
+
+(def login-failure-window-millis
+  "Failures older than this no longer slow down login attempts."
+  (* 15 60 1000))
+
+(def max-login-delay-millis 5000)
+
+(defonce ^:private login-failures (atom {:count 0 :last-failure 0}))
+
+(defn record-login-failure! []
+  (swap! login-failures
+         (fn [{:keys [count last-failure]}]
+           (let [now (System/currentTimeMillis)
+                 recent? (< (- now (long last-failure)) login-failure-window-millis)]
+             {:count (if recent? (inc (long count)) 1) :last-failure now}))))
+
+(defn record-login-success! []
+  (reset! login-failures {:count 0 :last-failure 0}))
+
+(defn login-delay-millis
+  "The pause the recent failures impose on the next login attempt: nothing after a clean history, then
+   growing with each failure in the window (250 ms, 1 s, 2.25 s ... capped at 5 s). This is a global
+   brake, not a lockout: the administrator can always log in, just not quickly after a burst of wrong
+   guesses, and a guessing script is held to a few attempts per minute."
+  []
+  (let [{:keys [count last-failure]} @login-failures]
+    (if (or (zero? (long count))
+            (>= (- (System/currentTimeMillis) (long last-failure)) login-failure-window-millis))
+      0
+      (min max-login-delay-millis (* 250 (long count) (long count))))))
+
+(defn login-wait-remaining-millis
+  "How much of the pause after the last failure is still ahead of us: an attempt arriving earlier is
+   refused outright (no password check, no thread parked in a sleep), one arriving later is checked."
+  []
+  (let [{:keys [last-failure]} @login-failures
+        delay (login-delay-millis)]
+    (if (zero? (long delay))
+      0
+      (max 0 (- (+ (long last-failure) (long delay)) (System/currentTimeMillis))))))
 
 (defn password-from-env-var?
   "True if the password is being supplied via the PLAUNA_PASSWORD environment variable."

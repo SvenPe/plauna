@@ -93,3 +93,16 @@ Tester\r
   (let [email (parser/parse-email (java.io.ByteArrayInputStream. (.getBytes "Content-Type: text/plain\r\n\r\njust text\r\n" "UTF-8")))]
     (is (nil? (-> email :header :message-id)))
     (is (false? (parser/with-message-id? email)))))
+
+(deftest dropped-fragments-are-answered-with-a-discarded-email-event
+  (let [test-chan (chan)
+        test-pub (pub test-chan :type)
+        results-chan (chan)]
+    (parser/parser-event-loop test-pub test-chan)
+    (sub test-pub :discarded-email results-chan)
+    (>!! test-chan {:type :received-email :options {:enrich true} :payload (.getBytes "Content-Type: text/plain\r\n\r\njust text\r\n" "UTF-8")})
+    (let [event (async-utils/fetch-or-timeout!! results-chan 2000)]
+      (is (= :discarded-email (:type event)))
+      (is (= :no-message-id (get-in event [:payload :reason])))
+      (is (true? (get-in event [:options :enrich])) "The original options travel with the answer")))
+  "The mbox limiter can account for fragments that never become e-mails")

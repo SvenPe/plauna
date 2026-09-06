@@ -7,6 +7,7 @@
             [plauna.messaging :as messaging]
             [plauna.core.events :as events])
   (:import [java.io File]
+           [java.nio.charset StandardCharsets]
            [java.nio.file AtomicMoveNotSupportedException CopyOption Files StandardCopyOption]
            [java.nio.file.attribute FileAttribute]))
 
@@ -54,15 +55,30 @@
       (do (.createNewFile file)
           file))))
 
+(def ^:private model-file-suffixes
+  ;; Model files are 'train-<language>.bin' (legacy Naive Bayes) or 'train-<language>-<model>.bin'.
+  #{"naive-bayes" "maxent" "maxent-qn"})
+
+(defn file-language
+  "The language code encoded in a training or model file name ('train-<language>.train',
+   'train-<language>.bin', 'train-<language>-<model>.bin'), or nil for any other file. Language codes
+   are usually three letters (ISO 639-3) but the detector's own tags such as zh-cn survive too, so the
+   code is read up to the suffix instead of by a fixed width."
+  [^String file-name]
+  (when-let [[_ stem] (re-matches #"train-(.+)\.(?:train|bin)" file-name)]
+    (if-let [model (some #(when (string/ends-with? stem (str "-" %)) %) model-file-suffixes)]
+      (subs stem 0 (- (count stem) (inc (count model))))
+      stem)))
+
 (defn files-with-type [type]
   (let [type-string (type {:model ".bin" :train ".train"})]
-    (->> (filter #(and (.isFile ^File %)
+    (->> (.listFiles (clojure.java.io/file (file-dir)))
+         (filter #(and (.isFile ^File %)
                        (.endsWith (.getName ^File %) type-string)
-                       (.startsWith (.getName ^File %) "train"))
-                 (file-seq (clojure.java.io/file (file-dir))))
-         (map (fn [f] (when (.isFile ^File f)
-                        {:file     f
-                         :language (subs (. ^File f getName) 6 9)}))))))
+                       (.startsWith (.getName ^File %) "train-")))
+         (keep (fn [^File f]
+                 (when-let [language (file-language (.getName f))]
+                   {:file f :language language}))))))
 
 (defn training-files [] (files-with-type :train))
 
@@ -149,13 +165,19 @@
           (recur fn (rest sq) (conj acc line "\r\n")))))))
 
 (defn read-emails-from-mbox
-  "Reads the e-mails from an mbox (as input channel) and puts them in a :received-email event as byte arrays.
+  "Reads the e-mails from an mbox (as input stream) and puts them in a :received-email event as byte
+   arrays. The stream is read as ISO-8859-1 and the message re-encoded the same way: every byte maps to
+   exactly one character, so the message bytes reach the MIME parser unchanged and each part is decoded
+   with ITS declared charset. (Reading as UTF-8 would replace every byte of a Latin-1 or Windows-1252
+   8-bit body with U+FFFD before the parser ever saw it.)
 
   Currently always adds the option :enrich"
   [mbox-is channel]
   (t/log! :info ["Starting to read from mbox"])
-  (with-open [rdr (clojure.java.io/reader mbox-is)]
-    (let [limiter (messaging/channel-limiter :parsed-enrichable-email)]
+  (with-open [rdr (clojure.java.io/reader mbox-is :encoding "ISO-8859-1")]
+    ;; The limiter also counts :discarded-email: a fragment the parser drops never becomes a parsed e-mail,
+    ;; and its token would otherwise stay in the bucket until the import blocked for good.
+    (let [limiter (messaging/channel-limiter #{:parsed-enrichable-email :discarded-email})]
       (try
         (read-mail-lines
          (fn [email-string]
@@ -163,7 +185,7 @@
            (async/>!! channel
                       ((comp
                         (fn [mail-string] (events/create-event :received-email  mail-string {:enrich true}))
-                        #(.getBytes ^String %)
+                        #(.getBytes ^String % StandardCharsets/ISO_8859_1)
                         #(apply str %)) email-string)))
          (line-seq rdr)
          [])

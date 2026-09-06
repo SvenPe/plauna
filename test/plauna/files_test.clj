@@ -120,3 +120,28 @@
   (binding [plauna.files/system-env (fn [key] (get {"SERVER_PORT" "3000" "DATA_FOLDER" "/var/test"} key))]
     (let [config-file (files/parse-config-from-cli-arguments ["--server-port" "4000" "--data-folder" "/var/test2"])]
       (is (and (= 4000 (-> config-file :server :port)) (= "/var/test2" (:data-folder config-file)))))))
+
+(deftest training-and-model-file-names-round-trip-any-language-code
+  (is (= "eng" (files/file-language "train-eng.train")))
+  (is (= "eng" (files/file-language "train-eng.bin")))
+  (is (= "eng" (files/file-language "train-eng-maxent.bin")))
+  (is (= "eng" (files/file-language "train-eng-maxent-qn.bin")))
+  (is (= "zh-cn" (files/file-language "train-zh-cn.train")))
+  (is (= "zh-cn" (files/file-language "train-zh-cn-naive-bayes.bin")))
+  (is (nil? (files/file-language "something-else.bin")))
+  (is (nil? (files/file-language ".train-eng-maxent.bin-123.tmp")))
+  "The language is read up to the model suffix, not as a fixed three characters")
+
+(deftest mbox-bytes-reach-the-parser-unchanged
+  ;; A Latin-1 body byte (0xE4, ä) must not be replaced by U+FFFD before the MIME parser applies the
+  ;; declared charset.
+  (let [raw (str "From sender@example.com Mon Jan  1 00:00:00 2024\r\nFrom: sender@example.com\r\nSubject: Umlaut\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\nGrüße\r\n")
+        bytes (.getBytes raw "ISO-8859-1")
+        test-chan (chan 20)]
+    (files/read-emails-from-mbox (java.io.ByteArrayInputStream. bytes) test-chan)
+    (close! test-chan)
+    (let [event (<!! test-chan)
+          payload ^bytes (:payload event)]
+      (is (some? event))
+      (is (= (seq bytes) (seq payload)) "Every byte of the message is passed through unchanged")))
+  "8-bit bodies in an mbox are decoded with their own charset, not mangled as UTF-8")
