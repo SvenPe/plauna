@@ -114,10 +114,10 @@
 <!-- The table renders even with zero results: hiding it along with the filter bar would make an
      active filter invisible and drop it from the next submit. -->
 <div class="w-full overflow-x-auto">
-  <table class="table table-zebra">
+  <table class="table table-zebra table-fixed">
     <thead class="table-header-group">
       <tr class="table-row">
-        <th class="table-cell text-left"><strong>Date</strong></th>
+        <th class="table-cell text-left w-28"><strong>Date</strong></th>
         <th class="table-cell text-left">
           <details class="dropdown">
             <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.subject-filter-active? %}text-primary{% endif %}">
@@ -150,7 +150,7 @@
             </div>
           </details>
         </th>
-        <th class="hidden lg:table-cell text-left">
+        <th class="hidden lg:table-cell text-left lg:w-40">
           <details class="dropdown">
             <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.from-filter-active? %}text-primary{% endif %}">
               <strong>From</strong>
@@ -182,7 +182,7 @@
             </div>
           </details>
         </th>
-        <th class="hidden lg:table-cell text-left">
+        <th class="hidden lg:table-cell text-left lg:w-40">
           <details class="dropdown">
             <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.to-filter-active? %}text-primary{% endif %}">
               <strong>To</strong>
@@ -214,9 +214,9 @@
             </div>
           </details>
         </th>
-        <th class="hidden lg:table-cell text-left"><strong>Language</strong></th>
-        <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
-        <th class="text-left">
+        <th class="hidden lg:table-cell text-left lg:w-20"><strong>Language</strong></th>
+        <th class="hidden lg:table-cell text-left lg:w-24"><strong>Confidence</strong></th>
+        <th class="text-left w-36">
           <details class="dropdown">
             <summary class="inline-flex items-center gap-1 cursor-pointer list-none {% if page.category-filter-active? %}text-primary{% endif %}">
               <strong>Category</strong>
@@ -248,7 +248,7 @@
             </div>
           </details>
         </th>
-        <th class="hidden lg:table-cell text-left"><strong>Confidence</strong></th>
+        <th class="hidden lg:table-cell text-left lg:w-24"><strong>Confidence</strong></th>
       </tr>
     </thead>
     <tbody>
